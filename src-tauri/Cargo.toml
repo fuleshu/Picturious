@@ -1,0 +1,20 @@
+[package]
+name = "picturious"
+description = "Folder-first picture library manager"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+build = "build.rs"
+default-run = "picturious"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow = "1"
+picturious-core = { path = "../crates/picturious-core" }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = ["protocol-asset"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Shell"] }

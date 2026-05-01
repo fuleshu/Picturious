@@ -1,0 +1,15 @@
+[package]
+name = "picturious-core"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+image = "0.25"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+turbojpeg = "1.4"
+uuid = { version = "1", features = ["v4"] }

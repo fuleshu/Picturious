@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Picturious</title>
+    <link rel="stylesheet" href="./styles.css?v=layout-11" />
+  </head>
+  <body>
+    <main class="workspace">
+      <header class="toolbar">
+        <div class="title-block">
+          <h2 id="view-title">Library</h2>
+          <p id="status">Starting Picturious...</p>
+        </div>
+        <div class="toolbar-actions">
+          <label class="thumb-scale-control" title="Thumbnail item size">
+            <span>Size</span>
+            <input
+              id="thumb-scale"
+              type="range"
+              min="0.5"
+              max="2"
+              step="0.05"
+              value="1"
+              aria-label="Thumbnail item size"
+            />
+          </label>
+          <button id="add-root-button" type="button">Add root</button>
+          <button id="settings-button" class="icon-button" type="button" title="Settings" aria-label="Settings">
+            &#9881;
+          </button>
+          <button id="up-button" type="button">Up</button>
+          <button id="scan-button" type="button">Scan</button>
+        </div>
+      </header>
+
+      <nav id="breadcrumbs" class="breadcrumbs" aria-label="Breadcrumbs"></nav>
+      <section id="content-grid" class="content-grid" aria-label="Library content"></section>
+    </main>
+
+    <div id="viewer" class="viewer hidden" role="dialog" aria-modal="true" tabindex="-1">
+      <button id="viewer-close-hotspot" class="viewer-close-hotspot" type="button" aria-label="Close viewer"></button>
+      <div class="viewer-stage">
+        <img id="viewer-image" alt="" />
+      </div>
+    </div>
+
+    <div id="thumb-context-menu" class="context-menu hidden" role="menu">
+    </div>
+
+    <dialog id="settings-dialog" class="settings-dialog">
+      <form method="dialog" class="settings-panel">
+        <header class="settings-header">
+          <h2>Settings</h2>
+          <button id="settings-close-button" class="icon-button" type="button" title="Close" aria-label="Close">
+            x
+          </button>
+        </header>
+
+        <label class="check-row">
+          <input id="upscale-fullscreen" type="checkbox" />
+          <span>Upscale images to fit fullscreen</span>
+        </label>
+
+        <label class="range-row">
+          <span>Slideshow speed</span>
+          <input
+            id="slideshow-speed"
+            type="range"
+            min="0.1"
+            max="10"
+            step="0.1"
+            value="3"
+          />
+          <output id="slideshow-speed-value">3.0 s</output>
+        </label>
+
+        <section class="external-viewers">
+          <div class="section-heading">
+            <h3>Open with</h3>
+            <button id="add-external-viewer-button" type="button">Add</button>
+          </div>
+          <div id="external-viewers-list" class="external-viewers-list"></div>
+        </section>
+      </form>
+    </dialog>
+
+    <script src="./main.js?v=layout-11"></script>
+  </body>
+</html>

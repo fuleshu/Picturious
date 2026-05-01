@@ -1,0 +1,12 @@
+/target/
+/src-tauri/target/
+/src-tauri/gen/schemas/
+/.tools/
+/.idea/
+/.vscode/
+*.log
+*.tmp
+*.bak
+*.pdb
+*.user
+Thumbs.db
