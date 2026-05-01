@@ -2,7 +2,9 @@ use crate::db::{
     RootDatabase, clean_path_string, root_database_exists, root_database_path, root_display_name,
     validate_root_path,
 };
-use crate::models::{FolderView, LibraryOverview, LibraryRoot, ScanProgress, ScanReport};
+use crate::models::{
+    FolderView, ImageSummary, LibraryOverview, LibraryRoot, ScanProgress, ScanReport,
+};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -55,6 +57,13 @@ impl LibraryManager {
             .iter()
             .map(|root| self.library_root(root))
             .collect::<Result<Vec<_>>>()?;
+        let mut roots = roots;
+        roots.sort_by(|left, right| {
+            left.display_name
+                .to_lowercase()
+                .cmp(&right.display_name.to_lowercase())
+                .then_with(|| left.path.to_lowercase().cmp(&right.path.to_lowercase()))
+        });
 
         Ok(LibraryOverview { roots })
     }
@@ -150,6 +159,16 @@ impl LibraryManager {
         let known_root = self.known_root(root_id)?;
         let db = self.open_connected_database(known_root)?;
         db.image_path(image_id)
+    }
+
+    pub fn recursive_images_for_folder(
+        &self,
+        root_id: &str,
+        relative_path: &str,
+    ) -> Result<Vec<ImageSummary>> {
+        let known_root = self.known_root(root_id)?;
+        let db = self.open_connected_database(known_root)?;
+        db.recursive_images_for_folder(root_id, relative_path)
     }
 
     pub fn refresh_image_metadata(&self, root_id: &str, image_id: i64) -> Result<()> {

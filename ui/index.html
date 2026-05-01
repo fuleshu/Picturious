@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Picturious</title>
-    <link rel="stylesheet" href="./styles.css?v=layout-11" />
+    <link rel="stylesheet" href="./styles.css?v=layout-13" />
   </head>
   <body>
     <main class="workspace">
@@ -63,6 +63,11 @@
           <span>Upscale images to fit fullscreen</span>
         </label>
 
+        <label class="check-row">
+          <input id="slideshow-loop" type="checkbox" />
+          <span>Loop slideshow</span>
+        </label>
+
         <label class="range-row">
           <span>Slideshow speed</span>
           <input
@@ -76,6 +81,16 @@
           <output id="slideshow-speed-value">3.0 s</output>
         </label>
 
+        <label class="select-row">
+          <span>Ignore images smaller</span>
+          <select id="slideshow-ignore-smaller">
+            <option value="0">Off</option>
+            <option value="512">512</option>
+            <option value="800">800</option>
+            <option value="1024">1024</option>
+          </select>
+        </label>
+
         <section class="external-viewers">
           <div class="section-heading">
             <h3>Open with</h3>
@@ -86,6 +101,6 @@
       </form>
     </dialog>
 
-    <script src="./main.js?v=layout-11"></script>
+    <script src="./main.js?v=layout-13"></script>
   </body>
 </html>

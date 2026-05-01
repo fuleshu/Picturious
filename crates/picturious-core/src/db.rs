@@ -2,7 +2,7 @@ use crate::models::{
     FolderSummary, FolderView, FolderViewHeader, ImageSummary, ScanProgress, ScanReport,
 };
 use anyhow::{Context, Result, anyhow, bail};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -372,6 +372,30 @@ impl RootDatabase {
         ))
     }
 
+    pub fn recursive_images_for_folder(
+        &self,
+        root_id: &str,
+        folder_relative_path: &str,
+    ) -> Result<Vec<ImageSummary>> {
+        let normalized_relative_path = normalize_relative_path(folder_relative_path);
+        let (lower_bound, upper_bound) = subtree_image_bounds(&normalized_relative_path);
+        let mut statement = self.connection.prepare(
+            "
+            SELECT id, folder_id, file_name, relative_path, width, height, file_size, modified_unix_ms
+            FROM images
+            WHERE relative_path >= ?1 AND relative_path < ?2
+            ORDER BY relative_path COLLATE NOCASE
+            ",
+        )?;
+
+        let images = statement
+            .query_map(params![lower_bound, upper_bound], |row| {
+                image_summary_from_row(root_id, row)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(images)
+    }
+
     pub fn refresh_image_metadata(&self, image_id: i64) -> Result<()> {
         let (path, _) = self.image_path(image_id)?;
         let metadata = fs::metadata(&path)
@@ -698,21 +722,7 @@ impl RootDatabase {
 
         let mut rows = statement.query(params![folder_id])?;
         while let Some(row) = rows.next()? {
-            on_image(ImageSummary {
-                root_id: root_id.to_owned(),
-                id: row.get(0)?,
-                folder_id: row.get(1)?,
-                file_name: row.get(2)?,
-                relative_path: row.get(3)?,
-                width: row
-                    .get::<_, Option<i64>>(4)?
-                    .map(|value| value.max(0) as u32),
-                height: row
-                    .get::<_, Option<i64>>(5)?
-                    .map(|value| value.max(0) as u32),
-                file_size: row.get::<_, i64>(6)?.max(0) as u64,
-                modified_unix_ms: row.get(7)?,
-            })?;
+            on_image(image_summary_from_row(root_id, row)?)?;
         }
 
         Ok(())
@@ -997,6 +1007,24 @@ fn names_for_folder(connection: &Connection, sql: &str, folder_id: i64) -> Resul
         .query_map(params![folder_id], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(names)
+}
+
+fn image_summary_from_row(root_id: &str, row: &Row<'_>) -> rusqlite::Result<ImageSummary> {
+    Ok(ImageSummary {
+        root_id: root_id.to_owned(),
+        id: row.get(0)?,
+        folder_id: row.get(1)?,
+        file_name: row.get(2)?,
+        relative_path: row.get(3)?,
+        width: row
+            .get::<_, Option<i64>>(4)?
+            .map(|value| value.max(0) as u32),
+        height: row
+            .get::<_, Option<i64>>(5)?
+            .map(|value| value.max(0) as u32),
+        file_size: row.get::<_, i64>(6)?.max(0) as u64,
+        modified_unix_ms: row.get(7)?,
+    })
 }
 
 fn relative_path_for(root_path: &Path, path: &Path) -> Result<String> {

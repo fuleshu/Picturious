@@ -441,7 +441,8 @@ button:disabled {
 }
 
 .check-row,
-.range-row {
+.range-row,
+.select-row {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -457,6 +458,20 @@ button:disabled {
   width: 48px;
   color: #52595d;
   text-align: right;
+}
+
+.select-row {
+  justify-content: space-between;
+}
+
+.select-row select {
+  min-width: 120px;
+  border: 1px solid #c8cdd0;
+  border-radius: 6px;
+  background: #ffffff;
+  padding: 6px 8px;
+  color: #202326;
+  font: inherit;
 }
 
 .external-viewers {
@@ -512,6 +527,11 @@ button:disabled {
 
 .viewer.hidden {
   display: none;
+}
+
+.viewer[data-cursor-hidden="true"],
+.viewer[data-cursor-hidden="true"] * {
+  cursor: none;
 }
 
 .viewer-close-hotspot {

@@ -36,6 +36,10 @@ struct UiSettings {
     #[serde(default = "default_slideshow_speed_seconds")]
     slideshow_speed_seconds: f64,
     #[serde(default)]
+    slideshow_loop: bool,
+    #[serde(default)]
+    slideshow_ignore_smaller_than: u32,
+    #[serde(default)]
     external_viewers: Vec<ExternalViewer>,
     #[serde(default)]
     window: Option<WindowSettings>,
@@ -47,6 +51,8 @@ impl Default for UiSettings {
             thumb_scale: default_thumb_scale(),
             upscale_fullscreen_images: false,
             slideshow_speed_seconds: default_slideshow_speed_seconds(),
+            slideshow_loop: false,
+            slideshow_ignore_smaller_than: 0,
             external_viewers: Vec::new(),
             window: None,
         }
@@ -66,6 +72,10 @@ struct UiPreferences {
     upscale_fullscreen_images: bool,
     #[serde(default = "default_slideshow_speed_seconds")]
     slideshow_speed_seconds: f64,
+    #[serde(default)]
+    slideshow_loop: bool,
+    #[serde(default)]
+    slideshow_ignore_smaller_than: u32,
     #[serde(default)]
     external_viewers: Vec<ExternalViewer>,
 }
@@ -161,6 +171,8 @@ fn save_app_preferences(
         .map_err(|_| "app settings are locked".to_owned())?;
     settings.upscale_fullscreen_images = preferences.upscale_fullscreen_images;
     settings.slideshow_speed_seconds = preferences.slideshow_speed_seconds;
+    settings.slideshow_loop = preferences.slideshow_loop;
+    settings.slideshow_ignore_smaller_than = preferences.slideshow_ignore_smaller_than;
     settings.external_viewers = preferences.external_viewers;
     sanitize_ui_settings(&mut settings);
     write_ui_settings(state.settings_path.as_ref().as_path(), &settings).map_err(error_message)?;
@@ -301,6 +313,24 @@ async fn folder_view(
             .lock()
             .map_err(|_| "library state is locked".to_owned())?
             .folder_view(&root_id, &relative_path)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn recursive_folder_images(
+    root_id: String,
+    relative_path: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<ImageSummary>, String> {
+    let library = state.library.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .recursive_images_for_folder(&root_id, &relative_path)
             .map_err(error_message)
     })
     .await
@@ -553,6 +583,7 @@ fn main() {
             remove_root,
             start_scan,
             folder_view,
+            recursive_folder_images,
             stream_folder_view,
             thumbnail,
             image_file_path,
@@ -701,10 +732,19 @@ fn clamp_slideshow_speed_seconds(value: f64) -> f64 {
     }
 }
 
+fn normalize_slideshow_ignore_smaller_than(value: u32) -> u32 {
+    match value {
+        512 | 800 | 1024 => value,
+        _ => 0,
+    }
+}
+
 fn sanitize_ui_settings(settings: &mut UiSettings) {
     settings.thumb_scale = clamp_thumb_scale(settings.thumb_scale);
     settings.slideshow_speed_seconds =
         clamp_slideshow_speed_seconds(settings.slideshow_speed_seconds);
+    settings.slideshow_ignore_smaller_than =
+        normalize_slideshow_ignore_smaller_than(settings.slideshow_ignore_smaller_than);
     settings.external_viewers.retain(|viewer| {
         let path = Path::new(&viewer.path);
         path.is_file() && is_external_viewer_path(path)

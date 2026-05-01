@@ -5,6 +5,7 @@ const convertFileSrc = tauri?.core?.convertFileSrc;
 const BASE_TILE_SIZE = 188;
 const THUMBNAIL_PIXEL_SIZE = 450;
 const STREAM_ITEMS_PER_FRAME = 16;
+const VIEWER_CURSOR_HIDE_DELAY_MS = 3000;
 
 const gridNode = document.querySelector("#content-grid");
 const statusNode = document.querySelector("#status");
@@ -22,8 +23,10 @@ const thumbContextMenu = document.querySelector("#thumb-context-menu");
 const settingsDialog = document.querySelector("#settings-dialog");
 const settingsCloseButton = document.querySelector("#settings-close-button");
 const upscaleFullscreenInput = document.querySelector("#upscale-fullscreen");
+const slideshowLoopInput = document.querySelector("#slideshow-loop");
 const slideshowSpeedInput = document.querySelector("#slideshow-speed");
 const slideshowSpeedValue = document.querySelector("#slideshow-speed-value");
+const slideshowIgnoreSmallerInput = document.querySelector("#slideshow-ignore-smaller");
 const addExternalViewerButton = document.querySelector("#add-external-viewer-button");
 const externalViewersList = document.querySelector("#external-viewers-list");
 
@@ -48,12 +51,20 @@ const state = {
   imageUrlCache: new Map(),
   lastWheelAt: 0,
   contextMenuImage: null,
+  contextMenuFolder: null,
   contextMenuRoot: null,
   slideshowTimer: null,
   slideshowActive: false,
+  slideshowEnded: false,
+  slideshowPlaylist: null,
+  slideshowSkipAttempts: 0,
+  viewerCursorTimer: null,
+  imageDimensionCache: new Map(),
   settings: {
     upscale_fullscreen_images: false,
     slideshow_speed_seconds: 3,
+    slideshow_loop: false,
+    slideshow_ignore_smaller_than: 0,
     external_viewers: [],
   },
   thumbScale: 1,
@@ -83,11 +94,14 @@ upButton.addEventListener("click", openParentFolder);
 thumbScaleInput.addEventListener("input", handleThumbScaleInput);
 settingsCloseButton.addEventListener("click", closeSettingsDialog);
 upscaleFullscreenInput.addEventListener("change", handleSettingsInput);
+slideshowLoopInput.addEventListener("change", handleSettingsInput);
 slideshowSpeedInput.addEventListener("input", handleSlideshowSpeedInput);
 slideshowSpeedInput.addEventListener("change", handleSettingsInput);
+slideshowIgnoreSmallerInput.addEventListener("change", handleSettingsInput);
 addExternalViewerButton.addEventListener("click", addExternalViewer);
 viewerCloseHotspot.addEventListener("click", closeViewer);
 viewer.addEventListener("wheel", handleViewerWheel, { passive: false });
+viewer.addEventListener("mousemove", handleViewerMouseMove);
 document.addEventListener("fullscreenchange", handleBrowserFullscreenChange);
 document.addEventListener("contextmenu", handleDocumentContextMenu);
 document.addEventListener("click", handleDocumentClick);
@@ -113,9 +127,18 @@ document.addEventListener("keydown", (event) => {
   } else if (event.key === "ArrowRight") {
     stopSlideshow();
     moveViewer(1);
+  } else if (event.key === "Home") {
+    event.preventDefault();
+    jumpToFirstViewerImage();
   } else if (event.key === " " || event.key === "Spacebar") {
     event.preventDefault();
+    if (event.repeat) {
+      return;
+    }
     toggleSlideshow();
+  } else if (event.key.toLowerCase() === "r" && state.slideshowActive) {
+    event.preventDefault();
+    randomizeCurrentSlideshow();
   }
 });
 
@@ -430,7 +453,7 @@ function renderRootOverview(options = {}) {
     return;
   }
 
-  const nodes = state.roots.map(renderRootCard);
+  const nodes = sortedRoots().map(renderRootCard);
   gridNode.replaceChildren(...nodes);
   if (options.resetScroll) {
     gridNode.scrollTop = 0;
@@ -438,6 +461,14 @@ function renderRootOverview(options = {}) {
   } else {
     restorePendingScrollPosition();
   }
+}
+
+function sortedRoots() {
+  return [...state.roots].sort((left, right) =>
+    left.display_name.localeCompare(right.display_name, undefined, {
+      sensitivity: "base",
+    }),
+  );
 }
 
 function renderRootCard(root) {
@@ -692,6 +723,10 @@ function normalizeAppSettings(settings) {
     slideshow_speed_seconds: clampSlideshowSpeed(
       Number(settings?.slideshow_speed_seconds ?? 3),
     ),
+    slideshow_loop: Boolean(settings?.slideshow_loop),
+    slideshow_ignore_smaller_than: normalizeIgnoreSmallerValue(
+      Number(settings?.slideshow_ignore_smaller_than ?? 0),
+    ),
     external_viewers: Array.isArray(settings?.external_viewers)
       ? settings.external_viewers
           .filter((viewer) => viewer?.id && viewer?.path)
@@ -717,8 +752,10 @@ function closeSettingsDialog() {
 
 function renderSettingsDialog() {
   upscaleFullscreenInput.checked = state.settings.upscale_fullscreen_images;
+  slideshowLoopInput.checked = state.settings.slideshow_loop;
   slideshowSpeedInput.value = String(state.settings.slideshow_speed_seconds);
   slideshowSpeedValue.value = `${state.settings.slideshow_speed_seconds.toFixed(1)} s`;
+  slideshowIgnoreSmallerInput.value = String(state.settings.slideshow_ignore_smaller_than);
   externalViewersList.replaceChildren(
     ...state.settings.external_viewers.map(renderExternalViewerRow),
   );
@@ -765,8 +802,12 @@ function handleSlideshowSpeedInput() {
 
 function handleSettingsInput() {
   state.settings.upscale_fullscreen_images = upscaleFullscreenInput.checked;
+  state.settings.slideshow_loop = slideshowLoopInput.checked;
   state.settings.slideshow_speed_seconds = clampSlideshowSpeed(
     Number(slideshowSpeedInput.value),
+  );
+  state.settings.slideshow_ignore_smaller_than = normalizeIgnoreSmallerValue(
+    Number(slideshowIgnoreSmallerInput.value),
   );
   applyViewerUpscaleSetting();
   saveSettingsPreferences().catch(showError);
@@ -802,6 +843,8 @@ async function saveSettingsPreferences() {
     preferences: {
       upscale_fullscreen_images: state.settings.upscale_fullscreen_images,
       slideshow_speed_seconds: state.settings.slideshow_speed_seconds,
+      slideshow_loop: state.settings.slideshow_loop,
+      slideshow_ignore_smaller_than: state.settings.slideshow_ignore_smaller_than,
       external_viewers: state.settings.external_viewers,
     },
   });
@@ -819,6 +862,10 @@ function clampSlideshowSpeed(value) {
     return 3;
   }
   return Math.min(10, Math.max(0.1, value));
+}
+
+function normalizeIgnoreSmallerValue(value) {
+  return [512, 800, 1024].includes(value) ? value : 0;
 }
 
 function clampThumbScale(value) {
@@ -920,6 +967,8 @@ function renderFolderCard(folder) {
   card.className = "tile folder-tile";
   card.tabIndex = 0;
   card.title = fullFolderPath(folder);
+  card.dataset.rootId = folder.root_id;
+  card.dataset.folderPath = folder.relative_path;
   card.innerHTML = `
     <div class="thumb">
       <span>${escapeHtml(initials(folder.name))}</span>
@@ -1024,8 +1073,34 @@ function handleDocumentContextMenu(event) {
 
     state.contextMenuRoot = root;
     state.contextMenuImage = null;
+    state.contextMenuFolder = null;
     showContextMenu(
       [{ action: "remove-root", label: "Remove root" }],
+      event.clientX,
+      event.clientY,
+    );
+    return;
+  }
+
+  const folderTile = event.target.closest(".folder-tile");
+  if (folderTile) {
+    const folder = folderByPath(folderTile.dataset.folderPath);
+    if (!folder) {
+      hideThumbContextMenu();
+      return;
+    }
+
+    state.contextMenuFolder = folder;
+    state.contextMenuImage = null;
+    state.contextMenuRoot = null;
+    showContextMenu(
+      [
+        { action: "play-folder-slideshow", label: "Play slideshow" },
+        {
+          action: "play-folder-slideshow-random",
+          label: "Play slideshow randomized",
+        },
+      ],
       event.clientX,
       event.clientY,
     );
@@ -1045,6 +1120,7 @@ function handleDocumentContextMenu(event) {
   }
 
   state.contextMenuImage = image;
+  state.contextMenuFolder = null;
   state.contextMenuRoot = null;
   showContextMenu(imageContextMenuItems(), event.clientX, event.clientY);
 }
@@ -1063,6 +1139,7 @@ async function handleThumbContextAction(event) {
 
   const action = button.dataset.action;
   const image = state.contextMenuImage;
+  const folder = state.contextMenuFolder;
   const root = state.contextMenuRoot;
   const viewerId = button.dataset.viewerId;
   hideThumbContextMenu();
@@ -1070,6 +1147,10 @@ async function handleThumbContextAction(event) {
   try {
     if (action === "remove-root" && root) {
       await removeRoot(root.id);
+    } else if (action === "play-folder-slideshow" && folder) {
+      await playFolderSlideshow(folder, { randomized: false });
+    } else if (action === "play-folder-slideshow-random" && folder) {
+      await playFolderSlideshow(folder, { randomized: true });
     } else if (action === "set-cover" && image) {
       await setCurrentFolderCover(image);
     } else if (action === "rotate-right" && image) {
@@ -1139,6 +1220,7 @@ function showContextMenu(items, x, y) {
 function hideThumbContextMenu() {
   thumbContextMenu.classList.add("hidden");
   state.contextMenuImage = null;
+  state.contextMenuFolder = null;
   state.contextMenuRoot = null;
 }
 
@@ -1150,6 +1232,7 @@ async function rotateImage(image, direction) {
     direction,
   });
   state.imageUrlCache.clear();
+  state.imageDimensionCache.clear();
   await refreshCurrentFolder({ keepStatus: true });
   setStatus(`Rotated ${image.file_name}`);
 }
@@ -1161,12 +1244,60 @@ async function moveImageToRecycleBin(image) {
     imageId: image.id,
   });
   state.imageUrlCache.clear();
+  state.imageDimensionCache.clear();
   await refreshCurrentFolder({ keepStatus: true });
   setStatus(`Moved ${image.file_name} to recycle bin`);
 }
 
+async function playFolderSlideshow(folder, options = {}) {
+  if (!invoke) {
+    return;
+  }
+
+  setStatus(`Loading slideshow for ${folder.name}...`);
+  const images = await invoke("recursive_folder_images", {
+    rootId: folder.root_id,
+    relativePath: folder.relative_path,
+  });
+  if (!images || images.length === 0) {
+    setStatus(`${folder.name} has no images`);
+    return;
+  }
+
+  startPlaylistSlideshow(images, options);
+}
+
+function startPlaylistSlideshow(images, options = {}) {
+  state.slideshowPlaylist = options.randomized ? shuffleImages(images) : [...images];
+  state.viewerIndex = 0;
+  state.slideshowActive = true;
+  state.slideshowEnded = false;
+  state.slideshowSkipAttempts = 0;
+  viewer.classList.remove("hidden");
+  viewer.focus({ preventScroll: true });
+  showViewerCursorTemporarily();
+  applyViewerUpscaleSetting();
+  enterViewerFullscreen().catch(showError);
+  renderViewerImage().catch(showError);
+}
+
+function shuffleImages(images) {
+  const shuffled = [...images];
+  for (let index = shuffled.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
+  }
+  return shuffled;
+}
+
 function imageById(imageId) {
   return state.currentView?.images.find((image) => image.id === imageId) ?? null;
+}
+
+function folderByPath(relativePath) {
+  return (
+    state.currentView?.folders.find((folder) => folder.relative_path === relativePath) ?? null
+  );
 }
 
 function rootById(rootId) {
@@ -1320,16 +1451,21 @@ async function loadThumbnail({ rootId, imageId, target, size, generation }) {
 }
 
 function openViewer(index) {
+  state.slideshowPlaylist = null;
+  state.slideshowActive = false;
+  state.slideshowEnded = false;
+  state.slideshowSkipAttempts = 0;
   state.viewerIndex = index;
   viewer.classList.remove("hidden");
   viewer.focus({ preventScroll: true });
+  showViewerCursorTemporarily();
   applyViewerUpscaleSetting();
   enterViewerFullscreen().catch(showError);
   renderViewerImage().catch(showError);
 }
 
 async function renderViewerImage() {
-  const image = state.currentView?.images[state.viewerIndex];
+  const image = currentViewerImage();
   if (!image) {
     closeViewer();
     return;
@@ -1342,8 +1478,23 @@ async function renderViewerImage() {
     return;
   }
 
+  if (state.slideshowActive && state.settings.slideshow_ignore_smaller_than > 0) {
+    const dimensions = await imageDimensionsFor(image, source);
+    if (generation !== state.viewerGeneration) {
+      return;
+    }
+    if (shouldIgnoreSlide(dimensions)) {
+      advanceSlideshow({ fromFilter: true });
+      return;
+    }
+  }
+
+  state.slideshowSkipAttempts = 0;
   viewerImage.src = source;
   preloadNeighborImages(generation);
+  if (state.slideshowActive) {
+    scheduleSlideshow();
+  }
 }
 
 async function imageSourceFor(image) {
@@ -1373,8 +1524,55 @@ async function imageSourceFor(image) {
   return source;
 }
 
+function viewerImages() {
+  return state.slideshowPlaylist ?? state.currentView?.images ?? [];
+}
+
+function currentViewerImage() {
+  return viewerImages()[state.viewerIndex] ?? null;
+}
+
+async function imageDimensionsFor(image, source) {
+  if (image.width && image.height) {
+    return { width: image.width, height: image.height };
+  }
+
+  const cacheKey = `${image.root_id}:${image.id}:${image.modified_unix_ms}`;
+  const cached = state.imageDimensionCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  const dimensions = await loadImageDimensions(source);
+  state.imageDimensionCache.set(cacheKey, dimensions);
+  return dimensions;
+}
+
+function loadImageDimensions(source) {
+  return new Promise((resolve) => {
+    const probe = new Image();
+    probe.onload = () => {
+      resolve({
+        width: probe.naturalWidth || 0,
+        height: probe.naturalHeight || 0,
+      });
+    };
+    probe.onerror = () => resolve({ width: 0, height: 0 });
+    probe.src = source;
+  });
+}
+
+function shouldIgnoreSlide(dimensions) {
+  const threshold = state.settings.slideshow_ignore_smaller_than;
+  if (!threshold || !dimensions) {
+    return false;
+  }
+
+  return Math.max(dimensions.width, dimensions.height) < threshold;
+}
+
 function preloadNeighborImages(generation) {
-  const images = state.currentView?.images ?? [];
+  const images = viewerImages();
   if (images.length < 2 || !convertFileSrc) {
     return;
   }
@@ -1403,17 +1601,27 @@ function toggleSlideshow() {
 }
 
 function startSlideshow() {
-  const images = state.currentView?.images ?? [];
-  if (images.length < 2) {
+  if (!state.slideshowPlaylist) {
+    state.slideshowPlaylist = [...(state.currentView?.images ?? [])];
+  }
+
+  if (state.slideshowPlaylist.length === 0) {
     return;
   }
 
+  if (state.slideshowEnded || state.viewerIndex >= state.slideshowPlaylist.length) {
+    state.viewerIndex = 0;
+  }
+
   state.slideshowActive = true;
-  scheduleSlideshow();
+  state.slideshowEnded = false;
+  state.slideshowSkipAttempts = 0;
+  renderViewerImage().catch(showError);
 }
 
-function stopSlideshow() {
+function stopSlideshow(options = {}) {
   state.slideshowActive = false;
+  state.slideshowEnded = Boolean(options.ended);
   if (state.slideshowTimer) {
     window.clearTimeout(state.slideshowTimer);
     state.slideshowTimer = null;
@@ -1434,9 +1642,70 @@ function scheduleSlideshow() {
     if (!state.slideshowActive || viewer.classList.contains("hidden")) {
       return;
     }
-    moveViewer(1, { keepSlideshow: true });
-    scheduleSlideshow();
+    advanceSlideshow();
   }, state.settings.slideshow_speed_seconds * 1000);
+}
+
+function advanceSlideshow(options = {}) {
+  const images = viewerImages();
+  if (images.length === 0) {
+    stopSlideshow({ ended: true });
+    return;
+  }
+
+  if (options.fromFilter) {
+    state.slideshowSkipAttempts += 1;
+    if (state.slideshowSkipAttempts >= images.length) {
+      stopSlideshow({ ended: true });
+      setStatus("No slideshow images match the size filter");
+      return;
+    }
+  }
+
+  const atLast = state.viewerIndex >= images.length - 1;
+  if (atLast) {
+    if (!state.settings.slideshow_loop) {
+      stopSlideshow({ ended: true });
+      return;
+    }
+    state.viewerIndex = 0;
+  } else {
+    state.viewerIndex += 1;
+  }
+
+  renderViewerImage().catch(showError);
+}
+
+function jumpToFirstViewerImage() {
+  if (!state.slideshowPlaylist) {
+    state.slideshowPlaylist = null;
+  }
+  const images = viewerImages();
+  if (images.length === 0) {
+    return;
+  }
+
+  state.viewerIndex = 0;
+  state.slideshowEnded = false;
+  state.slideshowSkipAttempts = 0;
+  renderViewerImage().catch(showError);
+}
+
+function randomizeCurrentSlideshow() {
+  if (!state.slideshowActive) {
+    return;
+  }
+
+  const images = viewerImages();
+  if (images.length === 0) {
+    return;
+  }
+
+  state.slideshowPlaylist = shuffleImages(images);
+  state.viewerIndex = 0;
+  state.slideshowEnded = false;
+  state.slideshowSkipAttempts = 0;
+  renderViewerImage().catch(showError);
 }
 
 function withCacheBuster(source, modifiedUnixMs) {
@@ -1449,6 +1718,7 @@ function handleViewerWheel(event) {
     return;
   }
 
+  showViewerCursorTemporarily();
   event.preventDefault();
   const delta =
     Math.abs(event.deltaX) > Math.abs(event.deltaY)
@@ -1465,6 +1735,35 @@ function handleViewerWheel(event) {
 
   state.lastWheelAt = now;
   moveViewer(delta > 0 ? 1 : -1);
+}
+
+function handleViewerMouseMove() {
+  if (viewer.classList.contains("hidden")) {
+    return;
+  }
+
+  showViewerCursorTemporarily();
+}
+
+function showViewerCursorTemporarily() {
+  viewer.dataset.cursorHidden = "false";
+  if (state.viewerCursorTimer) {
+    window.clearTimeout(state.viewerCursorTimer);
+  }
+
+  state.viewerCursorTimer = window.setTimeout(() => {
+    if (!viewer.classList.contains("hidden")) {
+      viewer.dataset.cursorHidden = "true";
+    }
+  }, VIEWER_CURSOR_HIDE_DELAY_MS);
+}
+
+function resetViewerCursor() {
+  if (state.viewerCursorTimer) {
+    window.clearTimeout(state.viewerCursorTimer);
+    state.viewerCursorTimer = null;
+  }
+  viewer.dataset.cursorHidden = "false";
 }
 
 async function enterViewerFullscreen() {
@@ -1506,7 +1805,7 @@ function handleBrowserFullscreenChange() {
 }
 
 function moveViewer(delta, options = {}) {
-  const images = state.currentView?.images ?? [];
+  const images = viewerImages();
   if (images.length === 0) {
     return;
   }
@@ -1519,6 +1818,10 @@ function moveViewer(delta, options = {}) {
 
 function closeViewer() {
   stopSlideshow();
+  resetViewerCursor();
+  state.slideshowPlaylist = null;
+  state.slideshowEnded = false;
+  state.slideshowSkipAttempts = 0;
   state.viewerGeneration += 1;
   viewer.classList.add("hidden");
   viewerImage.removeAttribute("src");
