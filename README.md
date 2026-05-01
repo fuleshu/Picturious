@@ -60,3 +60,21 @@ cargo tauri dev
 ```
 
 If the CLI does not find the app from the workspace root, run the same command from `src-tauri`.
+
+## Windows Installer
+
+Picturious uses Tauri's NSIS bundler for release installers. The installer is configured as a per-machine Windows installer, so the default install location is under `Program Files`, with Start Menu integration, optional desktop shortcut creation, and an uninstaller entry.
+
+Build the installer from the workspace root:
+
+```powershell
+cargo tauri build --bundles nsis
+```
+
+The release artifact is written below:
+
+```text
+target/release/bundle/nsis/
+```
+
+Upload the generated `*-setup.exe` file to a GitHub Release. Until the installer is code-signed, Windows SmartScreen may warn users that the publisher is unknown.

@@ -31,6 +31,26 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all"
+    "targets": [
+      "nsis"
+    ],
+    "publisher": "Picturious Project",
+    "homepage": "https://github.com/fuleshu/Picturious",
+    "icon": [
+      "icons/icon.ico"
+    ],
+    "license": "Apache-2.0",
+    "licenseFile": "../LICENSE",
+    "category": "Photography",
+    "shortDescription": "Folder-first picture library manager",
+    "longDescription": "Picturious is a folder-first picture library manager for Windows, built with a Rust core and a Tauri desktop shell.",
+    "windows": {
+      "allowDowngrades": false,
+      "nsis": {
+        "installMode": "perMachine",
+        "startMenuFolder": "Picturious",
+        "displayLanguageSelector": false
+      }
+    }
   }
 }
