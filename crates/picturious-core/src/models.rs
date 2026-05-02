@@ -81,6 +81,7 @@ pub struct ScanProgress {
     pub images_seen: u32,
     pub skipped_entries: u32,
     pub current_relative_path: String,
+    pub changed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

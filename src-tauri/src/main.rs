@@ -95,6 +95,13 @@ struct ScanError {
 }
 
 #[derive(Clone, Serialize)]
+struct FolderValidated {
+    root_id: String,
+    relative_path: String,
+    changed: bool,
+}
+
+#[derive(Clone, Serialize)]
 struct FolderViewStarted {
     request_id: u64,
     view: FolderViewHeader,
@@ -121,6 +128,20 @@ struct FolderViewError {
     request_id: u64,
     root_id: String,
     relative_path: String,
+    message: String,
+}
+
+#[derive(Clone, Serialize)]
+struct FolderValidationFinished {
+    request_id: u64,
+    root_id: String,
+    changed_paths: Vec<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct FolderValidationError {
+    request_id: u64,
+    root_id: String,
     message: String,
 }
 
@@ -249,6 +270,7 @@ async fn remove_root(
 #[tauri::command]
 async fn start_scan(
     root_id: String,
+    relative_path: String,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
@@ -257,7 +279,7 @@ async fn start_scan(
         library
             .lock()
             .map_err(|_| "library state is locked".to_owned())?
-            .scan_target(&root_id)
+            .scan_target(&root_id, &relative_path)
             .map_err(error_message)
     })
     .await
@@ -361,7 +383,7 @@ async fn stream_folder_view(
     let error_relative_path = relative_path.clone();
     let _ = tauri::async_runtime::spawn_blocking(move || {
         if let Err(error) = stream_folder_view_for_target(target, relative_path, request_id, &app) {
-            let message = error.to_string();
+            let message = error_message(error);
             let _ = app.emit(
                 "folder-view-error",
                 &FolderViewError {
@@ -371,6 +393,55 @@ async fn stream_folder_view(
                     message,
                 },
             );
+        }
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn validate_folder_view(
+    root_id: String,
+    relative_path: String,
+    visible_relative_paths: Vec<String>,
+    request_id: u64,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let library = state.library.clone();
+    let target_root_id = root_id.clone();
+    let target = tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .folder_view_target(&target_root_id)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        match validate_folder_view_for_target(target, relative_path, visible_relative_paths) {
+            Ok(changed_paths) => {
+                let _ = app.emit(
+                    "folder-validation-finished",
+                    &FolderValidationFinished {
+                        request_id,
+                        root_id,
+                        changed_paths,
+                    },
+                );
+            }
+            Err(error) => {
+                let _ = app.emit(
+                    "folder-validation-error",
+                    &FolderValidationError {
+                        request_id,
+                        root_id,
+                        message: error_message(error),
+                    },
+                );
+            }
         }
     });
 
@@ -585,6 +656,7 @@ fn main() {
             folder_view,
             recursive_folder_images,
             stream_folder_view,
+            validate_folder_view,
             thumbnail,
             image_file_path,
             set_viewer_fullscreen,
@@ -629,7 +701,17 @@ fn run_scan(target: ScanTarget, app: &AppHandle) -> anyhow::Result<ScanReport> {
 
     let mut last_emit = Instant::now() - Duration::from_millis(500);
     let mut last_folder_count = 0_u32;
-    db.scan_with_progress(&target.root_id, |progress| {
+    db.rescan_with_progress(&target.root_id, &target.relative_path, |progress| {
+        if progress.changed || progress.folders_seen == 1 {
+            let _ = app.emit(
+                "folder-validated",
+                &FolderValidated {
+                    root_id: progress.root_id.clone(),
+                    relative_path: progress.current_relative_path.clone(),
+                    changed: progress.changed,
+                },
+            );
+        }
         let enough_time = last_emit.elapsed() >= Duration::from_millis(500);
         let enough_work = progress.folders_seen.saturating_sub(last_folder_count) >= 500;
         if progress.folders_seen == 1 || enough_time || enough_work {
@@ -694,8 +776,43 @@ fn stream_folder_view_for_target(
     Ok(())
 }
 
+fn validate_folder_view_for_target(
+    target: FolderViewTarget,
+    relative_path: String,
+    visible_relative_paths: Vec<String>,
+) -> anyhow::Result<Vec<String>> {
+    let mut db = RootDatabase::open_existing(&target.path)?
+        .with_context(|| format!("root database is missing: {}", target.path.display()))?;
+    let database_root_id = db.root_id()?;
+    if database_root_id != target.root_id {
+        anyhow::bail!(
+            "root database id does not match the configured root id for {}",
+            target.path.display()
+        );
+    }
+
+    let mut seen_paths = HashSet::new();
+    let mut changed_paths = Vec::new();
+    for path in std::iter::once(relative_path).chain(visible_relative_paths.into_iter()) {
+        let path = path.replace('\\', "/").trim_matches('/').to_owned();
+        if !seen_paths.insert(path.clone()) {
+            continue;
+        }
+
+        if db.validate_folder_shallow(&target.root_id, &path)? {
+            changed_paths.push(path);
+        }
+    }
+
+    Ok(changed_paths)
+}
+
 fn error_message(error: anyhow::Error) -> String {
-    error.to_string()
+    error
+        .chain()
+        .map(|cause| cause.to_string())
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 fn root_is_scanning(
@@ -724,9 +841,9 @@ fn clamp_thumb_scale(value: f64) -> f64 {
     }
 }
 
-fn clamp_slideshow_speed_seconds(value: f64) -> f64 {
-    if value.is_finite() {
-        value.clamp(0.1, 10.0)
+fn normalize_slideshow_speed_seconds(value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        (value * 1000.0).round() / 1000.0
     } else {
         default_slideshow_speed_seconds()
     }
@@ -742,7 +859,7 @@ fn normalize_slideshow_ignore_smaller_than(value: u32) -> u32 {
 fn sanitize_ui_settings(settings: &mut UiSettings) {
     settings.thumb_scale = clamp_thumb_scale(settings.thumb_scale);
     settings.slideshow_speed_seconds =
-        clamp_slideshow_speed_seconds(settings.slideshow_speed_seconds);
+        normalize_slideshow_speed_seconds(settings.slideshow_speed_seconds);
     settings.slideshow_ignore_smaller_than =
         normalize_slideshow_ignore_smaller_than(settings.slideshow_ignore_smaller_than);
     settings.external_viewers.retain(|viewer| {

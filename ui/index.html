@@ -4,14 +4,20 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Picturious</title>
-    <link rel="stylesheet" href="./styles.css?v=layout-13" />
+    <link rel="stylesheet" href="./styles.css?v=layout-15" />
   </head>
   <body>
     <main class="workspace">
       <header class="toolbar">
         <div class="title-block">
           <h2 id="view-title">Library</h2>
-          <p id="status">Starting Picturious...</p>
+          <div class="status-row">
+            <p id="status">Starting Picturious...</p>
+            <div id="busy-indicator" class="busy-indicator hidden" role="status" aria-live="polite">
+              <span class="busy-spinner" aria-hidden="true"></span>
+              <span id="busy-text">Working</span>
+            </div>
+          </div>
         </div>
         <div class="toolbar-actions">
           <label class="thumb-scale-control" title="Thumbnail item size">
@@ -78,7 +84,16 @@
             step="0.1"
             value="3"
           />
-          <output id="slideshow-speed-value">3.0 s</output>
+          <input
+            id="slideshow-speed-number"
+            class="number-input"
+            type="number"
+            min="0.001"
+            step="0.001"
+            value="3.000"
+            aria-label="Slideshow speed in seconds"
+          />
+          <span class="unit-label">s</span>
         </label>
 
         <label class="select-row">
@@ -101,6 +116,6 @@
       </form>
     </dialog>
 
-    <script src="./main.js?v=layout-13"></script>
+    <script src="./main.js?v=layout-15"></script>
   </body>
 </html>

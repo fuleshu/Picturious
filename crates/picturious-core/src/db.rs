@@ -3,6 +3,7 @@ use crate::models::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -11,7 +12,7 @@ use uuid::Uuid;
 const DB_DIR: &str = ".picturious";
 const DB_FILE: &str = "root.sqlite";
 const ROOT_RELATIVE_PATH: &str = "";
-const SCAN_COMMIT_INTERVAL: u32 = 32;
+const SCHEMA_VERSION: &str = "2";
 const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "avif",
 ];
@@ -32,6 +33,28 @@ pub struct RootDatabase {
 struct ScannedImage {
     file_name: String,
     relative_path: String,
+    file_size: u64,
+    modified_unix_ms: i64,
+}
+
+struct ScannedFolder {
+    file_name: String,
+    relative_path: String,
+    modified_unix_ms: i64,
+}
+
+struct DirectorySnapshot {
+    child_folders: Vec<ScannedFolder>,
+    images: Vec<ScannedImage>,
+    content_hash: String,
+    skipped_entries: u32,
+}
+
+struct ExistingImage {
+    file_name: String,
+    relative_path: String,
+    file_size: u64,
+    modified_unix_ms: i64,
 }
 
 struct FolderRow {
@@ -41,6 +64,16 @@ struct FolderRow {
     selected_thumbnail_image_id: Option<i64>,
     image_count: u32,
     child_folder_count: u32,
+    validated: bool,
+}
+
+struct FolderValidation {
+    relative_path: String,
+    changed: bool,
+    should_descend: bool,
+    child_relative_paths: Vec<String>,
+    image_count: u32,
+    skipped_entries: u32,
 }
 
 impl RootDatabase {
@@ -79,9 +112,7 @@ impl RootDatabase {
             connection,
         };
         db.configure()?;
-        if initialize {
-            db.init_schema()?;
-        }
+        db.init_schema()?;
         Ok(db)
     }
 
@@ -136,95 +167,41 @@ impl RootDatabase {
     where
         F: FnMut(ScanProgress),
     {
-        let scan_started = unix_time_ms(SystemTime::now());
+        self.rescan_with_progress(root_id, ROOT_RELATIVE_PATH, |progress| {
+            on_progress(progress)
+        })
+    }
+
+    pub fn rescan_with_progress<F>(
+        &mut self,
+        root_id: &str,
+        relative_path: &str,
+        mut on_progress: F,
+    ) -> Result<ScanReport>
+    where
+        F: FnMut(ScanProgress),
+    {
+        let start_relative_path = normalize_relative_path(relative_path);
         let mut folders_seen = 0_u32;
         let mut images_seen = 0_u32;
         let mut skipped_entries = 0_u32;
-        let root_path = self.root_path.clone();
-        let mut pending_dirs = vec![root_path.clone()];
-        let mut folders_since_commit = 0_u32;
-        let mut tx = self.connection.transaction()?;
+        let mut pending_dirs = VecDeque::from([start_relative_path]);
+        let mut queued_dirs = HashSet::new();
 
-        while let Some(folder_path) = pending_dirs.pop() {
-            let relative_path = relative_path_for(&root_path, &folder_path)?;
-            let parent_relative_path = parent_relative_path(&relative_path);
-            let mut images = Vec::new();
-
-            match fs::read_dir(&folder_path) {
-                Ok(entries) => {
-                    for entry in entries {
-                        let entry = match entry {
-                            Ok(entry) => entry,
-                            Err(_) => {
-                                skipped_entries += 1;
-                                continue;
-                            }
-                        };
-
-                        let path = entry.path();
-                        let file_name = entry.file_name().to_string_lossy().to_string();
-                        let file_type = match entry.file_type() {
-                            Ok(metadata) => metadata,
-                            Err(_) => {
-                                skipped_entries += 1;
-                                continue;
-                            }
-                        };
-
-                        if file_name.eq_ignore_ascii_case(DB_DIR) && file_type.is_dir() {
-                            continue;
-                        }
-
-                        if file_type.is_dir() {
-                            pending_dirs.push(path);
-                            continue;
-                        }
-
-                        if !file_type.is_file() || !is_supported_image(&path) {
-                            continue;
-                        }
-
-                        let image_relative_path = relative_path_for(&root_path, &path)?;
-
-                        images.push(ScannedImage {
-                            file_name,
-                            relative_path: image_relative_path,
-                        });
-                    }
-                }
-                Err(_) => {
-                    skipped_entries += 1;
-                }
+        while let Some(relative_path) = pending_dirs.pop_front() {
+            if !queued_dirs.insert(relative_path.clone()) {
+                continue;
             }
 
-            let folder_id = upsert_folder(
-                &tx,
-                &relative_path,
-                parent_relative_path.as_deref(),
-                scan_started,
-            )?;
-
-            for image in images {
-                upsert_image(
-                    &tx,
-                    folder_id,
-                    &image.file_name,
-                    &image.relative_path,
-                    0,
-                    0,
-                    None,
-                    None,
-                    scan_started,
-                )?;
-                images_seen += 1;
-            }
+            let validation = self.validate_folder(root_id, &relative_path)?;
             folders_seen += 1;
-            folders_since_commit += 1;
+            images_seen = images_seen.saturating_add(validation.image_count);
+            skipped_entries = skipped_entries.saturating_add(validation.skipped_entries);
 
-            if folders_since_commit >= SCAN_COMMIT_INTERVAL {
-                tx.commit()?;
-                tx = self.connection.transaction()?;
-                folders_since_commit = 0;
+            if validation.should_descend {
+                for child_relative_path in &validation.child_relative_paths {
+                    pending_dirs.push_back(child_relative_path.clone());
+                }
             }
 
             on_progress(ScanProgress {
@@ -232,19 +209,10 @@ impl RootDatabase {
                 folders_seen,
                 images_seen,
                 skipped_entries,
-                current_relative_path: relative_path,
+                current_relative_path: validation.relative_path,
+                changed: validation.changed,
             });
         }
-
-        tx.execute(
-            "DELETE FROM images WHERE scanned_at_unix_ms <> ?1",
-            params![scan_started],
-        )?;
-        tx.execute(
-            "DELETE FROM folders WHERE relative_path <> '' AND last_seen_scan_ms <> ?1",
-            params![scan_started],
-        )?;
-        tx.commit()?;
 
         Ok(ScanReport {
             root_id: root_id.to_owned(),
@@ -324,6 +292,7 @@ impl RootDatabase {
             for visible_row in self.visible_folder_rows_from(row, 1)? {
                 folder_batch.push(self.folder_summary(
                     root_id,
+                    &normalized_relative_path,
                     visible_row.id,
                     visible_row.relative_path,
                     visible_row.parent_relative_path,
@@ -354,6 +323,123 @@ impl RootDatabase {
         }
 
         Ok(())
+    }
+
+    pub fn validate_folder_shallow(&mut self, root_id: &str, relative_path: &str) -> Result<bool> {
+        self.validate_folder(root_id, relative_path)
+            .map(|validation| validation.changed)
+    }
+
+    fn validate_folder(&mut self, _root_id: &str, relative_path: &str) -> Result<FolderValidation> {
+        self.ensure_scan_columns()?;
+
+        let normalized_relative_path = normalize_relative_path(relative_path);
+        let folder_path = path_from_relative(&self.root_path, &normalized_relative_path);
+        if !folder_path.is_dir() {
+            let changed = self.delete_folder_subtree(&normalized_relative_path)?;
+            return Ok(FolderValidation {
+                relative_path: normalized_relative_path,
+                changed,
+                should_descend: false,
+                child_relative_paths: Vec::new(),
+                image_count: 0,
+                skipped_entries: 1,
+            });
+        }
+
+        let snapshot = read_directory_snapshot(&self.root_path, &folder_path)?;
+        let validation_started = unix_time_ms(SystemTime::now());
+        let parent_path = parent_relative_path(&normalized_relative_path);
+        let previous_hash = self.folder_content_hash(&normalized_relative_path);
+        let existing_folder_id = self.folder_id_optional(&normalized_relative_path)?;
+        let existing_images = if let Some(folder_id) = existing_folder_id {
+            self.direct_image_rows(folder_id)?
+        } else {
+            Vec::new()
+        };
+        let existing_children = self.direct_child_relative_paths(&normalized_relative_path)?;
+        let child_hashes_missing =
+            self.direct_child_has_unvalidated_folder(&normalized_relative_path);
+        let scanned_child_paths = snapshot
+            .child_folders
+            .iter()
+            .map(|folder| folder.relative_path.clone())
+            .collect::<HashSet<_>>();
+        let scanned_image_paths = snapshot
+            .images
+            .iter()
+            .map(|image| image.relative_path.clone())
+            .collect::<HashSet<_>>();
+
+        let hash_changed = previous_hash.as_deref() != Some(snapshot.content_hash.as_str());
+        let changed = !same_image_entries(&existing_images, &snapshot.images)
+            || existing_children != scanned_child_paths
+            || existing_folder_id.is_none();
+        let should_descend = changed || hash_changed || child_hashes_missing;
+
+        let tx = self.connection.transaction()?;
+        let folder_id = upsert_folder(
+            &tx,
+            &normalized_relative_path,
+            parent_path.as_deref(),
+            Some(&snapshot.content_hash),
+            validation_started,
+        )?;
+
+        for folder in &snapshot.child_folders {
+            let child_parent = parent_relative_path(&folder.relative_path);
+            upsert_folder(
+                &tx,
+                &folder.relative_path,
+                child_parent.as_deref(),
+                None,
+                validation_started,
+            )?;
+        }
+
+        for child_path in existing_children.difference(&scanned_child_paths) {
+            delete_folder_subtree_tx(&tx, child_path)?;
+        }
+
+        for image_path in existing_images
+            .iter()
+            .map(|image| image.relative_path.as_str())
+            .filter(|relative_path| !scanned_image_paths.contains(*relative_path))
+        {
+            tx.execute(
+                "DELETE FROM images WHERE relative_path = ?1",
+                params![image_path],
+            )?;
+        }
+
+        for image in &snapshot.images {
+            upsert_image(
+                &tx,
+                folder_id,
+                &image.file_name,
+                &image.relative_path,
+                image.file_size,
+                image.modified_unix_ms,
+                None,
+                None,
+                validation_started,
+            )?;
+        }
+
+        tx.commit()?;
+
+        Ok(FolderValidation {
+            relative_path: normalized_relative_path,
+            changed,
+            should_descend,
+            child_relative_paths: snapshot
+                .child_folders
+                .into_iter()
+                .map(|folder| folder.relative_path)
+                .collect(),
+            image_count: snapshot.images.len() as u32,
+            skipped_entries: snapshot.skipped_entries,
+        })
     }
 
     pub fn image_path(&self, image_id: i64) -> Result<(PathBuf, i64)> {
@@ -473,7 +559,8 @@ impl RootDatabase {
     fn init_schema(&self) -> Result<()> {
         self.connection.execute_batch(
             "
-            PRAGMA journal_mode = DELETE;
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
 
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
@@ -486,6 +573,8 @@ impl RootDatabase {
                 parent_relative_path TEXT,
                 selected_thumbnail_image_id INTEGER,
                 last_seen_scan_ms INTEGER NOT NULL DEFAULT 0,
+                content_hash TEXT,
+                validated_at_unix_ms INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY(selected_thumbnail_image_id) REFERENCES images(id) ON DELETE SET NULL
             );
 
@@ -536,13 +625,15 @@ impl RootDatabase {
             ",
         )?;
 
+        self.ensure_scan_columns()?;
+
         self.connection.execute(
             "
             INSERT INTO meta(key, value)
-            VALUES('schema_version', '1')
-            ON CONFLICT(key) DO NOTHING
+            VALUES('schema_version', ?1)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
             ",
-            [],
+            params![SCHEMA_VERSION],
         )?;
         self.connection.execute(
             "
@@ -551,6 +642,41 @@ impl RootDatabase {
             ON CONFLICT(relative_path) DO NOTHING
             ",
             [],
+        )?;
+        Ok(())
+    }
+
+    fn ensure_column(&self, table: &str, column: &str, definition: &str) -> Result<()> {
+        let columns = {
+            let mut statement = self
+                .connection
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .with_context(|| format!("could not inspect table {table}"))?;
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .with_context(|| format!("could not read columns for table {table}"))?
+        };
+
+        if columns.iter().any(|existing| existing == column) {
+            return Ok(());
+        }
+
+        self.connection
+            .execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+                [],
+            )
+            .with_context(|| format!("could not add column {table}.{column}"))?;
+        Ok(())
+    }
+
+    fn ensure_scan_columns(&self) -> Result<()> {
+        self.ensure_column("folders", "content_hash", "TEXT")?;
+        self.ensure_column(
+            "folders",
+            "validated_at_unix_ms",
+            "INTEGER NOT NULL DEFAULT 0",
         )?;
         Ok(())
     }
@@ -588,6 +714,7 @@ impl RootDatabase {
             .map(|row| {
                 self.folder_summary(
                     root_id,
+                    parent_relative_path,
                     row.id,
                     row.relative_path,
                     row.parent_relative_path,
@@ -623,6 +750,7 @@ impl RootDatabase {
                 relative_path,
                 parent_relative_path,
                 selected_thumbnail_image_id,
+                content_hash IS NOT NULL AND validated_at_unix_ms > 0 AS validated,
                 (SELECT COUNT(*) FROM images WHERE folder_id = folders.id) AS image_count,
                 (SELECT COUNT(*) FROM folders AS child
                     WHERE child.parent_relative_path = folders.relative_path) AS child_folder_count
@@ -639,8 +767,9 @@ impl RootDatabase {
                 relative_path: row.get::<_, String>(1)?,
                 parent_relative_path: row.get::<_, Option<String>>(2)?,
                 selected_thumbnail_image_id: row.get::<_, Option<i64>>(3)?,
-                image_count: row.get::<_, i64>(4)?.max(0) as u32,
-                child_folder_count: row.get::<_, i64>(5)?.max(0) as u32,
+                validated: row.get::<_, i64>(4)? != 0,
+                image_count: row.get::<_, i64>(5)?.max(0) as u32,
+                child_folder_count: row.get::<_, i64>(6)?.max(0) as u32,
             })?;
         }
 
@@ -664,11 +793,11 @@ impl RootDatabase {
     }
 
     fn visible_folder_rows_from(&self, row: FolderRow, depth: u8) -> Result<Vec<FolderRow>> {
-        if depth > 64 || !self.folder_subtree_has_images(&row.relative_path)? {
+        if depth > 64 {
             return Ok(Vec::new());
         }
 
-        if row.image_count > 0 {
+        if !row.validated || row.image_count > 0 {
             return Ok(vec![row]);
         }
 
@@ -731,6 +860,7 @@ impl RootDatabase {
     fn folder_summary(
         &self,
         root_id: &str,
+        display_parent_relative_path: &str,
         id: i64,
         relative_path: String,
         parent_relative_path: Option<String>,
@@ -749,7 +879,7 @@ impl RootDatabase {
             root_id: root_id.to_owned(),
             id,
             relative_path: relative_path.clone(),
-            name: display_name_for_relative_path(&relative_path),
+            name: display_name_for_visible_child(display_parent_relative_path, &relative_path),
             parent_relative_path,
             thumbnail_image_id,
             direct_keywords,
@@ -877,6 +1007,93 @@ impl RootDatabase {
             .with_context(|| format!("folder not found: {relative_path}"))
     }
 
+    fn folder_id_optional(&self, relative_path: &str) -> Result<Option<i64>> {
+        self.connection
+            .query_row(
+                "SELECT id FROM folders WHERE relative_path = ?1",
+                params![relative_path],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("could not read folder id")
+    }
+
+    fn folder_content_hash(&self, relative_path: &str) -> Option<String> {
+        if self.ensure_scan_columns().is_err() {
+            return None;
+        }
+
+        self.connection
+            .query_row(
+                "SELECT content_hash FROM folders WHERE relative_path = ?1",
+                params![relative_path],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    fn direct_child_relative_paths(&self, parent_relative_path: &str) -> Result<HashSet<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT relative_path FROM folders WHERE parent_relative_path = ?1")?;
+        let rows = statement
+            .query_map(params![parent_relative_path], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().collect())
+    }
+
+    fn direct_child_has_unvalidated_folder(&self, parent_relative_path: &str) -> bool {
+        if self.ensure_scan_columns().is_err() {
+            return true;
+        }
+
+        self.connection
+            .query_row(
+                "
+            SELECT EXISTS(
+                SELECT 1
+                FROM folders
+                WHERE parent_relative_path = ?1
+                    AND (content_hash IS NULL OR validated_at_unix_ms = 0)
+            )
+            ",
+                params![parent_relative_path],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|has_unvalidated| has_unvalidated != 0)
+            .unwrap_or(true)
+    }
+
+    fn direct_image_rows(&self, folder_id: i64) -> Result<Vec<ExistingImage>> {
+        let mut statement = self.connection.prepare(
+            "
+            SELECT file_name, relative_path, file_size, modified_unix_ms
+            FROM images
+            WHERE folder_id = ?1
+            ",
+        )?;
+        let rows = statement
+            .query_map(params![folder_id], |row| {
+                Ok(ExistingImage {
+                    file_name: row.get(0)?,
+                    relative_path: row.get(1)?,
+                    file_size: row.get::<_, i64>(2)?.max(0) as u64,
+                    modified_unix_ms: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn delete_folder_subtree(&mut self, relative_path: &str) -> Result<bool> {
+        let tx = self.connection.transaction()?;
+        let changed = delete_folder_subtree_tx(&tx, relative_path)?;
+        tx.commit()?;
+        Ok(changed)
+    }
+
     fn visible_parent_relative_path(&self, relative_path: &str) -> Result<Option<String>> {
         let mut candidate = parent_relative_path(relative_path);
         while let Some(parent) = candidate {
@@ -908,40 +1125,40 @@ impl RootDatabase {
 
         Ok(count > 0)
     }
-
-    fn folder_subtree_has_images(&self, relative_path: &str) -> Result<bool> {
-        let (lower_bound, upper_bound) = subtree_image_bounds(relative_path);
-        let has_images = self.connection.query_row(
-            "
-            SELECT EXISTS(
-                SELECT 1
-                FROM images
-                WHERE relative_path >= ?1 AND relative_path < ?2
-            )
-            ",
-            params![lower_bound, upper_bound],
-            |row| row.get::<_, i64>(0),
-        )?;
-
-        Ok(has_images != 0)
-    }
 }
 
 fn upsert_folder(
     tx: &Transaction<'_>,
     relative_path: &str,
     parent_relative_path: Option<&str>,
-    scan_started: i64,
+    content_hash: Option<&str>,
+    validation_started: i64,
 ) -> Result<i64> {
     tx.execute(
         "
-        INSERT INTO folders(relative_path, parent_relative_path, last_seen_scan_ms)
-        VALUES(?1, ?2, ?3)
+        INSERT INTO folders(
+            relative_path,
+            parent_relative_path,
+            last_seen_scan_ms,
+            content_hash,
+            validated_at_unix_ms
+        )
+        VALUES(?1, ?2, ?3, ?4, CASE WHEN ?4 IS NULL THEN 0 ELSE ?3 END)
         ON CONFLICT(relative_path) DO UPDATE SET
             parent_relative_path = excluded.parent_relative_path,
-            last_seen_scan_ms = excluded.last_seen_scan_ms
+            last_seen_scan_ms = excluded.last_seen_scan_ms,
+            content_hash = COALESCE(excluded.content_hash, folders.content_hash),
+            validated_at_unix_ms = CASE
+                WHEN excluded.content_hash IS NULL THEN folders.validated_at_unix_ms
+                ELSE excluded.validated_at_unix_ms
+            END
         ",
-        params![relative_path, parent_relative_path, scan_started],
+        params![
+            relative_path,
+            parent_relative_path,
+            validation_started,
+            content_hash
+        ],
     )?;
 
     tx.query_row(
@@ -999,6 +1216,211 @@ fn upsert_image(
     )?;
 
     Ok(())
+}
+
+fn delete_folder_subtree_tx(tx: &Transaction<'_>, relative_path: &str) -> Result<bool> {
+    let changed = if relative_path.is_empty() {
+        let images_deleted = tx.execute("DELETE FROM images", [])?;
+        let folders_deleted = tx.execute("DELETE FROM folders WHERE relative_path <> ''", [])?;
+        images_deleted + folders_deleted
+    } else {
+        let (lower_bound, upper_bound) = subtree_image_bounds(relative_path);
+        let images_deleted = tx.execute(
+            "
+            DELETE FROM images
+            WHERE relative_path = ?1 OR (relative_path >= ?2 AND relative_path < ?3)
+            ",
+            params![relative_path, lower_bound, upper_bound],
+        )?;
+        let folders_deleted = tx.execute(
+            "
+            DELETE FROM folders
+            WHERE relative_path = ?1 OR (relative_path >= ?2 AND relative_path < ?3)
+            ",
+            params![relative_path, lower_bound, upper_bound],
+        )?;
+        images_deleted + folders_deleted
+    };
+
+    Ok(changed > 0)
+}
+
+fn same_image_entries(existing: &[ExistingImage], scanned: &[ScannedImage]) -> bool {
+    if existing.len() != scanned.len() {
+        return false;
+    }
+
+    let existing = existing
+        .iter()
+        .map(|image| {
+            (
+                image.relative_path.as_str(),
+                (
+                    image.file_name.as_str(),
+                    image.file_size,
+                    image.modified_unix_ms,
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    scanned.iter().all(|image| {
+        existing.get(image.relative_path.as_str()).is_some_and(
+            |(file_name, file_size, modified_unix_ms)| {
+                *file_name == image.file_name
+                    && *file_size == image.file_size
+                    && *modified_unix_ms == image.modified_unix_ms
+            },
+        )
+    })
+}
+
+fn read_directory_snapshot(root_path: &Path, folder_path: &Path) -> Result<DirectorySnapshot> {
+    let mut child_folders = Vec::new();
+    let mut images = Vec::new();
+    let mut skipped_entries = 0_u32;
+
+    match fs::read_dir(folder_path) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        skipped_entries += 1;
+                        continue;
+                    }
+                };
+
+                let path = entry.path();
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(_) => {
+                        skipped_entries += 1;
+                        continue;
+                    }
+                };
+
+                if file_name.eq_ignore_ascii_case(DB_DIR) && file_type.is_dir() {
+                    continue;
+                }
+
+                if file_type.is_dir() {
+                    let (modified_unix_ms, metadata_ok) = entry_modified_unix_ms(&entry);
+                    if !metadata_ok {
+                        skipped_entries += 1;
+                    }
+                    child_folders.push(ScannedFolder {
+                        file_name,
+                        relative_path: relative_path_for(root_path, &path)?,
+                        modified_unix_ms,
+                    });
+                    continue;
+                }
+
+                if !file_type.is_file() || !is_supported_image(&path) {
+                    continue;
+                }
+
+                let (file_size, modified_unix_ms, metadata_ok) = entry_file_fingerprint(&entry);
+                if !metadata_ok {
+                    skipped_entries += 1;
+                }
+                images.push(ScannedImage {
+                    file_name,
+                    relative_path: relative_path_for(root_path, &path)?,
+                    file_size,
+                    modified_unix_ms,
+                });
+            }
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("could not read directory {}", folder_path.display()));
+        }
+    }
+
+    child_folders.sort_by(|left, right| {
+        left.relative_path
+            .to_lowercase()
+            .cmp(&right.relative_path.to_lowercase())
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+    });
+    images.sort_by(|left, right| {
+        left.file_name
+            .to_lowercase()
+            .cmp(&right.file_name.to_lowercase())
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+    });
+
+    let content_hash = directory_content_hash(&child_folders, &images);
+
+    Ok(DirectorySnapshot {
+        child_folders,
+        images,
+        content_hash,
+        skipped_entries,
+    })
+}
+
+fn entry_modified_unix_ms(entry: &fs::DirEntry) -> (i64, bool) {
+    match entry.metadata().and_then(|metadata| metadata.modified()) {
+        Ok(modified) => (unix_time_ms(modified), true),
+        Err(_) => (0, false),
+    }
+}
+
+fn entry_file_fingerprint(entry: &fs::DirEntry) -> (u64, i64, bool) {
+    match entry.metadata() {
+        Ok(metadata) => {
+            let modified_unix_ms = metadata.modified().map(unix_time_ms).unwrap_or(0);
+            (metadata.len(), modified_unix_ms, true)
+        }
+        Err(_) => (0, 0, false),
+    }
+}
+
+fn directory_content_hash(child_folders: &[ScannedFolder], images: &[ScannedImage]) -> String {
+    let mut hash = FNV_OFFSET_BASIS;
+    for folder in child_folders {
+        fnv_update_str(&mut hash, "D");
+        fnv_update_str(&mut hash, &folder.file_name);
+        fnv_update_str(&mut hash, &folder.relative_path);
+        fnv_update_i64(&mut hash, folder.modified_unix_ms);
+    }
+    for image in images {
+        fnv_update_str(&mut hash, "I");
+        fnv_update_str(&mut hash, &image.file_name);
+        fnv_update_str(&mut hash, &image.relative_path);
+        fnv_update_u64(&mut hash, image.file_size);
+        fnv_update_i64(&mut hash, image.modified_unix_ms);
+    }
+    format!("{hash:016x}")
+}
+
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x00000100000001b3;
+
+fn fnv_update_str(hash: &mut u64, value: &str) {
+    for byte in value.as_bytes() {
+        fnv_update_byte(hash, *byte);
+    }
+    fnv_update_byte(hash, 0xff);
+}
+
+fn fnv_update_u64(hash: &mut u64, value: u64) {
+    for byte in value.to_le_bytes() {
+        fnv_update_byte(hash, byte);
+    }
+}
+
+fn fnv_update_i64(hash: &mut u64, value: i64) {
+    fnv_update_u64(hash, value as u64);
+}
+
+fn fnv_update_byte(hash: &mut u64, byte: u8) {
+    *hash ^= u64::from(byte);
+    *hash = hash.wrapping_mul(FNV_PRIME);
 }
 
 fn names_for_folder(connection: &Connection, sql: &str, folder_id: i64) -> Result<Vec<String>> {
@@ -1107,6 +1529,24 @@ fn display_name_for_relative_path(relative_path: &str) -> String {
             .filter(|name| !name.is_empty())
             .unwrap_or(relative_path)
             .to_owned()
+    }
+}
+
+fn display_name_for_visible_child(parent_relative_path: &str, relative_path: &str) -> String {
+    let parent = normalize_relative_path(parent_relative_path);
+    let relative = normalize_relative_path(relative_path);
+    let visible_name = if parent.is_empty() {
+        relative.as_str()
+    } else {
+        relative
+            .strip_prefix(&format!("{parent}/"))
+            .unwrap_or(relative.as_str())
+    };
+
+    if visible_name.is_empty() {
+        display_name_for_relative_path(&relative)
+    } else {
+        visible_name.replace('/', "\\")
     }
 }
 

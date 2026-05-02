@@ -6,9 +6,13 @@ const BASE_TILE_SIZE = 188;
 const THUMBNAIL_PIXEL_SIZE = 450;
 const STREAM_ITEMS_PER_FRAME = 16;
 const VIEWER_CURSOR_HIDE_DELAY_MS = 3000;
+const MAX_FOLDER_VIEW_CACHE_ENTRIES = 80;
+const MAX_THUMBNAIL_DATA_CACHE_ENTRIES = 700;
 
 const gridNode = document.querySelector("#content-grid");
 const statusNode = document.querySelector("#status");
+const busyIndicator = document.querySelector("#busy-indicator");
+const busyText = document.querySelector("#busy-text");
 const titleNode = document.querySelector("#view-title");
 const breadcrumbsNode = document.querySelector("#breadcrumbs");
 const addRootButton = document.querySelector("#add-root-button");
@@ -25,7 +29,7 @@ const settingsCloseButton = document.querySelector("#settings-close-button");
 const upscaleFullscreenInput = document.querySelector("#upscale-fullscreen");
 const slideshowLoopInput = document.querySelector("#slideshow-loop");
 const slideshowSpeedInput = document.querySelector("#slideshow-speed");
-const slideshowSpeedValue = document.querySelector("#slideshow-speed-value");
+const slideshowSpeedNumberInput = document.querySelector("#slideshow-speed-number");
 const slideshowIgnoreSmallerInput = document.querySelector("#slideshow-ignore-smaller");
 const addExternalViewerButton = document.querySelector("#add-external-viewer-button");
 const externalViewersList = document.querySelector("#external-viewers-list");
@@ -38,17 +42,24 @@ const state = {
   atRootOverview: true,
   viewerIndex: 0,
   activeScans: new Set(),
+  scanProgressText: new Map(),
   viewScrollPositions: new Map(),
   pendingScrollRestore: null,
   viewGeneration: 0,
   folderRequestId: 0,
   activeFolderRequestId: null,
   folderLoading: false,
+  folderViewCache: new Map(),
   streamRenderQueue: [],
   streamRenderScheduled: false,
   streamFinishedPayload: null,
+  validationPatchTimer: null,
+  visibleValidationTimer: null,
+  visibleValidationActive: false,
+  validatedVisibleKeys: new Set(),
   viewerGeneration: 0,
   imageUrlCache: new Map(),
+  thumbnailDataCache: new Map(),
   lastWheelAt: 0,
   contextMenuImage: null,
   contextMenuFolder: null,
@@ -97,6 +108,8 @@ upscaleFullscreenInput.addEventListener("change", handleSettingsInput);
 slideshowLoopInput.addEventListener("change", handleSettingsInput);
 slideshowSpeedInput.addEventListener("input", handleSlideshowSpeedInput);
 slideshowSpeedInput.addEventListener("change", handleSettingsInput);
+slideshowSpeedNumberInput.addEventListener("input", handleSlideshowSpeedNumberInput);
+slideshowSpeedNumberInput.addEventListener("change", handleSettingsInput);
 slideshowIgnoreSmallerInput.addEventListener("change", handleSettingsInput);
 addExternalViewerButton.addEventListener("click", addExternalViewer);
 viewerCloseHotspot.addEventListener("click", closeViewer);
@@ -107,6 +120,9 @@ document.addEventListener("contextmenu", handleDocumentContextMenu);
 document.addEventListener("click", handleDocumentClick);
 window.addEventListener("blur", hideThumbContextMenu);
 window.addEventListener("resize", hideThumbContextMenu);
+gridNode.addEventListener("scroll", () => scheduleVisibleFolderValidation(250), {
+  passive: true,
+});
 thumbContextMenu.addEventListener("click", handleThumbContextAction);
 
 document.addEventListener("keydown", (event) => {
@@ -209,12 +225,61 @@ async function wireScanEvents() {
     }
 
     state.folderLoading = false;
+    updateBusyIndicator();
     showError(payload.message);
+  });
+
+  await listen("folder-validated", ({ payload }) => {
+    if (payload.changed) {
+      invalidateFolderCachesForChanges(payload.root_id, [payload.relative_path]);
+    }
+
+    if (
+      payload.root_id === state.currentRootId &&
+      payload.changed &&
+      folderValidationAffectsCurrentView(payload.relative_path)
+    ) {
+      scheduleCurrentFolderPatch();
+    }
+  });
+
+  await listen("folder-validation-finished", ({ payload }) => {
+    if (payload.request_id !== state.activeFolderRequestId) {
+      return;
+    }
+
+    state.visibleValidationActive = false;
+    updateBusyIndicator();
+
+    const changedPaths = payload.changed_paths ?? [];
+    invalidateFolderCachesForChanges(payload.root_id, changedPaths);
+    if (changedPaths.some(folderValidationIsCurrentFolder)) {
+      state.validatedVisibleKeys.clear();
+    }
+    if (changedPaths.some(folderValidationAffectsCurrentView)) {
+      scheduleCurrentFolderPatch();
+    }
+  });
+
+  await listen("folder-validation-error", ({ payload }) => {
+    if (payload.request_id !== state.activeFolderRequestId) {
+      return;
+    }
+
+    state.visibleValidationActive = false;
+    state.validatedVisibleKeys.clear();
+    updateBusyIndicator();
+    console.warn(payload.message);
   });
 
   await listen("scan-progress", ({ payload }) => {
     const wasActive = state.activeScans.has(payload.root_id);
     state.activeScans.add(payload.root_id);
+    state.scanProgressText.set(
+      payload.root_id,
+      `Scanning ${payload.folders_seen} folders`,
+    );
+    updateBusyIndicator();
     if (!wasActive) {
       renderRootOverviewIfVisible({ keepStatus: true, keepScroll: true });
     }
@@ -231,9 +296,16 @@ async function wireScanEvents() {
 
   await listen("scan-finished", async ({ payload }) => {
     state.activeScans.delete(payload.root_id);
+    state.scanProgressText.delete(payload.root_id);
+    clearValidationPatchTimer();
+    updateBusyIndicator();
+    invalidateFolderViewCache(payload.root_id);
+    invalidateThumbnailDataCache(payload.root_id);
     await refreshOverview();
     if (payload.root_id === state.currentRootId) {
-      await refreshCurrentFolder({ keepStatus: true });
+      scanButton.disabled = false;
+      resumeDeferredThumbnails();
+      scheduleVisibleFolderValidation(100);
       setStatus(
         `Scan complete: ${payload.folders_seen} folders, ${payload.images_seen} images`,
       );
@@ -247,6 +319,13 @@ async function wireScanEvents() {
 
   await listen("scan-error", ({ payload }) => {
     state.activeScans.delete(payload.root_id);
+    state.scanProgressText.delete(payload.root_id);
+    clearValidationPatchTimer();
+    updateBusyIndicator();
+    if (payload.root_id === state.currentRootId) {
+      scanButton.disabled = false;
+      resumeDeferredThumbnails();
+    }
     renderRootOverviewIfVisible({ keepStatus: true, keepScroll: true });
     if (payload.root_id === state.currentRootId) {
       setStatus(payload.message);
@@ -284,30 +363,37 @@ async function scanCurrentRoot() {
     return;
   }
 
-  await startScan(state.currentRootId);
+  await startScan(state.currentRootId, state.currentPath);
 }
 
-async function startScan(rootId) {
+async function startScan(rootId, relativePath = "") {
   const root = state.roots.find((item) => item.id === rootId);
   if (!root?.connected) {
     return;
   }
 
+  const scanTarget = relativePath ? `${root.display_name}/${relativePath}` : root.display_name;
   state.activeScans.add(rootId);
+  state.scanProgressText.set(rootId, `Scanning ${scanTarget}`);
+  updateBusyIndicator();
   pauseThumbnailWorkForRoot(rootId);
   renderRootOverviewIfVisible({ keepStatus: true, keepScroll: true });
   scanButton.disabled = true;
-  setStatus(`Scanning ${root.display_name}...`);
+  setStatus(`Scanning ${scanTarget}...`);
   let started;
   try {
-    started = await invoke("start_scan", { rootId });
+    started = await invoke("start_scan", { rootId, relativePath });
   } catch (error) {
     state.activeScans.delete(rootId);
+    state.scanProgressText.delete(rootId);
+    updateBusyIndicator();
     renderRootOverviewIfVisible({ keepStatus: true, keepScroll: true });
     throw error;
   }
   if (!started) {
     setStatus(`${root.display_name} is already scanning`);
+    state.scanProgressText.delete(rootId);
+    updateBusyIndicator();
   }
 }
 
@@ -332,6 +418,8 @@ async function removeRoot(rootId) {
   const overview = await invoke("remove_root", { rootId });
   state.roots = overview.roots;
   state.activeScans.delete(rootId);
+  invalidateFolderViewCache(rootId);
+  invalidateThumbnailDataCache(rootId);
 
   if (state.currentRootId === rootId) {
     openRootOverview({ keepStatus: true });
@@ -359,9 +447,30 @@ async function openFolder(rootId, relativePath, options = {}) {
   state.atRootOverview = false;
   const requestId = ++state.folderRequestId;
   state.activeFolderRequestId = requestId;
-  state.folderLoading = true;
+  state.folderLoading = false;
+  state.visibleValidationActive = false;
+  state.validatedVisibleKeys.clear();
+  clearValidationPatchTimer();
+  clearVisibleValidationTimer();
+  updateBusyIndicator();
   resetStreamRenderQueue();
   prepareScrollRestore(rootId, state.currentPath, options);
+  resetThumbnailWork();
+
+  const cachedView = options.forceReload
+    ? null
+    : cachedFolderView(rootId, state.currentPath);
+  if (cachedView) {
+    state.currentView = cachedView;
+    renderFolderView(cachedView, options);
+    restorePendingScrollPosition();
+    updateBusyIndicator();
+    scheduleVisibleFolderValidation(100);
+    return;
+  }
+
+  state.folderLoading = true;
+  updateBusyIndicator();
   state.currentView = {
     root_id: rootId,
     root_display_name: root.display_name,
@@ -372,7 +481,6 @@ async function openFolder(rootId, relativePath, options = {}) {
     images: [],
   };
   state.imageUrlCache.clear();
-  resetThumbnailWork();
   renderPendingFolderView(state.currentView, options);
   await nextFrame();
   if (requestId !== state.activeFolderRequestId) {
@@ -386,6 +494,8 @@ async function openFolder(rootId, relativePath, options = {}) {
   }).catch((error) => {
     if (requestId === state.activeFolderRequestId) {
       state.folderLoading = false;
+      state.visibleValidationActive = false;
+      updateBusyIndicator();
       showError(error);
     }
   });
@@ -403,6 +513,182 @@ async function refreshCurrentFolder(options = {}) {
       showError(error);
     }
   }
+}
+
+function folderValidationIsCurrentFolder(relativePath) {
+  if (state.atRootOverview || !state.currentView) {
+    return false;
+  }
+
+  const normalizedPath = normalizeRelativePath(relativePath);
+  return normalizedPath === state.currentPath;
+}
+
+function folderValidationAffectsCurrentView(relativePath) {
+  if (folderValidationIsCurrentFolder(relativePath)) {
+    return true;
+  }
+
+  if (state.atRootOverview || !state.currentView) {
+    return false;
+  }
+
+  const normalizedPath = normalizeRelativePath(relativePath);
+  if (parentPathFor(normalizedPath) === state.currentPath) {
+    return true;
+  }
+
+  return state.currentView.folders.some(
+    (folder) => pathContainsPath(folder.relative_path, normalizedPath),
+  );
+}
+
+function scheduleCurrentFolderPatch() {
+  if (state.folderLoading || state.validationPatchTimer) {
+    return;
+  }
+
+  state.validationPatchTimer = window.setTimeout(() => {
+    state.validationPatchTimer = null;
+    patchCurrentFolderFromDb({ keepStatus: true }).catch(console.warn);
+  }, 120);
+}
+
+function clearValidationPatchTimer() {
+  if (!state.validationPatchTimer) {
+    return;
+  }
+
+  window.clearTimeout(state.validationPatchTimer);
+  state.validationPatchTimer = null;
+}
+
+function clearVisibleValidationTimer() {
+  if (!state.visibleValidationTimer) {
+    return;
+  }
+
+  window.clearTimeout(state.visibleValidationTimer);
+  state.visibleValidationTimer = null;
+}
+
+async function patchCurrentFolderFromDb(options = {}) {
+  if (!invoke || state.atRootOverview || !state.currentRootId || !state.currentView) {
+    return;
+  }
+
+  const rootId = state.currentRootId;
+  const relativePath = state.currentPath;
+  const requestId = state.activeFolderRequestId;
+  const scrollLeft = gridNode.scrollLeft;
+  const scrollTop = gridNode.scrollTop;
+  const view = await invoke("folder_view", { rootId, relativePath });
+  if (
+    requestId !== state.activeFolderRequestId ||
+    state.atRootOverview ||
+    state.currentRootId !== rootId ||
+    state.currentPath !== relativePath
+  ) {
+    return;
+  }
+
+  patchFolderViewInPlace(view, options);
+  gridNode.scrollLeft = scrollLeft;
+  gridNode.scrollTop = scrollTop;
+  cacheFolderView(state.currentView);
+  resumeDeferredThumbnails();
+  scheduleVisibleFolderValidation(100);
+}
+
+function scheduleVisibleFolderValidation(delay = 200) {
+  if (
+    !invoke ||
+    state.atRootOverview ||
+    !state.currentRootId ||
+    state.folderLoading ||
+    state.visibleValidationActive
+  ) {
+    return;
+  }
+
+  if (state.visibleValidationTimer) {
+    window.clearTimeout(state.visibleValidationTimer);
+  }
+
+  state.visibleValidationTimer = window.setTimeout(() => {
+    state.visibleValidationTimer = null;
+    startVisibleFolderValidation().catch(console.warn);
+  }, delay);
+}
+
+async function startVisibleFolderValidation() {
+  if (
+    state.atRootOverview ||
+    !state.currentRootId ||
+    !state.currentView ||
+    state.folderLoading ||
+    state.visibleValidationActive
+  ) {
+    return;
+  }
+
+  const paths = visibleFolderValidationPaths();
+  if (paths.length === 0) {
+    return;
+  }
+
+  const rootId = state.currentRootId;
+  const requestId = state.activeFolderRequestId;
+  const currentPath = state.currentPath;
+  state.visibleValidationActive = true;
+  updateBusyIndicator();
+
+  try {
+    await invoke("validate_folder_view", {
+      rootId,
+      relativePath: currentPath,
+      visibleRelativePaths: paths.filter((path) => path !== currentPath),
+      requestId,
+    });
+  } catch (error) {
+    if (requestId === state.activeFolderRequestId) {
+      state.visibleValidationActive = false;
+      state.validatedVisibleKeys.clear();
+      updateBusyIndicator();
+    }
+    console.warn(error);
+  }
+}
+
+function visibleFolderValidationPaths() {
+  const paths = [];
+  const addPath = (path) => {
+    const normalized = String(path || "").replaceAll("\\", "/").replace(/^\/+|\/+$/g, "");
+    const key = viewKey(state.currentRootId, normalized);
+    if (state.validatedVisibleKeys.has(key)) {
+      return;
+    }
+    state.validatedVisibleKeys.add(key);
+    paths.push(normalized);
+  };
+
+  addPath(state.currentPath);
+
+  const gridRect = gridNode.getBoundingClientRect();
+  const margin = 160;
+  for (const tile of gridNode.querySelectorAll(".folder-tile")) {
+    const rect = tile.getBoundingClientRect();
+    const intersects =
+      rect.bottom >= gridRect.top - margin &&
+      rect.top <= gridRect.bottom + margin &&
+      rect.right >= gridRect.left - margin &&
+      rect.left <= gridRect.right + margin;
+    if (intersects) {
+      addPath(tile.dataset.folderPath);
+    }
+  }
+
+  return paths;
 }
 
 function openParentFolder() {
@@ -426,6 +712,11 @@ function openRootOverview(options = {}) {
   state.currentView = null;
   state.activeFolderRequestId = null;
   state.folderLoading = false;
+  state.visibleValidationActive = false;
+  state.validatedVisibleKeys.clear();
+  clearValidationPatchTimer();
+  clearVisibleValidationTimer();
+  updateBusyIndicator();
   resetStreamRenderQueue();
   resetThumbnailWork();
   prepareScrollRestore(null, "", options);
@@ -553,6 +844,73 @@ function renderFolderView(view, options = {}) {
   }
 }
 
+function patchFolderViewInPlace(view, options = {}) {
+  const root = currentRoot();
+  titleNode.textContent = view.relative_path || root.display_name;
+  if (!options.keepStatus) {
+    setStatus(
+      `${view.folders.length} folders, ${view.images.length} images in this folder`,
+    );
+  }
+  upButton.disabled = false;
+  scanButton.disabled = state.activeScans.has(view.root_id);
+  renderBreadcrumbs(view);
+  state.currentView = cloneFolderView(view);
+
+  const desired = [
+    ...view.folders.map((folder) => ({
+      key: folderItemKey(folder),
+      signature: folderSummarySignature(folder),
+      render: () => renderFolderCard(folder),
+    })),
+    ...view.images.map((image) => ({
+      key: imageItemKey(image),
+      signature: imageSummarySignature(image),
+      render: () => renderImageCard(image),
+    })),
+  ];
+
+  if (desired.length === 0) {
+    renderEmptyState("Empty folder", { keepBreadcrumbs: true });
+    return;
+  }
+
+  if (gridNode.querySelector(".empty-state")) {
+    gridNode.replaceChildren();
+  }
+
+  const existingNodes = new Map();
+  for (const child of gridNode.children) {
+    if (child.dataset?.itemKey) {
+      existingNodes.set(child.dataset.itemKey, child);
+    }
+  }
+
+  const desiredKeys = new Set();
+  desired.forEach((item, index) => {
+    desiredKeys.add(item.key);
+    let node = existingNodes.get(item.key);
+    if (node && node.dataset.summarySignature !== item.signature) {
+      const replacement = item.render();
+      node.replaceWith(replacement);
+      node = replacement;
+    } else if (!node) {
+      node = item.render();
+    }
+
+    const currentNode = gridNode.children[index] ?? null;
+    if (currentNode !== node) {
+      gridNode.insertBefore(node, currentNode);
+    }
+  });
+
+  for (const child of [...gridNode.children]) {
+    if (!desiredKeys.has(child.dataset?.itemKey)) {
+      child.remove();
+    }
+  }
+}
+
 function renderPendingFolderView(view, options = {}) {
   const root = currentRoot();
   titleNode.textContent = view.relative_path || root.display_name;
@@ -598,7 +956,6 @@ function appendStreamedFolderBatch(payload) {
 }
 
 function finishStreamedFolderView(payload) {
-  state.folderLoading = false;
   if (state.streamRenderQueue.length > 0) {
     state.streamFinishedPayload = payload;
     scheduleStreamRender();
@@ -665,11 +1022,16 @@ function flushStreamRenderQueue() {
 }
 
 function completeStreamedFolderView(payload) {
+  state.folderLoading = false;
+  updateBusyIndicator();
   if (state.currentView.folders.length === 0 && state.currentView.images.length === 0) {
     renderEmptyState("Empty folder", { keepBreadcrumbs: true });
   }
   restorePendingScrollPosition();
+  resumeDeferredThumbnails();
+  cacheFolderView(state.currentView);
   setStatus(`${payload.folder_count} folders, ${payload.image_count} images in this folder`);
+  scheduleVisibleFolderValidation(100);
 }
 
 function handleThumbScaleInput() {
@@ -720,7 +1082,7 @@ function scheduleThumbScaleSave() {
 function normalizeAppSettings(settings) {
   return {
     upscale_fullscreen_images: Boolean(settings?.upscale_fullscreen_images),
-    slideshow_speed_seconds: clampSlideshowSpeed(
+    slideshow_speed_seconds: normalizeSlideshowSpeed(
       Number(settings?.slideshow_speed_seconds ?? 3),
     ),
     slideshow_loop: Boolean(settings?.slideshow_loop),
@@ -753,8 +1115,7 @@ function closeSettingsDialog() {
 function renderSettingsDialog() {
   upscaleFullscreenInput.checked = state.settings.upscale_fullscreen_images;
   slideshowLoopInput.checked = state.settings.slideshow_loop;
-  slideshowSpeedInput.value = String(state.settings.slideshow_speed_seconds);
-  slideshowSpeedValue.value = `${state.settings.slideshow_speed_seconds.toFixed(1)} s`;
+  syncSlideshowSpeedControls();
   slideshowIgnoreSmallerInput.value = String(state.settings.slideshow_ignore_smaller_than);
   externalViewersList.replaceChildren(
     ...state.settings.external_viewers.map(renderExternalViewerRow),
@@ -794,18 +1155,33 @@ function renderExternalViewerRow(viewer) {
 }
 
 function handleSlideshowSpeedInput() {
-  state.settings.slideshow_speed_seconds = clampSlideshowSpeed(
+  state.settings.slideshow_speed_seconds = normalizeSlideshowSpeed(
     Number(slideshowSpeedInput.value),
   );
-  slideshowSpeedValue.value = `${state.settings.slideshow_speed_seconds.toFixed(1)} s`;
+  syncSlideshowSpeedControls({ keepNumberFocus: false });
+  if (state.slideshowActive) {
+    scheduleSlideshow();
+  }
+}
+
+function handleSlideshowSpeedNumberInput() {
+  const value = Number(slideshowSpeedNumberInput.value);
+  if (!Number.isFinite(value) || value <= 0) {
+    return;
+  }
+
+  state.settings.slideshow_speed_seconds = roundSlideshowSpeed(value);
+  syncSlideshowSpeedControls({ keepNumberFocus: true });
+  if (state.slideshowActive) {
+    scheduleSlideshow();
+  }
 }
 
 function handleSettingsInput() {
   state.settings.upscale_fullscreen_images = upscaleFullscreenInput.checked;
   state.settings.slideshow_loop = slideshowLoopInput.checked;
-  state.settings.slideshow_speed_seconds = clampSlideshowSpeed(
-    Number(slideshowSpeedInput.value),
-  );
+  state.settings.slideshow_speed_seconds = speedFromControls();
+  syncSlideshowSpeedControls();
   state.settings.slideshow_ignore_smaller_than = normalizeIgnoreSmallerValue(
     Number(slideshowIgnoreSmallerInput.value),
   );
@@ -857,11 +1233,39 @@ function applyViewerUpscaleSetting() {
   viewer.dataset.upscale = String(state.settings.upscale_fullscreen_images);
 }
 
-function clampSlideshowSpeed(value) {
+function normalizeSlideshowSpeed(value) {
+  if (!Number.isFinite(value) || value <= 0) {
+    return 3;
+  }
+  return roundSlideshowSpeed(value);
+}
+
+function roundSlideshowSpeed(value) {
+  return Math.round(value * 1000) / 1000;
+}
+
+function sliderSpeedValue(value) {
   if (!Number.isFinite(value)) {
     return 3;
   }
   return Math.min(10, Math.max(0.1, value));
+}
+
+function speedFromControls() {
+  const numberValue = Number(slideshowSpeedNumberInput.value);
+  if (Number.isFinite(numberValue) && numberValue > 0) {
+    return roundSlideshowSpeed(numberValue);
+  }
+  return normalizeSlideshowSpeed(Number(slideshowSpeedInput.value));
+}
+
+function syncSlideshowSpeedControls(options = {}) {
+  const value = normalizeSlideshowSpeed(state.settings.slideshow_speed_seconds);
+  state.settings.slideshow_speed_seconds = value;
+  slideshowSpeedInput.value = String(sliderSpeedValue(value));
+  if (!options.keepNumberFocus || document.activeElement !== slideshowSpeedNumberInput) {
+    slideshowSpeedNumberInput.value = value.toFixed(3);
+  }
 }
 
 function normalizeIgnoreSmallerValue(value) {
@@ -880,6 +1284,143 @@ function viewKey(rootId, relativePath) {
     return "root-overview";
   }
   return `${rootId}:${relativePath ?? ""}`;
+}
+
+function thumbnailCacheKey(rootId, imageId, size) {
+  return `${rootId}:${imageId}:${size}`;
+}
+
+function normalizeRelativePath(relativePath) {
+  return String(relativePath || "")
+    .replaceAll("\\", "/")
+    .replace(/^\/+|\/+$/g, "");
+}
+
+function ancestorPaths(relativePath) {
+  const normalized = normalizeRelativePath(relativePath);
+  const paths = [normalized];
+  let parent = parentPathFor(normalized);
+  while (parent !== null) {
+    paths.push(parent);
+    parent = parentPathFor(parent);
+  }
+  return paths;
+}
+
+function pathContainsPath(ancestor, descendant) {
+  const normalizedAncestor = normalizeRelativePath(ancestor);
+  const normalizedDescendant = normalizeRelativePath(descendant);
+  if (!normalizedAncestor) {
+    return true;
+  }
+  return (
+    normalizedDescendant === normalizedAncestor ||
+    normalizedDescendant.startsWith(`${normalizedAncestor}/`)
+  );
+}
+
+function folderItemKey(folder) {
+  return `folder:${folder.relative_path}`;
+}
+
+function imageItemKey(image) {
+  return `image:${image.id}`;
+}
+
+function folderSummarySignature(folder) {
+  return JSON.stringify([
+    folder.id,
+    folder.relative_path,
+    folder.name,
+    folder.parent_relative_path,
+    folder.thumbnail_image_id,
+    folder.image_count,
+    folder.child_folder_count,
+    folder.direct_keywords ?? [],
+    folder.inherited_keywords ?? [],
+    folder.direct_people ?? [],
+    folder.inherited_people ?? [],
+  ]);
+}
+
+function imageSummarySignature(image) {
+  return JSON.stringify([
+    image.id,
+    image.folder_id,
+    image.file_name,
+    image.relative_path,
+    image.width,
+    image.height,
+    image.file_size,
+    image.modified_unix_ms,
+  ]);
+}
+
+function cloneFolderView(view) {
+  return {
+    ...view,
+    folders: view.folders.map((folder) => ({
+      ...folder,
+      inherited_keywords: [...(folder.inherited_keywords ?? [])],
+      direct_keywords: [...(folder.direct_keywords ?? [])],
+      inherited_people: [...(folder.inherited_people ?? [])],
+      direct_people: [...(folder.direct_people ?? [])],
+    })),
+    images: view.images.map((image) => ({ ...image })),
+  };
+}
+
+function cachedFolderView(rootId, relativePath) {
+  const key = viewKey(rootId, relativePath);
+  const cached = state.folderViewCache.get(key);
+  if (!cached) {
+    return null;
+  }
+
+  state.folderViewCache.delete(key);
+  state.folderViewCache.set(key, cached);
+  return cloneFolderView(cached);
+}
+
+function cacheFolderView(view) {
+  const key = viewKey(view.root_id, view.relative_path);
+  state.folderViewCache.delete(key);
+  state.folderViewCache.set(key, cloneFolderView(view));
+  trimMapToSize(state.folderViewCache, MAX_FOLDER_VIEW_CACHE_ENTRIES);
+}
+
+function invalidateFolderViewCache(rootId, relativePath = undefined) {
+  if (rootId === null || rootId === undefined) {
+    state.folderViewCache.clear();
+    return;
+  }
+
+  if (relativePath === undefined) {
+    const prefix = `${rootId}:`;
+    for (const key of [...state.folderViewCache.keys()]) {
+      if (key.startsWith(prefix)) {
+        state.folderViewCache.delete(key);
+      }
+    }
+    return;
+  }
+
+  state.folderViewCache.delete(viewKey(rootId, relativePath));
+}
+
+function invalidateFolderCachesForChanges(rootId, relativePaths) {
+  for (const relativePath of relativePaths ?? []) {
+    for (const path of ancestorPaths(relativePath)) {
+      invalidateFolderViewCache(rootId, path);
+    }
+  }
+}
+
+function trimMapToSize(map, maxEntries) {
+  while (map.size > maxEntries) {
+    const oldestKey = map.keys().next().value;
+    map.delete(oldestKey);
+  }
 }
 
 function rememberCurrentScrollPosition() {
@@ -969,6 +1510,8 @@ function renderFolderCard(folder) {
   card.title = fullFolderPath(folder);
   card.dataset.rootId = folder.root_id;
   card.dataset.folderPath = folder.relative_path;
+  card.dataset.itemKey = folderItemKey(folder);
+  card.dataset.summarySignature = folderSummarySignature(folder);
   card.innerHTML = `
     <div class="thumb">
       <span>${escapeHtml(initials(folder.name))}</span>
@@ -1003,11 +1546,14 @@ function renderFolderCard(folder) {
   return card;
 }
 
-function renderImageCard(image, index) {
+function renderImageCard(image) {
   const card = document.createElement("article");
   card.className = "tile image-tile";
   card.tabIndex = 0;
   card.title = fullImagePath(image);
+  card.dataset.imageId = String(image.id);
+  card.dataset.itemKey = imageItemKey(image);
+  card.dataset.summarySignature = imageSummarySignature(image);
   card.innerHTML = `
     <div class="thumb image-thumb" data-image-id="${image.id}">
       <span>${escapeHtml(initials(image.file_name))}</span>
@@ -1022,10 +1568,10 @@ function renderImageCard(image, index) {
   thumb.title = fullImagePath(image);
   requestThumbnailWhenVisible(image.root_id, image.id, thumb, THUMBNAIL_PIXEL_SIZE);
 
-  card.addEventListener("click", () => openViewer(index));
+  card.addEventListener("click", () => openViewerByImageId(image.id));
   card.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
-      openViewer(index);
+      openViewerByImageId(image.id);
     }
   });
 
@@ -1058,6 +1604,7 @@ async function setCurrentFolderCover(image) {
     folderId: state.currentView.folder_id,
     imageId: image.id,
   });
+  invalidateFolderViewCache(image.root_id, parentPathFor(state.currentPath));
   setStatus(`Cover set to ${image.file_name}`);
 }
 
@@ -1233,7 +1780,10 @@ async function rotateImage(image, direction) {
   });
   state.imageUrlCache.clear();
   state.imageDimensionCache.clear();
-  await refreshCurrentFolder({ keepStatus: true });
+  invalidateThumbnailDataCache(image.root_id);
+  invalidateFolderViewCache(image.root_id, state.currentPath);
+  invalidateFolderViewCache(image.root_id, parentPathFor(state.currentPath));
+  await refreshCurrentFolder({ keepStatus: true, forceReload: true });
   setStatus(`Rotated ${image.file_name}`);
 }
 
@@ -1245,7 +1795,10 @@ async function moveImageToRecycleBin(image) {
   });
   state.imageUrlCache.clear();
   state.imageDimensionCache.clear();
-  await refreshCurrentFolder({ keepStatus: true });
+  invalidateThumbnailDataCache(image.root_id);
+  invalidateFolderViewCache(image.root_id, state.currentPath);
+  invalidateFolderViewCache(image.root_id, parentPathFor(state.currentPath));
+  await refreshCurrentFolder({ keepStatus: true, forceReload: true });
   setStatus(`Moved ${image.file_name} to recycle bin`);
 }
 
@@ -1294,6 +1847,10 @@ function imageById(imageId) {
   return state.currentView?.images.find((image) => image.id === imageId) ?? null;
 }
 
+function imageIndexById(imageId) {
+  return state.currentView?.images.findIndex((image) => image.id === imageId) ?? -1;
+}
+
 function folderByPath(relativePath) {
   return (
     state.currentView?.folders.find((folder) => folder.relative_path === relativePath) ?? null
@@ -1338,17 +1895,74 @@ function resetThumbnailWork() {
   observedThumbs.clear();
 }
 
-function requestThumbnailWhenVisible(rootId, imageId, target, size) {
-  if (state.activeScans.has(rootId)) {
+function invalidateThumbnailDataCache(rootId = undefined) {
+  if (rootId === undefined || rootId === null) {
+    state.thumbnailDataCache.clear();
     return;
   }
 
+  const prefix = `${rootId}:`;
+  for (const key of [...state.thumbnailDataCache.keys()]) {
+    if (key.startsWith(prefix)) {
+      state.thumbnailDataCache.delete(key);
+    }
+  }
+}
+
+function applyThumbnailData(target, dataUrl) {
+  delete target.dataset.thumbnailDeferred;
+  target.replaceChildren();
+  target.style.backgroundImage = `url("${dataUrl}")`;
+  target.style.backgroundSize = "contain";
+  target.style.backgroundPosition = "center";
+  target.style.backgroundRepeat = "no-repeat";
+  target.classList.add("loaded");
+  target.classList.remove("failed");
+}
+
+function thumbnailsPausedFor(rootId) {
+  return (
+    state.activeScans.has(rootId) ||
+    (state.folderLoading && rootId === state.currentRootId)
+  );
+}
+
+function resumeDeferredThumbnails() {
+  for (const target of gridNode.querySelectorAll(".thumb[data-thumbnail-deferred='true']")) {
+    const rootId = target.dataset.rootId;
+    if (thumbnailsPausedFor(rootId)) {
+      continue;
+    }
+
+    delete target.dataset.thumbnailDeferred;
+    requestThumbnailWhenVisible(
+      rootId,
+      Number(target.dataset.imageId),
+      target,
+      Number(target.dataset.thumbSize),
+    );
+  }
+}
+
+function requestThumbnailWhenVisible(rootId, imageId, target, size) {
   const generation = state.viewGeneration;
   target.dataset.rootId = rootId;
   target.dataset.imageId = String(imageId);
   target.dataset.thumbSize = String(size);
   target.dataset.generation = String(generation);
 
+  const cached = state.thumbnailDataCache.get(thumbnailCacheKey(rootId, imageId, size));
+  if (cached) {
+    applyThumbnailData(target, cached);
+    return;
+  }
+
+  if (thumbnailsPausedFor(rootId)) {
+    target.dataset.thumbnailDeferred = "true";
+    return;
+  }
+
+  delete target.dataset.thumbnailDeferred;
   if (!thumbnailObserver) {
     queueThumbnail(rootId, imageId, target, size);
     return;
@@ -1383,7 +1997,14 @@ function handleThumbnailIntersection(entries) {
 }
 
 function queueThumbnail(rootId, imageId, target, size) {
-  if (state.activeScans.has(rootId)) {
+  const cached = state.thumbnailDataCache.get(thumbnailCacheKey(rootId, imageId, size));
+  if (cached) {
+    applyThumbnailData(target, cached);
+    return;
+  }
+
+  if (thumbnailsPausedFor(rootId)) {
+    target.dataset.thumbnailDeferred = "true";
     return;
   }
 
@@ -1400,7 +2021,8 @@ function pumpThumbnailQueue() {
     thumbnailQueue.items.length > 0
   ) {
     const job = thumbnailQueue.items.shift();
-    if (state.activeScans.has(job.rootId)) {
+    if (thumbnailsPausedFor(job.rootId)) {
+      job.target.dataset.thumbnailDeferred = "true";
       continue;
     }
     if (
@@ -1416,7 +2038,7 @@ function pumpThumbnailQueue() {
         const message = String(error);
         if (
           job.generation === state.viewGeneration &&
-          !state.activeScans.has(job.rootId) &&
+          !thumbnailsPausedFor(job.rootId) &&
           !message.includes("paused while scanning")
         ) {
           job.target.classList.add("failed");
@@ -1430,24 +2052,24 @@ function pumpThumbnailQueue() {
 }
 
 async function loadThumbnail({ rootId, imageId, target, size, generation }) {
-  if (state.activeScans.has(rootId)) {
+  if (thumbnailsPausedFor(rootId)) {
+    target.dataset.thumbnailDeferred = "true";
     return;
   }
 
   target.dataset.imageId = String(imageId);
+  const cacheKey = thumbnailCacheKey(rootId, imageId, size);
   const thumbnail = await invoke("thumbnail", { rootId, imageId, size });
+  state.thumbnailDataCache.delete(cacheKey);
+  state.thumbnailDataCache.set(cacheKey, thumbnail.data_url);
+  trimMapToSize(state.thumbnailDataCache, MAX_THUMBNAIL_DATA_CACHE_ENTRIES);
   if (
     generation !== state.viewGeneration ||
     target.dataset.imageId !== String(imageId)
   ) {
     return;
   }
-  target.replaceChildren();
-  target.style.backgroundImage = `url("${thumbnail.data_url}")`;
-  target.style.backgroundSize = "contain";
-  target.style.backgroundPosition = "center";
-  target.style.backgroundRepeat = "no-repeat";
-  target.classList.add("loaded");
+  applyThumbnailData(target, thumbnail.data_url);
 }
 
 function openViewer(index) {
@@ -1462,6 +2084,13 @@ function openViewer(index) {
   applyViewerUpscaleSetting();
   enterViewerFullscreen().catch(showError);
   renderViewerImage().catch(showError);
+}
+
+function openViewerByImageId(imageId) {
+  const index = imageIndexById(imageId);
+  if (index >= 0) {
+    openViewer(index);
+  }
 }
 
 async function renderViewerImage() {
@@ -1873,6 +2502,47 @@ function parentPathFor(relativePath) {
 
 function setStatus(message) {
   statusNode.textContent = message;
+}
+
+function updateBusyIndicator() {
+  if (!busyIndicator || !busyText) {
+    return;
+  }
+
+  const message = busyMessage();
+  if (!message) {
+    busyIndicator.classList.add("hidden");
+    busyText.textContent = "Working";
+    return;
+  }
+
+  busyText.textContent = message;
+  busyIndicator.classList.remove("hidden");
+}
+
+function busyMessage() {
+  if (state.folderLoading) {
+    return "Loading folder";
+  }
+
+  if (state.visibleValidationActive) {
+    return "Checking visible folders";
+  }
+
+  if (state.activeScans.size === 0) {
+    return "";
+  }
+
+  if (state.currentRootId && state.scanProgressText.has(state.currentRootId)) {
+    return state.scanProgressText.get(state.currentRootId);
+  }
+
+  const firstScanRoot = state.activeScans.values().next().value;
+  if (state.activeScans.size === 1) {
+    return state.scanProgressText.get(firstScanRoot) ?? "Scanning";
+  }
+
+  return `${state.activeScans.size} scans running`;
 }
 
 function showError(error) {

@@ -26,6 +26,7 @@ struct KnownRoot {
 pub struct ScanTarget {
     pub root_id: String,
     pub path: PathBuf,
+    pub relative_path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -111,17 +112,30 @@ impl LibraryManager {
     where
         F: FnMut(ScanProgress),
     {
-        let known_root = self.known_root(root_id)?;
-        let mut db = self.open_connected_database(known_root)?;
-        db.scan_with_progress(root_id, on_progress)
+        self.scan_folder_with_progress(root_id, "", on_progress)
     }
 
-    pub fn scan_target(&self, root_id: &str) -> Result<ScanTarget> {
+    pub fn scan_folder_with_progress<F>(
+        &self,
+        root_id: &str,
+        relative_path: &str,
+        on_progress: F,
+    ) -> Result<ScanReport>
+    where
+        F: FnMut(ScanProgress),
+    {
+        let known_root = self.known_root(root_id)?;
+        let mut db = self.open_connected_database(known_root)?;
+        db.rescan_with_progress(root_id, relative_path, on_progress)
+    }
+
+    pub fn scan_target(&self, root_id: &str, relative_path: &str) -> Result<ScanTarget> {
         let known_root = self.known_root(root_id)?;
         self.open_connected_database(known_root)?;
         Ok(ScanTarget {
             root_id: known_root.id.clone(),
             path: PathBuf::from(&known_root.path),
+            relative_path: relative_path.to_owned(),
         })
     }
 
