@@ -2,10 +2,10 @@
 
 use anyhow::Context;
 use picturious_core::{
-    FolderSummary, FolderView, FolderViewHeader, FolderViewTarget, GeneratedThumbnail,
-    ImageSummary, LibraryManager, LibraryOverview, LibraryRoot, RootDatabase,
-    RotationDirection as CoreRotationDirection, ScanReport, ScanTarget, ThumbnailCache,
-    ThumbnailResponse, generate_thumbnail, rotate_image as rotate_image_file,
+    FolderMetadata, FolderSummary, FolderView, FolderViewHeader, FolderViewTarget,
+    GeneratedThumbnail, ImageMetadata, ImageSummary, LibraryManager, LibraryOverview, LibraryRoot,
+    MetadataTag, RootDatabase, RotationDirection as CoreRotationDirection, ScanReport, ScanTarget,
+    ThumbnailCache, ThumbnailResponse, generate_thumbnail, rotate_image as rotate_image_file,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -621,6 +621,187 @@ fn set_folder_thumbnail(
         .map_err(error_message)
 }
 
+#[tauri::command]
+async fn image_metadata(
+    root_id: String,
+    image_id: i64,
+    state: State<'_, AppState>,
+) -> Result<ImageMetadata, String> {
+    let library = state.library.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .image_metadata(&root_id, image_id)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn image_people(
+    root_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<MetadataTag>, String> {
+    let library = state.library.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .people(&root_id)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn metadata_people(state: State<'_, AppState>) -> Result<Vec<MetadataTag>, String> {
+    let library = state.library.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .all_people()
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn folder_metadata(
+    root_id: String,
+    folder_id: i64,
+    state: State<'_, AppState>,
+) -> Result<FolderMetadata, String> {
+    let library = state.library.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .folder_metadata(&root_id, folder_id)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn add_folder_person(
+    root_id: String,
+    folder_id: i64,
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<FolderMetadata, String> {
+    let library = state.library.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .add_folder_person(&root_id, folder_id, &name)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn remove_folder_person(
+    root_id: String,
+    folder_id: i64,
+    person_id: i64,
+    state: State<'_, AppState>,
+) -> Result<FolderMetadata, String> {
+    let library = state.library.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .remove_folder_person(&root_id, folder_id, person_id)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn set_folder_rating(
+    root_id: String,
+    folder_id: i64,
+    rating: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<FolderMetadata, String> {
+    let library = state.library.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .set_folder_rating(&root_id, folder_id, rating.as_deref())
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn add_image_person(
+    root_id: String,
+    image_id: i64,
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<ImageMetadata, String> {
+    let library = state.library.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .add_image_person(&root_id, image_id, &name)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn remove_image_person(
+    root_id: String,
+    image_id: i64,
+    person_id: i64,
+    state: State<'_, AppState>,
+) -> Result<ImageMetadata, String> {
+    let library = state.library.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .remove_image_person(&root_id, image_id, person_id)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn set_image_rating(
+    root_id: String,
+    image_id: i64,
+    rating: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<ImageMetadata, String> {
+    let library = state.library.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .set_image_rating(&root_id, image_id, rating.as_deref())
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
@@ -664,7 +845,17 @@ fn main() {
             show_image_in_explorer,
             open_image_with,
             move_image_to_recycle_bin,
-            set_folder_thumbnail
+            set_folder_thumbnail,
+            image_metadata,
+            image_people,
+            metadata_people,
+            folder_metadata,
+            add_folder_person,
+            remove_folder_person,
+            set_folder_rating,
+            add_image_person,
+            remove_image_person,
+            set_image_rating
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Picturious");

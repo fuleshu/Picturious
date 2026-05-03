@@ -26,6 +26,7 @@ Current tables:
 - `folders`: folder rows, parent path, and optional selected thumbnail image id.
 - `images`: indexed image files, optional dimensions, file size, and modified time.
 - `keywords`, `people`, `folder_keywords`, `folder_people`: controlled metadata tables for the folder inheritance model.
+- `ratings`, `folder_ratings`, `image_keywords`, `image_people`, `image_ratings`: controlled metadata tables for ratings and image metadata.
 
 Picturious keeps the list of known root paths in the app config directory. At runtime the Rust core opens every connected root database and merges the results in memory, so disconnected external drives simply disappear from the combined library view.
 

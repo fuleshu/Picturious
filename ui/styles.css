@@ -181,7 +181,7 @@ button:disabled {
 .workspace {
   display: grid;
   height: 100vh;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -281,6 +281,199 @@ button:disabled {
   accent-color: #23645d;
 }
 
+.metadata-bar {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 12px;
+  border-top: 1px solid #dfe3e1;
+  border-bottom: 1px solid #dfe3e1;
+  margin-bottom: 12px;
+  padding: 9px 0;
+}
+
+.metadata-mode-tabs {
+  display: inline-flex;
+  flex: 0 0 auto;
+  overflow: hidden;
+  border: 1px solid #c8cdd0;
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.metadata-mode-tabs button {
+  min-height: 30px;
+  border: 0;
+  border-radius: 0;
+  padding: 0 10px;
+  font-size: 13px;
+}
+
+.metadata-mode-tabs button + button {
+  border-left: 1px solid #dfe3e1;
+}
+
+.metadata-mode-tabs button[data-active="true"] {
+  background: #23645d;
+  color: #ffffff;
+}
+
+.metadata-target {
+  flex: 0 1 210px;
+  min-width: 84px;
+  overflow: hidden;
+  color: #52595d;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rating-toggle-group,
+.people-editor,
+.person-chips {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+
+.rating-toggle-group {
+  flex: 0 0 auto;
+}
+
+.rating-toggle {
+  width: 38px;
+  min-height: 30px;
+  padding: 0;
+  font-weight: 700;
+}
+
+.rating-toggle[data-active="true"] {
+  border-color: #23645d;
+  background: #e1efeb;
+  color: #173f39;
+}
+
+.rating-toggle[data-inherited-active="true"] {
+  border-style: dashed;
+  border-color: #7f9690;
+  background: #eef2f0;
+  color: #41504c;
+}
+
+.people-editor {
+  position: relative;
+  flex: 1 1 auto;
+}
+
+.metadata-label {
+  flex: 0 0 auto;
+  color: #52595d;
+  font-size: 13px;
+}
+
+.person-chips {
+  flex-wrap: wrap;
+}
+
+.person-chip {
+  display: inline-flex;
+  max-width: 180px;
+  min-height: 28px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #ccd4d1;
+  border-radius: 6px;
+  background: #ffffff;
+  padding: 0 4px 0 8px;
+  color: #202326;
+  font-size: 13px;
+}
+
+.person-chip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.person-chip button,
+.person-add-button {
+  display: grid;
+  width: 28px;
+  min-height: 28px;
+  place-items: center;
+  padding: 0;
+  line-height: 1;
+}
+
+.person-chip button {
+  border: 0;
+  background: transparent;
+  color: #6e4d45;
+}
+
+.person-chip[data-inherited="true"] {
+  border-style: dashed;
+  background: #eef2f0;
+  color: #59635f;
+}
+
+.person-add-button {
+  flex: 0 0 auto;
+  font-weight: 700;
+}
+
+.person-dropdown {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 18;
+  width: min(320px, calc(100vw - 52px));
+  border: 1px solid #c8cdd0;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 14px 36px rgba(20, 24, 27, 0.18);
+  padding: 6px;
+}
+
+.person-search-field {
+  width: 100%;
+  min-height: 32px;
+  border: 1px solid #c8cdd0;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #202326;
+  font: inherit;
+  padding: 5px 8px;
+}
+
+.person-options {
+  display: flex;
+  max-height: 190px;
+  flex-direction: column;
+  gap: 2px;
+  overflow: auto;
+  padding-top: 5px;
+}
+
+.person-option {
+  display: block;
+  width: 100%;
+  min-height: 30px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  padding: 0 9px;
+  text-align: left;
+  font-size: 13px;
+}
+
+.person-option:hover,
+.person-option:focus-visible {
+  background: #e8efec;
+}
+
 .breadcrumbs {
   display: flex;
   flex-wrap: wrap;
@@ -323,6 +516,11 @@ button:disabled {
 .tile:hover,
 .tile:focus-visible {
   border-color: #23645d;
+}
+
+.image-tile[data-selected="true"] {
+  border-color: #23645d;
+  box-shadow: 0 0 0 2px rgba(35, 100, 93, 0.22);
 }
 
 .root-tile[data-connected="false"] {
@@ -657,6 +855,21 @@ button:disabled {
 
   .toolbar-actions button {
     flex: 1;
+  }
+
+  .metadata-bar {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .metadata-target {
+    flex-basis: 100%;
+    order: 3;
+  }
+
+  .people-editor {
+    flex-basis: 100%;
+    order: 4;
   }
 
   .content-grid {

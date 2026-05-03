@@ -8,12 +8,18 @@ const STREAM_ITEMS_PER_FRAME = 16;
 const VIEWER_CURSOR_HIDE_DELAY_MS = 3000;
 const MAX_FOLDER_VIEW_CACHE_ENTRIES = 80;
 const MAX_THUMBNAIL_DATA_CACHE_ENTRIES = 700;
+const RATING_OPTIONS = [
+  { value: "unhappy", label: ":(" },
+  { value: "neutral", label: ":|" },
+  { value: "happy", label: ":)" },
+];
 
 const gridNode = document.querySelector("#content-grid");
 const statusNode = document.querySelector("#status");
 const busyIndicator = document.querySelector("#busy-indicator");
 const busyText = document.querySelector("#busy-text");
 const titleNode = document.querySelector("#view-title");
+const metadataBar = document.querySelector("#metadata-bar");
 const breadcrumbsNode = document.querySelector("#breadcrumbs");
 const addRootButton = document.querySelector("#add-root-button");
 const settingsButton = document.querySelector("#settings-button");
@@ -64,6 +70,14 @@ const state = {
   contextMenuImage: null,
   contextMenuFolder: null,
   contextMenuRoot: null,
+  metadataMode: "edit",
+  currentFolderMeta: null,
+  metadataLoading: false,
+  metadataRequestId: 0,
+  peopleOptions: [],
+  peopleOptionsLoaded: false,
+  personDropdownOpen: false,
+  personSearch: "",
   slideshowTimer: null,
   slideshowActive: false,
   slideshowEnded: false,
@@ -104,6 +118,13 @@ scanButton.addEventListener("click", scanCurrentRoot);
 upButton.addEventListener("click", openParentFolder);
 thumbScaleInput.addEventListener("input", handleThumbScaleInput);
 settingsCloseButton.addEventListener("click", closeSettingsDialog);
+metadataBar.addEventListener("click", (event) => {
+  handleMetadataBarClick(event).catch(showError);
+});
+metadataBar.addEventListener("input", handleMetadataBarInput);
+metadataBar.addEventListener("keydown", (event) => {
+  handleMetadataBarKeydown(event).catch(showError);
+});
 upscaleFullscreenInput.addEventListener("change", handleSettingsInput);
 slideshowLoopInput.addEventListener("change", handleSettingsInput);
 slideshowSpeedInput.addEventListener("input", handleSlideshowSpeedInput);
@@ -128,6 +149,11 @@ thumbContextMenu.addEventListener("click", handleThumbContextAction);
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !thumbContextMenu.classList.contains("hidden")) {
     hideThumbContextMenu();
+    return;
+  }
+
+  if (event.key === "Escape" && state.personDropdownOpen) {
+    closePersonDropdown();
     return;
   }
 
@@ -338,6 +364,7 @@ async function wireScanEvents() {
 async function refreshOverview() {
   const overview = await invoke("library_overview");
   state.roots = overview.roots;
+  state.peopleOptionsLoaded = false;
   renderRootOverviewIfVisible({ keepStatus: true, keepScroll: true });
 }
 
@@ -436,6 +463,7 @@ async function removeRoot(rootId) {
 async function openFolder(rootId, relativePath, options = {}) {
   const root = state.roots.find((item) => item.id === rootId);
   if (!root?.connected) {
+    clearMetadataSelection();
     renderEmptyState("Root is not connected");
     return;
   }
@@ -456,6 +484,7 @@ async function openFolder(rootId, relativePath, options = {}) {
   resetStreamRenderQueue();
   prepareScrollRestore(rootId, state.currentPath, options);
   resetThumbnailWork();
+  clearMetadataSelection();
 
   const cachedView = options.forceReload
     ? null
@@ -719,6 +748,7 @@ function openRootOverview(options = {}) {
   updateBusyIndicator();
   resetStreamRenderQueue();
   resetThumbnailWork();
+  clearMetadataSelection();
   prepareScrollRestore(null, "", options);
   renderRootOverview(options);
 }
@@ -737,6 +767,7 @@ function renderRootOverview(options = {}) {
   }
   upButton.disabled = true;
   scanButton.disabled = true;
+  renderMetadataBar();
   breadcrumbsNode.replaceChildren();
 
   if (state.roots.length === 0) {
@@ -819,6 +850,412 @@ function rootStatus(root) {
   return `${root.folder_count} folders, ${root.image_count} images`;
 }
 
+function clearMetadataSelection() {
+  state.currentFolderMeta = null;
+  state.metadataLoading = false;
+  state.metadataRequestId += 1;
+  state.personDropdownOpen = false;
+  state.personSearch = "";
+  renderMetadataBar();
+}
+
+function currentFolderMetadataTarget() {
+  if (state.atRootOverview || !state.currentView?.folder_id) {
+    return null;
+  }
+
+  return {
+    rootId: state.currentView.root_id,
+    folderId: Number(state.currentView.folder_id),
+    relativePath: state.currentView.relative_path ?? "",
+    displayName: state.currentView.relative_path || state.currentView.root_display_name,
+  };
+}
+
+async function loadCurrentFolderMetadata() {
+  const target = currentFolderMetadataTarget();
+  if (!target) {
+    clearMetadataSelection();
+    return;
+  }
+
+  if (!invoke) {
+    state.currentFolderMeta = normalizeFolderMetadata(null, target);
+    state.metadataLoading = false;
+    renderMetadataBar();
+    return;
+  }
+
+  const requestId = ++state.metadataRequestId;
+  state.metadataLoading = true;
+  renderMetadataBar();
+  try {
+    const metadata = await invoke("folder_metadata", {
+      rootId: target.rootId,
+      folderId: target.folderId,
+    });
+    const currentTarget = currentFolderMetadataTarget();
+    if (
+      requestId !== state.metadataRequestId ||
+      !currentTarget ||
+      currentTarget.rootId !== target.rootId ||
+      currentTarget.folderId !== target.folderId
+    ) {
+      return;
+    }
+    state.currentFolderMeta = normalizeFolderMetadata(metadata, target);
+    mergePeopleOptions([
+      ...state.currentFolderMeta.people,
+      ...state.currentFolderMeta.inherited_people,
+    ]);
+  } finally {
+    const currentTarget = currentFolderMetadataTarget();
+    if (
+      requestId === state.metadataRequestId &&
+      currentTarget &&
+      currentTarget.rootId === target.rootId &&
+      currentTarget.folderId === target.folderId
+    ) {
+      state.metadataLoading = false;
+      renderMetadataBar();
+    }
+  }
+}
+
+function normalizeFolderMetadata(metadata, target) {
+  return {
+    root_id: metadata?.root_id ?? target?.rootId ?? "",
+    folder_id: Number(metadata?.folder_id ?? target?.folderId ?? 0),
+    relative_path: metadata?.relative_path ?? target?.relativePath ?? "",
+    rating: metadata?.rating ?? null,
+    inherited_rating: metadata?.inherited_rating ?? null,
+    people: Array.isArray(metadata?.people)
+      ? metadata.people
+          .filter((person) => Number.isFinite(Number(person?.id)) && person?.name)
+          .map((person) => ({
+            id: Number(person.id),
+            name: String(person.name),
+          }))
+      : [],
+    inherited_people: Array.isArray(metadata?.inherited_people)
+      ? metadata.inherited_people
+          .filter((person) => Number.isFinite(Number(person?.id)) && person?.name)
+          .map((person) => ({
+            id: Number(person.id),
+            name: String(person.name),
+          }))
+      : [],
+  };
+}
+
+function renderMetadataBar(options = {}) {
+  const target = currentFolderMetadataTarget();
+  const metadata = target ? state.currentFolderMeta : null;
+  const editDisabled = !target || state.metadataMode !== "edit";
+  const disabledAttr = editDisabled ? " disabled" : "";
+  const targetLabel = target ? `Folder: ${target.displayName}` : "No folder";
+  const targetTitle = target?.relativePath ?? "";
+  const rating = metadata?.rating ?? null;
+  const inheritedRating = metadata?.inherited_rating ?? null;
+  const people = metadata?.people ?? [];
+  const inheritedPeople = metadata?.inherited_people ?? [];
+  const personDropdown = state.personDropdownOpen && !editDisabled
+    ? renderPersonDropdownHtml()
+    : "";
+
+  metadataBar.innerHTML = `
+    <div class="metadata-mode-tabs" role="tablist" aria-label="Metadata mode">
+      <button type="button" data-metadata-mode="search" disabled>Search</button>
+      <button type="button" data-metadata-mode="edit" data-active="${state.metadataMode === "edit"}">Edit</button>
+    </div>
+    <div class="metadata-target" title="${escapeHtml(targetTitle)}">${escapeHtml(targetLabel)}</div>
+    <div class="rating-toggle-group" role="group" aria-label="Rating">
+      ${RATING_OPTIONS.map((option) => {
+        const active = rating === option.value;
+        const inheritedActive = !rating && inheritedRating === option.value;
+        const title = inheritedActive
+          ? `${option.value} inherited from a parent folder`
+          : option.value;
+        return `<button class="rating-toggle" type="button" data-rating="${option.value}" data-active="${active}" data-inherited-active="${inheritedActive}" aria-pressed="${active || inheritedActive}" title="${title}"${disabledAttr}>${option.label}</button>`;
+      }).join("")}
+    </div>
+    <div class="people-editor">
+      <span class="metadata-label">Person:</span>
+      <div class="person-chips">
+        ${people.map(renderPersonChipHtml).join("")}
+        ${inheritedPeople.map(renderInheritedPersonChipHtml).join("")}
+      </div>
+      <button class="person-add-button" type="button" data-action="toggle-person-dropdown" title="Add person" aria-label="Add person"${disabledAttr}>+</button>
+      ${personDropdown}
+    </div>
+  `;
+
+  updatePersonDropdownOptions();
+  if (options.focusPersonInput && state.personDropdownOpen) {
+    requestAnimationFrame(() => {
+      const input = metadataBar.querySelector(".person-search-field");
+      input?.focus({ preventScroll: true });
+      input?.select();
+    });
+  }
+}
+
+function renderPersonChipHtml(person) {
+  return `
+    <span class="person-chip">
+      <span title="${escapeHtml(person.name)}">${escapeHtml(person.name)}</span>
+      <button type="button" data-action="remove-person" data-person-id="${person.id}" title="Remove person" aria-label="Remove person">x</button>
+    </span>
+  `;
+}
+
+function renderInheritedPersonChipHtml(person) {
+  return `
+    <span class="person-chip" data-inherited="true" title="Inherited from a parent folder">
+      <span>${escapeHtml(person.name)}</span>
+    </span>
+  `;
+}
+
+function renderPersonDropdownHtml() {
+  return `
+    <div class="person-dropdown">
+      <input class="person-search-field" type="text" value="${escapeHtml(state.personSearch)}" placeholder="Name" aria-label="Person name" />
+      <div class="person-options" role="listbox"></div>
+    </div>
+  `;
+}
+
+function updatePersonDropdownOptions() {
+  const optionsNode = metadataBar.querySelector(".person-options");
+  if (!optionsNode) {
+    return;
+  }
+
+  const metadata = state.currentFolderMeta;
+  const assignedNames = new Set([
+    ...(metadata?.people ?? []).map((person) => normalizedPersonName(person.name)),
+    ...(metadata?.inherited_people ?? []).map((person) => normalizedPersonName(person.name)),
+  ]);
+  const query = state.personSearch.trim().toLowerCase();
+  const options = state.peopleOptions
+    .filter((person) => !assignedNames.has(normalizedPersonName(person.name)))
+    .filter((person) => !query || person.name.toLowerCase().includes(query))
+    .sort((left, right) =>
+      left.name.localeCompare(right.name, undefined, { sensitivity: "base" }),
+    );
+
+  optionsNode.replaceChildren(
+    ...options.map((person) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "person-option";
+      button.dataset.personName = person.name;
+      button.textContent = person.name;
+      return button;
+    }),
+  );
+}
+
+async function openPersonDropdown() {
+  const target = currentFolderMetadataTarget();
+  if (!target) {
+    return;
+  }
+
+  state.personDropdownOpen = true;
+  state.personSearch = "";
+  if (!state.peopleOptionsLoaded) {
+    state.peopleOptions = [];
+  }
+  renderMetadataBar({ focusPersonInput: true });
+  await loadPeopleOptions();
+}
+
+function closePersonDropdown() {
+  if (!state.personDropdownOpen) {
+    return;
+  }
+  state.personDropdownOpen = false;
+  state.personSearch = "";
+  renderMetadataBar();
+}
+
+async function loadPeopleOptions() {
+  if (!invoke || state.peopleOptionsLoaded) {
+    return;
+  }
+
+  const options = await invoke("metadata_people");
+  state.peopleOptionsLoaded = true;
+  state.peopleOptions = normalizePeopleOptions(options);
+  renderMetadataBar({ focusPersonInput: true });
+}
+
+function normalizePeopleOptions(options) {
+  return Array.isArray(options)
+    ? options
+        .filter((person) => Number.isFinite(Number(person?.id)) && person?.name)
+        .map((person) => ({
+          id: Number(person.id),
+          name: String(person.name),
+        }))
+    : [];
+}
+
+function mergePeopleOptions(people) {
+  if (!Array.isArray(people) || people.length === 0) {
+    return;
+  }
+
+  const existing = new Set(
+    state.peopleOptions.map((person) => normalizedPersonName(person.name)),
+  );
+  for (const person of people) {
+    const key = normalizedPersonName(person.name);
+    if (!existing.has(key)) {
+      state.peopleOptions.push({
+        id: Number(person.id),
+        name: String(person.name),
+      });
+      existing.add(key);
+    }
+  }
+}
+
+function normalizedPersonName(name) {
+  return String(name || "").trim().toLowerCase();
+}
+
+async function handleMetadataBarClick(event) {
+  const modeButton = event.target.closest("button[data-metadata-mode]");
+  if (modeButton && !modeButton.disabled) {
+    state.metadataMode = modeButton.dataset.metadataMode;
+    renderMetadataBar();
+    return;
+  }
+
+  const ratingButton = event.target.closest("button[data-rating]");
+  if (ratingButton && !ratingButton.disabled) {
+    await setCurrentFolderRating(ratingButton.dataset.rating);
+    return;
+  }
+
+  const actionButton = event.target.closest("button[data-action]");
+  if (actionButton && !actionButton.disabled) {
+    const action = actionButton.dataset.action;
+    if (action === "toggle-person-dropdown") {
+      if (state.personDropdownOpen) {
+        closePersonDropdown();
+      } else {
+        await openPersonDropdown();
+      }
+      return;
+    }
+    if (action === "remove-person") {
+      await removeCurrentFolderPerson(Number(actionButton.dataset.personId));
+      return;
+    }
+  }
+
+  const personOption = event.target.closest(".person-option");
+  if (personOption) {
+    await addCurrentFolderPerson(personOption.dataset.personName);
+  }
+}
+
+function handleMetadataBarInput(event) {
+  if (!event.target.classList.contains("person-search-field")) {
+    return;
+  }
+  state.personSearch = event.target.value;
+  updatePersonDropdownOptions();
+}
+
+async function handleMetadataBarKeydown(event) {
+  if (!event.target.classList.contains("person-search-field")) {
+    return;
+  }
+
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closePersonDropdown();
+    return;
+  }
+
+  if (event.key === "Enter") {
+    event.preventDefault();
+    await addCurrentFolderPerson(event.target.value);
+  }
+}
+
+async function setCurrentFolderRating(rating) {
+  const target = currentFolderMetadataTarget();
+  if (!invoke || !target) {
+    return;
+  }
+
+  const currentRating = state.currentFolderMeta?.rating ?? null;
+  const nextRating = currentRating === rating ? null : rating;
+  const metadata = await invoke("set_folder_rating", {
+    rootId: target.rootId,
+    folderId: target.folderId,
+    rating: nextRating,
+  });
+  applyCurrentFolderMetadata(metadata, target);
+}
+
+async function addCurrentFolderPerson(name) {
+  const target = currentFolderMetadataTarget();
+  const cleanName = String(name || "").trim();
+  if (!invoke || !target || !cleanName) {
+    return;
+  }
+
+  const metadata = await invoke("add_folder_person", {
+    rootId: target.rootId,
+    folderId: target.folderId,
+    name: cleanName,
+  });
+  applyCurrentFolderMetadata(metadata, target);
+  state.personSearch = "";
+  mergePeopleOptions(state.currentFolderMeta?.people ?? []);
+  closePersonDropdown();
+  invalidateFolderViewCache(target.rootId);
+  await patchCurrentFolderFromDb({ keepStatus: true });
+}
+
+async function removeCurrentFolderPerson(personId) {
+  const target = currentFolderMetadataTarget();
+  if (!invoke || !target || !Number.isFinite(personId)) {
+    return;
+  }
+
+  const metadata = await invoke("remove_folder_person", {
+    rootId: target.rootId,
+    folderId: target.folderId,
+    personId,
+  });
+  applyCurrentFolderMetadata(metadata, target);
+  invalidateFolderViewCache(target.rootId);
+  await patchCurrentFolderFromDb({ keepStatus: true });
+}
+
+function applyCurrentFolderMetadata(metadata, target) {
+  const currentTarget = currentFolderMetadataTarget();
+  if (
+    !currentTarget ||
+    currentTarget.rootId !== target.rootId ||
+    currentTarget.folderId !== target.folderId
+  ) {
+    return;
+  }
+  state.currentFolderMeta = normalizeFolderMetadata(metadata, target);
+  state.metadataLoading = false;
+  mergePeopleOptions(state.currentFolderMeta.people);
+  renderMetadataBar();
+}
+
 function renderFolderView(view, options = {}) {
   const root = currentRoot();
   const title = view.relative_path || root.display_name;
@@ -842,6 +1279,7 @@ function renderFolderView(view, options = {}) {
   } else {
     gridNode.replaceChildren(...nodes);
   }
+  loadCurrentFolderMetadata().catch(showError);
 }
 
 function patchFolderViewInPlace(view, options = {}) {
@@ -872,6 +1310,7 @@ function patchFolderViewInPlace(view, options = {}) {
 
   if (desired.length === 0) {
     renderEmptyState("Empty folder", { keepBreadcrumbs: true });
+    clearMetadataSelection();
     return;
   }
 
@@ -909,6 +1348,7 @@ function patchFolderViewInPlace(view, options = {}) {
       child.remove();
     }
   }
+  loadCurrentFolderMetadata().catch(showError);
 }
 
 function renderPendingFolderView(view, options = {}) {
@@ -920,6 +1360,7 @@ function renderPendingFolderView(view, options = {}) {
   }
   upButton.disabled = false;
   scanButton.disabled = state.activeScans.has(view.root_id);
+  renderMetadataBar();
   renderBreadcrumbs(view);
   gridNode.replaceChildren();
   restorePendingScrollPosition();
@@ -936,6 +1377,8 @@ function startStreamedFolderView(header) {
   titleNode.textContent = header.relative_path || header.root_display_name;
   upButton.disabled = false;
   scanButton.disabled = state.activeScans.has(header.root_id);
+  renderMetadataBar();
+  loadCurrentFolderMetadata().catch(showError);
   renderBreadcrumbs(state.currentView);
   gridNode.replaceChildren();
   const scanning = state.activeScans.has(header.root_id);
@@ -1027,6 +1470,7 @@ function completeStreamedFolderView(payload) {
   if (state.currentView.folders.length === 0 && state.currentView.images.length === 0) {
     renderEmptyState("Empty folder", { keepBreadcrumbs: true });
   }
+  loadCurrentFolderMetadata().catch(showError);
   restorePendingScrollPosition();
   resumeDeferredThumbnails();
   cacheFolderView(state.currentView);
@@ -1676,6 +2120,19 @@ function handleDocumentClick(event) {
   if (!thumbContextMenu.contains(event.target)) {
     hideThumbContextMenu();
   }
+  if (state.personDropdownOpen && shouldClosePersonDropdownForClick(event.target)) {
+    closePersonDropdown();
+  }
+}
+
+function shouldClosePersonDropdownForClick(target) {
+  if (target.closest(".person-dropdown")) {
+    return false;
+  }
+  if (target.closest("button[data-action='toggle-person-dropdown']")) {
+    return false;
+  }
+  return true;
 }
 
 async function handleThumbContextAction(event) {

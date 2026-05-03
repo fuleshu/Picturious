@@ -3,10 +3,12 @@ use crate::db::{
     validate_root_path,
 };
 use crate::models::{
-    FolderView, ImageSummary, LibraryOverview, LibraryRoot, ScanProgress, ScanReport,
+    FolderMetadata, FolderView, ImageMetadata, ImageSummary, LibraryOverview, LibraryRoot,
+    MetadataTag, ScanProgress, ScanReport,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -208,6 +210,113 @@ impl LibraryManager {
         db.set_folder_thumbnail(folder_id, image_id)
     }
 
+    pub fn image_metadata(&self, root_id: &str, image_id: i64) -> Result<ImageMetadata> {
+        let known_root = self.known_root(root_id)?;
+        let db = self.open_connected_database(known_root)?;
+        db.image_metadata(root_id, image_id)
+    }
+
+    pub fn folder_metadata(&self, root_id: &str, folder_id: i64) -> Result<FolderMetadata> {
+        let known_root = self.known_root(root_id)?;
+        let db = self.open_connected_database(known_root)?;
+        db.folder_metadata(root_id, folder_id)
+    }
+
+    pub fn people(&self, root_id: &str) -> Result<Vec<MetadataTag>> {
+        let known_root = self.known_root(root_id)?;
+        let db = self.open_connected_database(known_root)?;
+        db.people()
+    }
+
+    pub fn all_people(&self) -> Result<Vec<MetadataTag>> {
+        let mut names_by_key = BTreeMap::new();
+        for root in &self.roots {
+            let Ok(db) = self.open_connected_database(root) else {
+                continue;
+            };
+            for person in db.people()? {
+                names_by_key
+                    .entry(person.name.to_lowercase())
+                    .or_insert(person.name);
+            }
+        }
+
+        Ok(names_by_key
+            .into_values()
+            .enumerate()
+            .map(|(index, name)| MetadataTag {
+                id: index as i64 + 1,
+                name,
+            })
+            .collect())
+    }
+
+    pub fn add_folder_person(
+        &self,
+        root_id: &str,
+        folder_id: i64,
+        name: &str,
+    ) -> Result<FolderMetadata> {
+        let known_root = self.known_root(root_id)?;
+        let db = self.open_connected_database(known_root)?;
+        db.add_folder_person(root_id, folder_id, name)
+    }
+
+    pub fn remove_folder_person(
+        &self,
+        root_id: &str,
+        folder_id: i64,
+        person_id: i64,
+    ) -> Result<FolderMetadata> {
+        let known_root = self.known_root(root_id)?;
+        let db = self.open_connected_database(known_root)?;
+        db.remove_folder_person(root_id, folder_id, person_id)
+    }
+
+    pub fn set_folder_rating(
+        &self,
+        root_id: &str,
+        folder_id: i64,
+        rating: Option<&str>,
+    ) -> Result<FolderMetadata> {
+        let known_root = self.known_root(root_id)?;
+        let db = self.open_connected_database(known_root)?;
+        db.set_folder_rating(root_id, folder_id, rating)
+    }
+
+    pub fn add_image_person(
+        &self,
+        root_id: &str,
+        image_id: i64,
+        name: &str,
+    ) -> Result<ImageMetadata> {
+        let known_root = self.known_root(root_id)?;
+        let db = self.open_connected_database(known_root)?;
+        db.add_image_person(root_id, image_id, name)
+    }
+
+    pub fn remove_image_person(
+        &self,
+        root_id: &str,
+        image_id: i64,
+        person_id: i64,
+    ) -> Result<ImageMetadata> {
+        let known_root = self.known_root(root_id)?;
+        let db = self.open_connected_database(known_root)?;
+        db.remove_image_person(root_id, image_id, person_id)
+    }
+
+    pub fn set_image_rating(
+        &self,
+        root_id: &str,
+        image_id: i64,
+        rating: Option<&str>,
+    ) -> Result<ImageMetadata> {
+        let known_root = self.known_root(root_id)?;
+        let db = self.open_connected_database(known_root)?;
+        db.set_image_rating(root_id, image_id, rating)
+    }
+
     fn known_root(&self, root_id: &str) -> Result<&KnownRoot> {
         self.roots
             .iter()
@@ -288,4 +397,45 @@ fn read_config(path: &Path) -> Result<AppConfig> {
 fn same_path(left: &str, right: &str) -> bool {
     left.trim_end_matches(['\\', '/'])
         .eq_ignore_ascii_case(right.trim_end_matches(['\\', '/']))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn all_people_combines_connected_roots_by_name() -> Result<()> {
+        let workspace = temp_path("all_people_combines_connected_roots_by_name");
+        let config_dir = workspace.join("config");
+        let root_a = workspace.join("root-a");
+        let root_b = workspace.join("root-b");
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(&root_a)?;
+        fs::create_dir_all(&root_b)?;
+
+        let mut manager = LibraryManager::new(&config_dir)?;
+        let root_a = manager.add_root(root_a.to_string_lossy().as_ref())?;
+        let root_b = manager.add_root(root_b.to_string_lossy().as_ref())?;
+        let root_a_folder_id = manager.folder_view(&root_a.id, "")?.folder_id;
+
+        manager.add_folder_person(&root_a.id, root_a_folder_id, "Max")?;
+
+        assert_eq!(manager.people(&root_b.id)?, Vec::<MetadataTag>::new());
+        assert_eq!(
+            manager
+                .all_people()?
+                .into_iter()
+                .map(|person| person.name)
+                .collect::<Vec<_>>(),
+            vec!["Max"]
+        );
+
+        let _ = fs::remove_dir_all(&workspace);
+        Ok(())
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("picturious-{name}-{}", Uuid::new_v4()))
+    }
 }

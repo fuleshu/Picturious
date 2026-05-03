@@ -42,6 +42,31 @@ pub struct ImageSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetadataTag {
+    pub id: i64,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FolderMetadata {
+    pub root_id: String,
+    pub folder_id: i64,
+    pub relative_path: String,
+    pub rating: Option<String>,
+    pub inherited_rating: Option<String>,
+    pub people: Vec<MetadataTag>,
+    pub inherited_people: Vec<MetadataTag>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageMetadata {
+    pub root_id: String,
+    pub image_id: i64,
+    pub rating: Option<String>,
+    pub people: Vec<MetadataTag>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FolderViewHeader {
     pub root_id: String,
     pub root_display_name: String,

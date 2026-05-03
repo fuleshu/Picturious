@@ -1,5 +1,6 @@
 use crate::models::{
-    FolderSummary, FolderView, FolderViewHeader, ImageSummary, ScanProgress, ScanReport,
+    FolderMetadata, FolderSummary, FolderView, FolderViewHeader, ImageMetadata, ImageSummary,
+    MetadataTag, ScanProgress, ScanReport,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
@@ -12,7 +13,7 @@ use uuid::Uuid;
 const DB_DIR: &str = ".picturious";
 const DB_FILE: &str = "root.sqlite";
 const ROOT_RELATIVE_PATH: &str = "";
-const SCHEMA_VERSION: &str = "2";
+const SCHEMA_VERSION: &str = "3";
 const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "avif",
 ];
@@ -546,6 +547,199 @@ impl RootDatabase {
         Ok(())
     }
 
+    pub fn folder_metadata(&self, root_id: &str, folder_id: i64) -> Result<FolderMetadata> {
+        let relative_path = self.folder_relative_path(folder_id)?;
+        let rating = self.folder_rating(folder_id)?;
+        let inherited_rating = self.inherited_folder_rating(&relative_path)?;
+        let people = self.folder_people(folder_id)?;
+        let inherited_people = self.inherited_folder_people(&relative_path)?;
+
+        Ok(FolderMetadata {
+            root_id: root_id.to_owned(),
+            folder_id,
+            relative_path,
+            rating,
+            inherited_rating,
+            people,
+            inherited_people,
+        })
+    }
+
+    pub fn image_metadata(&self, root_id: &str, image_id: i64) -> Result<ImageMetadata> {
+        self.ensure_image_exists(image_id)?;
+        let rating = self.image_rating(image_id)?;
+        let people = self.image_people(image_id)?;
+
+        Ok(ImageMetadata {
+            root_id: root_id.to_owned(),
+            image_id,
+            rating,
+            people,
+        })
+    }
+
+    pub fn people(&self) -> Result<Vec<MetadataTag>> {
+        let mut statement = self.connection.prepare(
+            "
+            SELECT id, name
+            FROM people
+            ORDER BY name COLLATE NOCASE
+            ",
+        )?;
+        let people = statement
+            .query_map([], metadata_tag_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(people)
+    }
+
+    pub fn add_folder_person(
+        &self,
+        root_id: &str,
+        folder_id: i64,
+        name: &str,
+    ) -> Result<FolderMetadata> {
+        self.folder_relative_path(folder_id)?;
+        let name = normalize_metadata_name(name)?;
+        self.connection.execute(
+            "
+            INSERT INTO people(name)
+            VALUES(?1)
+            ON CONFLICT(name) DO NOTHING
+            ",
+            params![&name],
+        )?;
+        let person_id = self.connection.query_row(
+            "SELECT id FROM people WHERE name = ?1 COLLATE NOCASE",
+            params![&name],
+            |row| row.get::<_, i64>(0),
+        )?;
+        self.connection.execute(
+            "
+            INSERT INTO folder_people(folder_id, person_id)
+            VALUES(?1, ?2)
+            ON CONFLICT(folder_id, person_id) DO NOTHING
+            ",
+            params![folder_id, person_id],
+        )?;
+
+        self.folder_metadata(root_id, folder_id)
+    }
+
+    pub fn remove_folder_person(
+        &self,
+        root_id: &str,
+        folder_id: i64,
+        person_id: i64,
+    ) -> Result<FolderMetadata> {
+        self.folder_relative_path(folder_id)?;
+        self.connection.execute(
+            "DELETE FROM folder_people WHERE folder_id = ?1 AND person_id = ?2",
+            params![folder_id, person_id],
+        )?;
+        self.folder_metadata(root_id, folder_id)
+    }
+
+    pub fn set_folder_rating(
+        &self,
+        root_id: &str,
+        folder_id: i64,
+        rating: Option<&str>,
+    ) -> Result<FolderMetadata> {
+        self.folder_relative_path(folder_id)?;
+        if let Some(rating) = rating {
+            let rating_id = rating_id_for_name(rating)?;
+            self.connection.execute(
+                "
+                INSERT INTO folder_ratings(folder_id, rating_id)
+                VALUES(?1, ?2)
+                ON CONFLICT(folder_id) DO UPDATE SET rating_id = excluded.rating_id
+                ",
+                params![folder_id, rating_id],
+            )?;
+        } else {
+            self.connection.execute(
+                "DELETE FROM folder_ratings WHERE folder_id = ?1",
+                params![folder_id],
+            )?;
+        }
+
+        self.folder_metadata(root_id, folder_id)
+    }
+
+    pub fn add_image_person(
+        &self,
+        root_id: &str,
+        image_id: i64,
+        name: &str,
+    ) -> Result<ImageMetadata> {
+        self.ensure_image_exists(image_id)?;
+        let name = normalize_metadata_name(name)?;
+        self.connection.execute(
+            "
+            INSERT INTO people(name)
+            VALUES(?1)
+            ON CONFLICT(name) DO NOTHING
+            ",
+            params![&name],
+        )?;
+        let person_id = self.connection.query_row(
+            "SELECT id FROM people WHERE name = ?1 COLLATE NOCASE",
+            params![&name],
+            |row| row.get::<_, i64>(0),
+        )?;
+        self.connection.execute(
+            "
+            INSERT INTO image_people(image_id, person_id)
+            VALUES(?1, ?2)
+            ON CONFLICT(image_id, person_id) DO NOTHING
+            ",
+            params![image_id, person_id],
+        )?;
+
+        self.image_metadata(root_id, image_id)
+    }
+
+    pub fn remove_image_person(
+        &self,
+        root_id: &str,
+        image_id: i64,
+        person_id: i64,
+    ) -> Result<ImageMetadata> {
+        self.ensure_image_exists(image_id)?;
+        self.connection.execute(
+            "DELETE FROM image_people WHERE image_id = ?1 AND person_id = ?2",
+            params![image_id, person_id],
+        )?;
+        self.image_metadata(root_id, image_id)
+    }
+
+    pub fn set_image_rating(
+        &self,
+        root_id: &str,
+        image_id: i64,
+        rating: Option<&str>,
+    ) -> Result<ImageMetadata> {
+        self.ensure_image_exists(image_id)?;
+        if let Some(rating) = rating {
+            let rating_id = rating_id_for_name(rating)?;
+            self.connection.execute(
+                "
+                INSERT INTO image_ratings(image_id, rating_id)
+                VALUES(?1, ?2)
+                ON CONFLICT(image_id) DO UPDATE SET rating_id = excluded.rating_id
+                ",
+                params![image_id, rating_id],
+            )?;
+        } else {
+            self.connection.execute(
+                "DELETE FROM image_ratings WHERE image_id = ?1",
+                params![image_id],
+            )?;
+        }
+
+        self.image_metadata(root_id, image_id)
+    }
+
     fn configure(&self) -> Result<()> {
         self.connection
             .busy_timeout(Duration::from_secs(5))
@@ -622,10 +816,53 @@ impl RootDatabase {
                 FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE CASCADE,
                 FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS ratings (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE
+            );
+
+            CREATE TABLE IF NOT EXISTS folder_ratings (
+                folder_id INTEGER PRIMARY KEY,
+                rating_id INTEGER NOT NULL,
+                FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE CASCADE,
+                FOREIGN KEY(rating_id) REFERENCES ratings(id) ON DELETE RESTRICT
+            );
+
+            CREATE TABLE IF NOT EXISTS image_keywords (
+                image_id INTEGER NOT NULL,
+                keyword_id INTEGER NOT NULL,
+                PRIMARY KEY(image_id, keyword_id),
+                FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE,
+                FOREIGN KEY(keyword_id) REFERENCES keywords(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS image_people (
+                image_id INTEGER NOT NULL,
+                person_id INTEGER NOT NULL,
+                PRIMARY KEY(image_id, person_id),
+                FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE,
+                FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS image_ratings (
+                image_id INTEGER PRIMARY KEY,
+                rating_id INTEGER NOT NULL,
+                FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE,
+                FOREIGN KEY(rating_id) REFERENCES ratings(id) ON DELETE RESTRICT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_image_people_person
+                ON image_people(person_id);
+
+            CREATE INDEX IF NOT EXISTS idx_image_keywords_keyword
+                ON image_keywords(keyword_id);
             ",
         )?;
 
         self.ensure_scan_columns()?;
+        self.ensure_ratings()?;
+        self.migrate_image_metadata_to_folders()?;
 
         self.connection.execute(
             "
@@ -644,6 +881,173 @@ impl RootDatabase {
             [],
         )?;
         Ok(())
+    }
+
+    fn migrate_image_metadata_to_folders(&self) -> Result<()> {
+        self.connection.execute(
+            "
+            INSERT INTO folder_people(folder_id, person_id)
+            SELECT DISTINCT images.folder_id, image_people.person_id
+            FROM image_people
+            INNER JOIN images ON images.id = image_people.image_id
+            ON CONFLICT(folder_id, person_id) DO NOTHING
+            ",
+            [],
+        )?;
+
+        self.connection.execute(
+            "
+            INSERT INTO folder_ratings(folder_id, rating_id)
+            SELECT image_rating_folders.folder_id, MIN(image_rating_folders.rating_id)
+            FROM (
+                SELECT images.folder_id, image_ratings.rating_id
+                FROM image_ratings
+                INNER JOIN images ON images.id = image_ratings.image_id
+            ) AS image_rating_folders
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM folder_ratings
+                WHERE folder_ratings.folder_id = image_rating_folders.folder_id
+            )
+            GROUP BY image_rating_folders.folder_id
+            HAVING COUNT(DISTINCT image_rating_folders.rating_id) = 1
+            ON CONFLICT(folder_id) DO NOTHING
+            ",
+            [],
+        )?;
+
+        Ok(())
+    }
+
+    fn ensure_ratings(&self) -> Result<()> {
+        for (id, name) in [(1_i64, "unhappy"), (2, "neutral"), (3, "happy")] {
+            self.connection.execute(
+                "
+                INSERT INTO ratings(id, name)
+                VALUES(?1, ?2)
+                ON CONFLICT(id) DO UPDATE SET name = excluded.name
+                ",
+                params![id, name],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn ensure_image_exists(&self, image_id: i64) -> Result<()> {
+        let exists = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM images WHERE id = ?1",
+                params![image_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            bail!("image not found: {image_id}");
+        }
+        Ok(())
+    }
+
+    fn image_rating(&self, image_id: i64) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "
+                SELECT ratings.name
+                FROM image_ratings
+                INNER JOIN ratings ON ratings.id = image_ratings.rating_id
+                WHERE image_ratings.image_id = ?1
+                ",
+                params![image_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("could not read image rating")
+    }
+
+    fn image_people(&self, image_id: i64) -> Result<Vec<MetadataTag>> {
+        let mut statement = self.connection.prepare(
+            "
+            SELECT people.id, people.name
+            FROM people
+            INNER JOIN image_people ON image_people.person_id = people.id
+            WHERE image_people.image_id = ?1
+            ORDER BY people.name COLLATE NOCASE
+            ",
+        )?;
+        let people = statement
+            .query_map(params![image_id], metadata_tag_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(people)
+    }
+
+    fn folder_relative_path(&self, folder_id: i64) -> Result<String> {
+        self.connection
+            .query_row(
+                "SELECT relative_path FROM folders WHERE id = ?1",
+                params![folder_id],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("folder not found: {folder_id}"))
+    }
+
+    fn folder_rating(&self, folder_id: i64) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "
+                SELECT ratings.name
+                FROM folder_ratings
+                INNER JOIN ratings ON ratings.id = folder_ratings.rating_id
+                WHERE folder_ratings.folder_id = ?1
+                ",
+                params![folder_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("could not read folder rating")
+    }
+
+    fn inherited_folder_rating(&self, relative_path: &str) -> Result<Option<String>> {
+        for ancestor in nearest_ancestor_paths(relative_path) {
+            let folder_id = self.folder_id(&ancestor)?;
+            if let Some(rating) = self.folder_rating(folder_id)? {
+                return Ok(Some(rating));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn folder_people(&self, folder_id: i64) -> Result<Vec<MetadataTag>> {
+        let mut statement = self.connection.prepare(
+            "
+            SELECT people.id, people.name
+            FROM people
+            INNER JOIN folder_people ON folder_people.person_id = people.id
+            WHERE folder_people.folder_id = ?1
+            ORDER BY people.name COLLATE NOCASE
+            ",
+        )?;
+        let people = statement
+            .query_map(params![folder_id], metadata_tag_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(people)
+    }
+
+    fn inherited_folder_people(&self, relative_path: &str) -> Result<Vec<MetadataTag>> {
+        let mut people = Vec::new();
+        for ancestor in ancestor_paths(relative_path) {
+            let folder_id = self.folder_id(&ancestor)?;
+            people.extend(self.folder_people(folder_id)?);
+        }
+        people.sort_by(|left, right| {
+            left.name
+                .to_lowercase()
+                .cmp(&right.name.to_lowercase())
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        people.dedup_by(|left, right| left.id == right.id);
+        Ok(people)
     }
 
     fn ensure_column(&self, table: &str, column: &str, definition: &str) -> Result<()> {
@@ -1431,6 +1835,33 @@ fn names_for_folder(connection: &Connection, sql: &str, folder_id: i64) -> Resul
     Ok(names)
 }
 
+fn metadata_tag_from_row(row: &Row<'_>) -> rusqlite::Result<MetadataTag> {
+    Ok(MetadataTag {
+        id: row.get(0)?,
+        name: row.get(1)?,
+    })
+}
+
+fn normalize_metadata_name(name: &str) -> Result<String> {
+    let normalized = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        bail!("person name is empty");
+    }
+    if normalized.chars().count() > 160 {
+        bail!("person name is too long");
+    }
+    Ok(normalized)
+}
+
+fn rating_id_for_name(name: &str) -> Result<i64> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "unhappy" => Ok(1),
+        "neutral" => Ok(2),
+        "happy" => Ok(3),
+        _ => bail!("unknown rating: {name}"),
+    }
+}
+
 fn image_summary_from_row(root_id: &str, row: &Row<'_>) -> rusqlite::Result<ImageSummary> {
     Ok(ImageSummary {
         root_id: root_id.to_owned(),
@@ -1519,6 +1950,19 @@ fn ancestor_paths(relative_path: &str) -> Vec<String> {
     ancestors
 }
 
+fn nearest_ancestor_paths(relative_path: &str) -> Vec<String> {
+    let mut ancestors = Vec::new();
+    let mut current = parent_relative_path(relative_path);
+    while let Some(path) = current {
+        ancestors.push(path.clone());
+        if path.is_empty() {
+            break;
+        }
+        current = parent_relative_path(&path);
+    }
+    ancestors
+}
+
 fn display_name_for_relative_path(relative_path: &str) -> String {
     if relative_path.is_empty() {
         "Root".to_owned()
@@ -1602,4 +2046,121 @@ pub fn validate_root_path(path: &str) -> Result<PathBuf> {
     }
 
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_metadata_people_and_rating_round_trip() -> Result<()> {
+        let root = temp_root_path("image_metadata_people_and_rating_round_trip");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        fs::write(root.join("portrait.jpg"), b"image bytes")?;
+
+        let mut db = RootDatabase::open(&root)?;
+        let root_id = db.root_id()?;
+        db.scan(&root_id)?;
+        let images = db.images_for_folder(&root_id, "")?;
+        let image_id = images
+            .first()
+            .map(|image| image.id)
+            .context("test image was not indexed")?;
+
+        let metadata = db.add_image_person(&root_id, image_id, " Ada   Lovelace ")?;
+        assert_eq!(metadata.people.len(), 1);
+        assert_eq!(metadata.people[0].name, "Ada Lovelace");
+
+        let metadata = db.set_image_rating(&root_id, image_id, Some("happy"))?;
+        assert_eq!(metadata.rating.as_deref(), Some("happy"));
+
+        let metadata = db.set_image_rating(&root_id, image_id, None)?;
+        assert_eq!(metadata.rating, None);
+        assert_eq!(metadata.people.len(), 1);
+
+        let person_id = metadata.people[0].id;
+        let metadata = db.remove_image_person(&root_id, image_id, person_id)?;
+        assert!(metadata.people.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn folder_metadata_inherits_people_and_rating_from_ancestors() -> Result<()> {
+        let root = temp_root_path("folder_metadata_inherits_people_and_rating_from_ancestors");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("Ada").join("Set"))?;
+        fs::write(
+            root.join("Ada").join("Set").join("portrait.jpg"),
+            b"image bytes",
+        )?;
+
+        let mut db = RootDatabase::open(&root)?;
+        let root_id = db.root_id()?;
+        db.scan(&root_id)?;
+        let parent_id = db.folder_id("Ada")?;
+        let child_id = db.folder_id("Ada/Set")?;
+
+        let parent_metadata = db.add_folder_person(&root_id, parent_id, "Ada Lovelace")?;
+        assert_eq!(parent_metadata.people.len(), 1);
+        assert!(parent_metadata.inherited_people.is_empty());
+
+        db.set_folder_rating(&root_id, parent_id, Some("happy"))?;
+
+        let child_metadata = db.folder_metadata(&root_id, child_id)?;
+        assert!(child_metadata.people.is_empty());
+        assert_eq!(child_metadata.inherited_people.len(), 1);
+        assert_eq!(child_metadata.inherited_people[0].name, "Ada Lovelace");
+        assert_eq!(child_metadata.rating, None);
+        assert_eq!(child_metadata.inherited_rating.as_deref(), Some("happy"));
+
+        let parent_view = db.folder_view(&root_id, "Root", "Ada")?;
+        let child_summary = parent_view
+            .folders
+            .iter()
+            .find(|folder| folder.relative_path == "Ada/Set")
+            .context("child folder was not visible")?;
+        assert!(child_summary.direct_people.is_empty());
+        assert_eq!(child_summary.inherited_people, vec!["Ada Lovelace"]);
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn image_metadata_migrates_to_containing_folder() -> Result<()> {
+        let root = temp_root_path("image_metadata_migrates_to_containing_folder");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("Ada"))?;
+        fs::write(root.join("Ada").join("portrait.jpg"), b"image bytes")?;
+
+        let mut db = RootDatabase::open(&root)?;
+        let root_id = db.root_id()?;
+        db.scan(&root_id)?;
+        let folder_id = db.folder_id("Ada")?;
+        let image_id = db
+            .images_for_folder(&root_id, "Ada")?
+            .first()
+            .map(|image| image.id)
+            .context("test image was not indexed")?;
+
+        db.add_image_person(&root_id, image_id, "Ada Lovelace")?;
+        db.set_image_rating(&root_id, image_id, Some("happy"))?;
+        drop(db);
+
+        let db = RootDatabase::open_existing(&root)?.context("test database was not reopened")?;
+        let metadata = db.folder_metadata(&root_id, folder_id)?;
+        assert_eq!(metadata.people.len(), 1);
+        assert_eq!(metadata.people[0].name, "Ada Lovelace");
+        assert_eq!(metadata.rating.as_deref(), Some("happy"));
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    fn temp_root_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("picturious-{name}-{}", Uuid::new_v4()))
+    }
 }
