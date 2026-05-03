@@ -13,7 +13,7 @@ use uuid::Uuid;
 const DB_DIR: &str = ".picturious";
 const DB_FILE: &str = "root.sqlite";
 const ROOT_RELATIVE_PATH: &str = "";
-const SCHEMA_VERSION: &str = "3";
+const SCHEMA_VERSION: &str = "4";
 const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "avif",
 ];
@@ -731,11 +731,11 @@ impl RootDatabase {
         &self,
         root_id: &str,
         folder_id: i64,
-        rating: Option<&str>,
+        rating: Option<u8>,
     ) -> Result<FolderMetadata> {
         self.folder_relative_path(folder_id)?;
         if let Some(rating) = rating {
-            let rating_id = rating_id_for_name(rating)?;
+            let rating_id = rating_id_for_value(rating)?;
             self.connection.execute(
                 "
                 INSERT INTO folder_ratings(folder_id, rating_id)
@@ -805,11 +805,11 @@ impl RootDatabase {
         &self,
         root_id: &str,
         image_id: i64,
-        rating: Option<&str>,
+        rating: Option<u8>,
     ) -> Result<ImageMetadata> {
         self.ensure_image_exists(image_id)?;
         if let Some(rating) = rating {
-            let rating_id = rating_id_for_name(rating)?;
+            let rating_id = rating_id_for_value(rating)?;
             self.connection.execute(
                 "
                 INSERT INTO image_ratings(image_id, rating_id)
@@ -1008,7 +1008,24 @@ impl RootDatabase {
     }
 
     fn ensure_ratings(&self) -> Result<()> {
-        for (id, name) in [(1_i64, "unhappy"), (2, "neutral"), (3, "happy")] {
+        self.connection.execute_batch(
+            "
+            DELETE FROM folder_ratings
+            WHERE rating_id IN (
+                SELECT id FROM ratings WHERE name IN ('unhappy', 'neutral', 'happy')
+            ) OR rating_id NOT BETWEEN 1 AND 5;
+
+            DELETE FROM image_ratings
+            WHERE rating_id IN (
+                SELECT id FROM ratings WHERE name IN ('unhappy', 'neutral', 'happy')
+            ) OR rating_id NOT BETWEEN 1 AND 5;
+
+            DELETE FROM ratings
+            WHERE name IN ('unhappy', 'neutral', 'happy') OR id NOT BETWEEN 1 AND 5;
+            ",
+        )?;
+
+        for (id, name) in [(1_i64, "1"), (2, "2"), (3, "3"), (4, "4"), (5, "5")] {
             self.connection.execute(
                 "
                 INSERT INTO ratings(id, name)
@@ -1037,20 +1054,21 @@ impl RootDatabase {
         Ok(())
     }
 
-    fn image_rating(&self, image_id: i64) -> Result<Option<String>> {
-        self.connection
+    fn image_rating(&self, image_id: i64) -> Result<Option<u8>> {
+        let rating_id = self
+            .connection
             .query_row(
                 "
-                SELECT ratings.name
+                SELECT image_ratings.rating_id
                 FROM image_ratings
-                INNER JOIN ratings ON ratings.id = image_ratings.rating_id
                 WHERE image_ratings.image_id = ?1
                 ",
                 params![image_id],
-                |row| row.get(0),
+                |row| row.get::<_, i64>(0),
             )
             .optional()
-            .context("could not read image rating")
+            .context("could not read image rating")?;
+        rating_id.map(rating_from_id).transpose()
     }
 
     fn image_people(&self, image_id: i64) -> Result<Vec<MetadataTag>> {
@@ -1079,23 +1097,24 @@ impl RootDatabase {
             .with_context(|| format!("folder not found: {folder_id}"))
     }
 
-    fn folder_rating(&self, folder_id: i64) -> Result<Option<String>> {
-        self.connection
+    fn folder_rating(&self, folder_id: i64) -> Result<Option<u8>> {
+        let rating_id = self
+            .connection
             .query_row(
                 "
-                SELECT ratings.name
+                SELECT folder_ratings.rating_id
                 FROM folder_ratings
-                INNER JOIN ratings ON ratings.id = folder_ratings.rating_id
                 WHERE folder_ratings.folder_id = ?1
                 ",
                 params![folder_id],
-                |row| row.get(0),
+                |row| row.get::<_, i64>(0),
             )
             .optional()
-            .context("could not read folder rating")
+            .context("could not read folder rating")?;
+        rating_id.map(rating_from_id).transpose()
     }
 
-    fn inherited_folder_rating(&self, relative_path: &str) -> Result<Option<String>> {
+    fn inherited_folder_rating(&self, relative_path: &str) -> Result<Option<u8>> {
         for ancestor in nearest_ancestor_paths(relative_path) {
             let folder_id = self.folder_id(&ancestor)?;
             if let Some(rating) = self.folder_rating(folder_id)? {
@@ -1396,6 +1415,8 @@ impl RootDatabase {
         let direct_people = self.person_names(id)?;
         let inherited_keywords = self.inherited_keyword_names(&relative_path)?;
         let inherited_people = self.inherited_person_names(&relative_path)?;
+        let direct_rating = self.folder_rating(id)?;
+        let inherited_rating = self.inherited_folder_rating(&relative_path)?;
         let thumbnail_image_id =
             self.thumbnail_image_id(id, &relative_path, selected_thumbnail_image_id)?;
 
@@ -1410,6 +1431,8 @@ impl RootDatabase {
             inherited_keywords,
             direct_people,
             inherited_people,
+            direct_rating,
+            inherited_rating,
             image_count,
             child_folder_count,
         })
@@ -1973,12 +1996,22 @@ fn normalize_metadata_name(name: &str) -> Result<String> {
     Ok(normalized)
 }
 
-fn rating_id_for_name(name: &str) -> Result<i64> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "unhappy" => Ok(1),
-        "neutral" => Ok(2),
-        "happy" => Ok(3),
-        _ => bail!("unknown rating: {name}"),
+fn rating_id_for_value(value: u8) -> Result<i64> {
+    if (1..=5).contains(&value) {
+        Ok(i64::from(value))
+    } else {
+        bail!("unknown rating: {value}")
+    }
+}
+
+fn rating_from_id(id: i64) -> Result<u8> {
+    let value: u8 = id
+        .try_into()
+        .with_context(|| format!("unknown rating: {id}"))?;
+    if (1..=5).contains(&value) {
+        Ok(value)
+    } else {
+        bail!("unknown rating: {id}")
     }
 }
 
@@ -2192,8 +2225,8 @@ mod tests {
         assert_eq!(metadata.people.len(), 1);
         assert_eq!(metadata.people[0].name, "Ada Lovelace");
 
-        let metadata = db.set_image_rating(&root_id, image_id, Some("happy"))?;
-        assert_eq!(metadata.rating.as_deref(), Some("happy"));
+        let metadata = db.set_image_rating(&root_id, image_id, Some(4))?;
+        assert_eq!(metadata.rating, Some(4));
 
         let metadata = db.set_image_rating(&root_id, image_id, None)?;
         assert_eq!(metadata.rating, None);
@@ -2227,7 +2260,7 @@ mod tests {
         assert_eq!(parent_metadata.people.len(), 1);
         assert!(parent_metadata.inherited_people.is_empty());
 
-        db.set_folder_rating(&root_id, parent_id, Some("happy"))?;
+        db.set_folder_rating(&root_id, parent_id, Some(5))?;
         db.add_folder_keyword(&root_id, parent_id, "portrait")?;
 
         let child_metadata = db.folder_metadata(&root_id, child_id)?;
@@ -2238,7 +2271,7 @@ mod tests {
         assert_eq!(child_metadata.inherited_tags.len(), 1);
         assert_eq!(child_metadata.inherited_tags[0].name, "portrait");
         assert_eq!(child_metadata.rating, None);
-        assert_eq!(child_metadata.inherited_rating.as_deref(), Some("happy"));
+        assert_eq!(child_metadata.inherited_rating, Some(5));
 
         let parent_view = db.folder_view(&root_id, "Root", "Ada")?;
         let child_summary = parent_view
@@ -2250,6 +2283,8 @@ mod tests {
         assert_eq!(child_summary.inherited_people, vec!["Ada Lovelace"]);
         assert!(child_summary.direct_keywords.is_empty());
         assert_eq!(child_summary.inherited_keywords, vec!["portrait"]);
+        assert_eq!(child_summary.direct_rating, None);
+        assert_eq!(child_summary.inherited_rating, Some(5));
 
         let _ = fs::remove_dir_all(&root);
         Ok(())
@@ -2329,14 +2364,56 @@ mod tests {
             .context("test image was not indexed")?;
 
         db.add_image_person(&root_id, image_id, "Ada Lovelace")?;
-        db.set_image_rating(&root_id, image_id, Some("happy"))?;
+        db.set_image_rating(&root_id, image_id, Some(3))?;
         drop(db);
 
         let db = RootDatabase::open_existing(&root)?.context("test database was not reopened")?;
         let metadata = db.folder_metadata(&root_id, folder_id)?;
         assert_eq!(metadata.people.len(), 1);
         assert_eq!(metadata.people[0].name, "Ada Lovelace");
-        assert_eq!(metadata.rating.as_deref(), Some("happy"));
+        assert_eq!(metadata.rating, Some(3));
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_smiley_ratings_are_dropped() -> Result<()> {
+        let root = temp_root_path("legacy_smiley_ratings_are_dropped");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("Ada"))?;
+        fs::write(root.join("Ada").join("portrait.jpg"), b"image bytes")?;
+
+        let mut db = RootDatabase::open(&root)?;
+        let root_id = db.root_id()?;
+        db.scan(&root_id)?;
+        let folder_id = db.folder_id("Ada")?;
+        let image_id = db
+            .images_for_folder(&root_id, "Ada")?
+            .first()
+            .map(|image| image.id)
+            .context("test image was not indexed")?;
+
+        db.connection.execute("DELETE FROM ratings", [])?;
+        for (id, name) in [(1_i64, "unhappy"), (2, "neutral"), (3, "happy")] {
+            db.connection.execute(
+                "INSERT INTO ratings(id, name) VALUES(?1, ?2)",
+                params![id, name],
+            )?;
+        }
+        db.connection.execute(
+            "INSERT INTO folder_ratings(folder_id, rating_id) VALUES(?1, 3)",
+            params![folder_id],
+        )?;
+        db.connection.execute(
+            "INSERT INTO image_ratings(image_id, rating_id) VALUES(?1, 1)",
+            params![image_id],
+        )?;
+        drop(db);
+
+        let db = RootDatabase::open_existing(&root)?.context("test database was not reopened")?;
+        assert_eq!(db.folder_metadata(&root_id, folder_id)?.rating, None);
+        assert_eq!(db.image_metadata(&root_id, image_id)?.rating, None);
 
         let _ = fs::remove_dir_all(&root);
         Ok(())

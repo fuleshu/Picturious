@@ -812,7 +812,7 @@ async fn remove_folder_person(
 async fn set_folder_rating(
     root_id: String,
     folder_id: i64,
-    rating: Option<String>,
+    rating: Option<u8>,
     state: State<'_, AppState>,
 ) -> Result<FolderMetadata, String> {
     let library = state.library.clone();
@@ -820,7 +820,7 @@ async fn set_folder_rating(
         library
             .lock()
             .map_err(|_| "library state is locked".to_owned())?
-            .set_folder_rating(&root_id, folder_id, rating.as_deref())
+            .set_folder_rating(&root_id, folder_id, rating)
             .map_err(error_message)
     })
     .await
@@ -869,7 +869,7 @@ async fn remove_image_person(
 async fn set_image_rating(
     root_id: String,
     image_id: i64,
-    rating: Option<String>,
+    rating: Option<u8>,
     state: State<'_, AppState>,
 ) -> Result<ImageMetadata, String> {
     let library = state.library.clone();
@@ -877,7 +877,7 @@ async fn set_image_rating(
         library
             .lock()
             .map_err(|_| "library state is locked".to_owned())?
-            .set_image_rating(&root_id, image_id, rating.as_deref())
+            .set_image_rating(&root_id, image_id, rating)
             .map_err(error_message)
     })
     .await

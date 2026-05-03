@@ -342,26 +342,42 @@ button:disabled {
 
 .rating-toggle-group {
   flex: 0 0 auto;
+  gap: 2px;
 }
 
 .rating-toggle {
-  width: 38px;
+  display: grid;
+  width: 30px;
   min-height: 30px;
+  place-items: center;
+  border-color: transparent;
+  background: transparent;
   padding: 0;
-  font-weight: 700;
+  color: #d49a00;
+  font-size: 21px;
+  line-height: 1;
+}
+
+.rating-toggle:hover:not(:disabled) {
+  border-color: #d9a92f;
+  background: #fff7df;
 }
 
 .rating-toggle[data-active="true"] {
-  border-color: #23645d;
-  background: #e1efeb;
-  color: #173f39;
+  border-color: #c88b00;
+  background: #fff4cf;
+  color: #e0a400;
 }
 
 .rating-toggle[data-inherited-active="true"] {
   border-style: dashed;
-  border-color: #7f9690;
-  background: #eef2f0;
-  color: #41504c;
+  border-color: #d2a538;
+  background: #fffaf0;
+  color: #d49a00;
+}
+
+.rating-toggle[data-filled="true"] .star-icon {
+  color: #e3a600;
 }
 
 .people-editor,
@@ -545,6 +561,7 @@ button:disabled {
 }
 
 .thumb {
+  position: relative;
   display: flex;
   width: 100%;
   height: var(--thumb-height);
@@ -572,12 +589,12 @@ button:disabled {
   background: #7b4b42;
 }
 
-.thumb span {
+.thumb > span:not(.folder-rating-badge) {
   font-size: 34px;
   font-weight: 750;
 }
 
-.thumb.loaded span {
+.thumb.loaded > span:not(.folder-rating-badge) {
   display: none;
 }
 
@@ -608,12 +625,55 @@ button:disabled {
   margin-top: 10px;
 }
 
-.tags span {
+.tags > span {
   border-radius: 999px;
   background: #e8ece7;
   color: #35403b;
   padding: 3px 8px;
   font-size: 12px;
+}
+
+.folder-rating-badge {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 1;
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  min-width: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+  pointer-events: none;
+}
+
+.folder-rating-badge[data-inherited="true"] {
+  opacity: 0.72;
+}
+
+.rating-star-badge {
+  display: block;
+  width: 38px;
+  height: 38px;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.42));
+  overflow: visible;
+}
+
+.rating-star-glyph {
+  fill: #f0b400;
+  stroke: rgba(25, 20, 5, 0.32);
+  stroke-width: 0.9;
+}
+
+.rating-star-number {
+  fill: #111315;
+  dominant-baseline: middle;
+  font-size: 14px;
+  font-weight: 800;
+  text-anchor: middle;
 }
 
 .empty-state {

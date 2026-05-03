@@ -24,6 +24,8 @@ pub struct FolderSummary {
     pub inherited_keywords: Vec<String>,
     pub direct_people: Vec<String>,
     pub inherited_people: Vec<String>,
+    pub direct_rating: Option<u8>,
+    pub inherited_rating: Option<u8>,
     pub image_count: u32,
     pub child_folder_count: u32,
 }
@@ -52,8 +54,8 @@ pub struct FolderMetadata {
     pub root_id: String,
     pub folder_id: i64,
     pub relative_path: String,
-    pub rating: Option<String>,
-    pub inherited_rating: Option<String>,
+    pub rating: Option<u8>,
+    pub inherited_rating: Option<u8>,
     pub people: Vec<MetadataTag>,
     pub inherited_people: Vec<MetadataTag>,
     pub tags: Vec<MetadataTag>,
@@ -64,7 +66,7 @@ pub struct FolderMetadata {
 pub struct ImageMetadata {
     pub root_id: String,
     pub image_id: i64,
-    pub rating: Option<String>,
+    pub rating: Option<u8>,
     pub people: Vec<MetadataTag>,
 }
 

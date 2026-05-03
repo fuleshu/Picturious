@@ -8,11 +8,7 @@ const STREAM_ITEMS_PER_FRAME = 16;
 const VIEWER_CURSOR_HIDE_DELAY_MS = 3000;
 const MAX_FOLDER_VIEW_CACHE_ENTRIES = 80;
 const MAX_THUMBNAIL_DATA_CACHE_ENTRIES = 700;
-const RATING_OPTIONS = [
-  { value: "unhappy", label: ":(" },
-  { value: "neutral", label: ":|" },
-  { value: "happy", label: ":)" },
-];
+const RATING_OPTIONS = [1, 2, 3, 4, 5];
 
 const gridNode = document.querySelector("#content-grid");
 const statusNode = document.querySelector("#status");
@@ -941,8 +937,8 @@ function normalizeFolderMetadata(metadata, target) {
     root_id: metadata?.root_id ?? target?.rootId ?? "",
     folder_id: Number(metadata?.folder_id ?? target?.folderId ?? 0),
     relative_path: metadata?.relative_path ?? target?.relativePath ?? "",
-    rating: metadata?.rating ?? null,
-    inherited_rating: metadata?.inherited_rating ?? null,
+    rating: normalizeRating(metadata?.rating),
+    inherited_rating: normalizeRating(metadata?.inherited_rating),
     people: Array.isArray(metadata?.people)
       ? metadata.people
           .filter((person) => Number.isFinite(Number(person?.id)) && person?.name)
@@ -985,8 +981,8 @@ function renderMetadataBar(options = {}) {
   const disabledAttr = editDisabled ? " disabled" : "";
   const targetLabel = target ? `Folder: ${target.displayName}` : "No folder";
   const targetTitle = target?.relativePath ?? "";
-  const rating = metadata?.rating ?? null;
-  const inheritedRating = metadata?.inherited_rating ?? null;
+  const rating = normalizeRating(metadata?.rating);
+  const inheritedRating = normalizeRating(metadata?.inherited_rating);
   const people = metadata?.people ?? [];
   const inheritedPeople = metadata?.inherited_people ?? [];
   const tags = metadata?.tags ?? [];
@@ -1005,12 +1001,16 @@ function renderMetadataBar(options = {}) {
     <div class="metadata-target" title="${escapeHtml(targetTitle)}">${escapeHtml(targetLabel)}</div>
     <div class="rating-toggle-group" role="group" aria-label="Rating">
       ${RATING_OPTIONS.map((option) => {
-        const active = rating === option.value;
-        const inheritedActive = !rating && inheritedRating === option.value;
+        const displayRating = rating ?? inheritedRating ?? 0;
+        const active = rating === option;
+        const inheritedActive = !rating && inheritedRating === option;
+        const filled = displayRating >= option;
         const title = inheritedActive
-          ? `${option.value} inherited from a parent folder`
-          : option.value;
-        return `<button class="rating-toggle" type="button" data-rating="${option.value}" data-active="${active}" data-inherited-active="${inheritedActive}" aria-pressed="${active || inheritedActive}" title="${title}"${disabledAttr}>${option.label}</button>`;
+          ? `${option} of 5 stars inherited from a parent folder`
+          : active
+            ? `Clear ${option} of 5 star rating`
+            : `Set ${option} of 5 stars`;
+        return `<button class="rating-toggle" type="button" data-rating="${option}" data-active="${active}" data-filled="${filled}" data-inherited-active="${inheritedActive}" aria-pressed="${active}" title="${title}" aria-label="${title}"${disabledAttr}><span class="star-icon" aria-hidden="true">${filled ? "★" : "☆"}</span></button>`;
       }).join("")}
     </div>
     <div class="people-editor">
@@ -1309,6 +1309,11 @@ function normalizedMetadataName(name) {
   return String(name || "").trim().toLowerCase();
 }
 
+function normalizeRating(value) {
+  const rating = Number(value);
+  return Number.isInteger(rating) && rating >= 1 && rating <= 5 ? rating : null;
+}
+
 async function handleMetadataBarClick(event) {
   const modeButton = event.target.closest("button[data-metadata-mode]");
   if (modeButton && !modeButton.disabled) {
@@ -1319,7 +1324,7 @@ async function handleMetadataBarClick(event) {
 
   const ratingButton = event.target.closest("button[data-rating]");
   if (ratingButton && !ratingButton.disabled) {
-    await setCurrentFolderRating(ratingButton.dataset.rating);
+    await setCurrentFolderRating(Number(ratingButton.dataset.rating));
     return;
   }
 
@@ -1402,11 +1407,12 @@ async function handleMetadataBarKeydown(event) {
 
 async function setCurrentFolderRating(rating) {
   const target = currentFolderMetadataTarget();
-  if (!invoke || !target) {
+  rating = normalizeRating(rating);
+  if (!invoke || !target || !rating) {
     return;
   }
 
-  const currentRating = state.currentFolderMeta?.rating ?? null;
+  const currentRating = normalizeRating(state.currentFolderMeta?.rating);
   const nextRating = currentRating === rating ? null : rating;
   const metadata = await invoke("set_folder_rating", {
     rootId: target.rootId,
@@ -1414,6 +1420,8 @@ async function setCurrentFolderRating(rating) {
     rating: nextRating,
   });
   applyCurrentFolderMetadata(metadata, target);
+  invalidateFolderViewCache(target.rootId);
+  await patchCurrentFolderFromDb({ keepStatus: true });
 }
 
 async function addCurrentFolderPerson(name) {
@@ -2032,6 +2040,8 @@ function folderSummarySignature(folder) {
     folder.inherited_keywords ?? [],
     folder.direct_people ?? [],
     folder.inherited_people ?? [],
+    normalizeRating(folder.direct_rating),
+    normalizeRating(folder.inherited_rating),
   ]);
 }
 
@@ -2057,6 +2067,8 @@ function cloneFolderView(view) {
       direct_keywords: [...(folder.direct_keywords ?? [])],
       inherited_people: [...(folder.inherited_people ?? [])],
       direct_people: [...(folder.direct_people ?? [])],
+      direct_rating: normalizeRating(folder.direct_rating),
+      inherited_rating: normalizeRating(folder.inherited_rating),
     })),
     images: view.images.map((image) => ({ ...image })),
   };
@@ -2207,6 +2219,7 @@ function renderFolderCard(folder) {
   card.innerHTML = `
     <div class="thumb">
       <span>${escapeHtml(initials(folder.name))}</span>
+      ${renderFolderRatingBadge(folder)}
     </div>
     <div class="tile-body">
       <h3>${escapeHtml(folder.name)}</h3>
@@ -2284,6 +2297,28 @@ function renderTags(folder) {
   return `<div class="tags">${tags
     .map((tag) => `<span>${escapeHtml(tag)}</span>`)
     .join("")}</div>`;
+}
+
+function renderFolderRatingBadge(folder) {
+  const directRating = normalizeRating(folder.direct_rating);
+  const inheritedRating = normalizeRating(folder.inherited_rating);
+  const rating = directRating ?? inheritedRating;
+  if (!rating) {
+    return "";
+  }
+
+  const inherited = !directRating && Boolean(inheritedRating);
+  const title = inherited
+    ? `${rating} of 5 stars inherited from a parent folder`
+    : `${rating} of 5 stars`;
+  return `
+    <span class="folder-rating-badge" data-inherited="${inherited}" title="${title}" role="img" aria-label="${title}">
+      <svg class="rating-star-badge" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+        <path class="rating-star-glyph" d="M16 2.8l3.72 8.6 9.28.84-7 6.2 2.04 9.16L16 22.86 7.96 27.6 10 18.44l-7-6.2 9.28-.84L16 2.8z"></path>
+        <text class="rating-star-number" x="16" y="17.1">${rating}</text>
+      </svg>
+    </span>
+  `;
 }
 
 async function setCurrentFolderCover(image) {
@@ -2669,7 +2704,6 @@ function invalidateThumbnailDataCache(rootId = undefined) {
 
 function applyThumbnailData(target, dataUrl) {
   delete target.dataset.thumbnailDeferred;
-  target.replaceChildren();
   target.style.backgroundImage = `url("${dataUrl}")`;
   target.style.backgroundSize = "contain";
   target.style.backgroundPosition = "center";

@@ -340,7 +340,7 @@ impl LibraryManager {
         &self,
         root_id: &str,
         folder_id: i64,
-        rating: Option<&str>,
+        rating: Option<u8>,
     ) -> Result<FolderMetadata> {
         let known_root = self.known_root(root_id)?;
         let db = self.open_connected_database(known_root)?;
@@ -373,7 +373,7 @@ impl LibraryManager {
         &self,
         root_id: &str,
         image_id: i64,
-        rating: Option<&str>,
+        rating: Option<u8>,
     ) -> Result<ImageMetadata> {
         let known_root = self.known_root(root_id)?;
         let db = self.open_connected_database(known_root)?;
