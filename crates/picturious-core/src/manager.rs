@@ -177,6 +177,12 @@ impl LibraryManager {
         db.image_path(image_id)
     }
 
+    pub fn folder_path(&self, root_id: &str, relative_path: &str) -> Result<PathBuf> {
+        let known_root = self.known_root(root_id)?;
+        let db = self.open_connected_database(known_root)?;
+        db.folder_path(relative_path)
+    }
+
     pub fn recursive_images_for_folder(
         &self,
         root_id: &str,
@@ -197,6 +203,12 @@ impl LibraryManager {
         let known_root = self.known_root(root_id)?;
         let db = self.open_connected_database(known_root)?;
         db.delete_image(image_id)
+    }
+
+    pub fn delete_folder(&self, root_id: &str, relative_path: &str) -> Result<()> {
+        let known_root = self.known_root(root_id)?;
+        let mut db = self.open_connected_database(known_root)?;
+        db.delete_folder(relative_path)
     }
 
     pub fn set_folder_thumbnail(
@@ -228,6 +240,12 @@ impl LibraryManager {
         db.people()
     }
 
+    pub fn keywords(&self, root_id: &str) -> Result<Vec<MetadataTag>> {
+        let known_root = self.known_root(root_id)?;
+        let db = self.open_connected_database(known_root)?;
+        db.keywords()
+    }
+
     pub fn all_people(&self) -> Result<Vec<MetadataTag>> {
         let mut names_by_key = BTreeMap::new();
         for root in &self.roots {
@@ -251,6 +269,29 @@ impl LibraryManager {
             .collect())
     }
 
+    pub fn all_keywords(&self) -> Result<Vec<MetadataTag>> {
+        let mut names_by_key = BTreeMap::new();
+        for root in &self.roots {
+            let Ok(db) = self.open_connected_database(root) else {
+                continue;
+            };
+            for keyword in db.keywords()? {
+                names_by_key
+                    .entry(keyword.name.to_lowercase())
+                    .or_insert(keyword.name);
+            }
+        }
+
+        Ok(names_by_key
+            .into_values()
+            .enumerate()
+            .map(|(index, name)| MetadataTag {
+                id: index as i64 + 1,
+                name,
+            })
+            .collect())
+    }
+
     pub fn add_folder_person(
         &self,
         root_id: &str,
@@ -260,6 +301,28 @@ impl LibraryManager {
         let known_root = self.known_root(root_id)?;
         let db = self.open_connected_database(known_root)?;
         db.add_folder_person(root_id, folder_id, name)
+    }
+
+    pub fn add_folder_keyword(
+        &self,
+        root_id: &str,
+        folder_id: i64,
+        name: &str,
+    ) -> Result<FolderMetadata> {
+        let known_root = self.known_root(root_id)?;
+        let db = self.open_connected_database(known_root)?;
+        db.add_folder_keyword(root_id, folder_id, name)
+    }
+
+    pub fn remove_folder_keyword(
+        &self,
+        root_id: &str,
+        folder_id: i64,
+        keyword_id: i64,
+    ) -> Result<FolderMetadata> {
+        let known_root = self.known_root(root_id)?;
+        let db = self.open_connected_database(known_root)?;
+        db.remove_folder_keyword(root_id, folder_id, keyword_id)
     }
 
     pub fn remove_folder_person(
@@ -405,8 +468,8 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn all_people_combines_connected_roots_by_name() -> Result<()> {
-        let workspace = temp_path("all_people_combines_connected_roots_by_name");
+    fn all_metadata_terms_combine_connected_roots_by_name() -> Result<()> {
+        let workspace = temp_path("all_metadata_terms_combine_connected_roots_by_name");
         let config_dir = workspace.join("config");
         let root_a = workspace.join("root-a");
         let root_b = workspace.join("root-b");
@@ -420,8 +483,10 @@ mod tests {
         let root_a_folder_id = manager.folder_view(&root_a.id, "")?.folder_id;
 
         manager.add_folder_person(&root_a.id, root_a_folder_id, "Max")?;
+        manager.add_folder_keyword(&root_a.id, root_a_folder_id, "favorite")?;
 
         assert_eq!(manager.people(&root_b.id)?, Vec::<MetadataTag>::new());
+        assert_eq!(manager.keywords(&root_b.id)?, Vec::<MetadataTag>::new());
         assert_eq!(
             manager
                 .all_people()?
@@ -429,6 +494,14 @@ mod tests {
                 .map(|person| person.name)
                 .collect::<Vec<_>>(),
             vec!["Max"]
+        );
+        assert_eq!(
+            manager
+                .all_keywords()?
+                .into_iter()
+                .map(|tag| tag.name)
+                .collect::<Vec<_>>(),
+            vec!["favorite"]
         );
 
         let _ = fs::remove_dir_all(&workspace);

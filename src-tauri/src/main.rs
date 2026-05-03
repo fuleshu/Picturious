@@ -567,6 +567,16 @@ fn show_image_in_explorer(
 }
 
 #[tauri::command]
+fn show_folder_in_explorer(
+    root_id: String,
+    relative_path: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let path = folder_path_for(&state.library, &root_id, &relative_path)?;
+    show_in_explorer(&path).map_err(error_message)
+}
+
+#[tauri::command]
 fn open_image_with(
     root_id: String,
     image_id: i64,
@@ -603,6 +613,26 @@ async fn move_image_to_recycle_bin(
         .lock()
         .map_err(|_| "library state is locked".to_owned())?
         .delete_image(&root_id, image_id)
+        .map_err(error_message)
+}
+
+#[tauri::command]
+async fn move_folder_to_recycle_bin(
+    root_id: String,
+    relative_path: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let library = state.library.clone();
+    let path = folder_path_for(&library, &root_id, &relative_path)?;
+    tauri::async_runtime::spawn_blocking(move || recycle_file(&path))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(error_message)?;
+
+    library
+        .lock()
+        .map_err(|_| "library state is locked".to_owned())?
+        .delete_folder(&root_id, &relative_path)
         .map_err(error_message)
 }
 
@@ -671,6 +701,20 @@ async fn metadata_people(state: State<'_, AppState>) -> Result<Vec<MetadataTag>,
 }
 
 #[tauri::command]
+async fn metadata_tags(state: State<'_, AppState>) -> Result<Vec<MetadataTag>, String> {
+    let library = state.library.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .all_keywords()
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 async fn folder_metadata(
     root_id: String,
     folder_id: i64,
@@ -682,6 +726,44 @@ async fn folder_metadata(
             .lock()
             .map_err(|_| "library state is locked".to_owned())?
             .folder_metadata(&root_id, folder_id)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn add_folder_tag(
+    root_id: String,
+    folder_id: i64,
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<FolderMetadata, String> {
+    let library = state.library.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .add_folder_keyword(&root_id, folder_id, &name)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn remove_folder_tag(
+    root_id: String,
+    folder_id: i64,
+    tag_id: i64,
+    state: State<'_, AppState>,
+) -> Result<FolderMetadata, String> {
+    let library = state.library.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .remove_folder_keyword(&root_id, folder_id, tag_id)
             .map_err(error_message)
     })
     .await
@@ -843,13 +925,18 @@ fn main() {
             set_viewer_fullscreen,
             rotate_image,
             show_image_in_explorer,
+            show_folder_in_explorer,
             open_image_with,
             move_image_to_recycle_bin,
+            move_folder_to_recycle_bin,
             set_folder_thumbnail,
             image_metadata,
             image_people,
             metadata_people,
+            metadata_tags,
             folder_metadata,
+            add_folder_tag,
+            remove_folder_tag,
             add_folder_person,
             remove_folder_person,
             set_folder_rating,
@@ -1206,12 +1293,57 @@ fn image_path_for(
         .map_err(error_message)
 }
 
+fn folder_path_for(
+    library: &Arc<Mutex<LibraryManager>>,
+    root_id: &str,
+    relative_path: &str,
+) -> Result<PathBuf, String> {
+    library
+        .lock()
+        .map_err(|_| "library state is locked".to_owned())?
+        .folder_path(root_id, relative_path)
+        .map_err(error_message)
+}
+
+#[cfg(windows)]
 fn show_in_explorer(path: &Path) -> anyhow::Result<()> {
-    Command::new("explorer.exe")
-        .arg(format!("/select,{}", path.display()))
-        .spawn()
-        .with_context(|| format!("could not open Explorer for {}", path.display()))?;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::{ILCreateFromPathW, ILFree, SHOpenFolderAndSelectItems};
+
+    if !path.exists() {
+        anyhow::bail!("path is not available: {}", path.display());
+    }
+
+    let wide_path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let item = unsafe { ILCreateFromPathW(wide_path.as_ptr()) };
+    if item.is_null() {
+        anyhow::bail!("could not create Explorer item for {}", path.display());
+    }
+
+    let result = unsafe { SHOpenFolderAndSelectItems(item, 0, std::ptr::null(), 0) };
+    unsafe { ILFree(item) };
+
+    if result < 0 {
+        anyhow::bail!(
+            "could not select {} in Explorer (shell error {:#010x})",
+            path.display(),
+            result as u32
+        );
+    }
+
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn show_in_explorer(path: &Path) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "show in Explorer is only implemented on Windows for {}",
+        path.display()
+    )
 }
 
 fn is_external_viewer_path(path: &Path) -> bool {

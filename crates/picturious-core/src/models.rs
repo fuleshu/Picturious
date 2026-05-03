@@ -56,6 +56,8 @@ pub struct FolderMetadata {
     pub inherited_rating: Option<String>,
     pub people: Vec<MetadataTag>,
     pub inherited_people: Vec<MetadataTag>,
+    pub tags: Vec<MetadataTag>,
+    pub inherited_tags: Vec<MetadataTag>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

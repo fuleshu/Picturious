@@ -331,7 +331,9 @@ button:disabled {
 
 .rating-toggle-group,
 .people-editor,
-.person-chips {
+.tags-editor,
+.person-chips,
+.tag-chips {
   display: inline-flex;
   min-width: 0;
   align-items: center;
@@ -362,7 +364,8 @@ button:disabled {
   color: #41504c;
 }
 
-.people-editor {
+.people-editor,
+.tags-editor {
   position: relative;
   flex: 1 1 auto;
 }
@@ -373,11 +376,13 @@ button:disabled {
   font-size: 13px;
 }
 
-.person-chips {
+.person-chips,
+.tag-chips {
   flex-wrap: wrap;
 }
 
-.person-chip {
+.person-chip,
+.tag-chip {
   display: inline-flex;
   max-width: 180px;
   min-height: 28px;
@@ -391,14 +396,17 @@ button:disabled {
   font-size: 13px;
 }
 
-.person-chip span {
+.person-chip span,
+.tag-chip span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .person-chip button,
-.person-add-button {
+.person-add-button,
+.tag-chip button,
+.tag-add-button {
   display: grid;
   width: 28px;
   min-height: 28px;
@@ -407,24 +415,28 @@ button:disabled {
   line-height: 1;
 }
 
-.person-chip button {
+.person-chip button,
+.tag-chip button {
   border: 0;
   background: transparent;
   color: #6e4d45;
 }
 
-.person-chip[data-inherited="true"] {
+.person-chip[data-inherited="true"],
+.tag-chip[data-inherited="true"] {
   border-style: dashed;
   background: #eef2f0;
   color: #59635f;
 }
 
-.person-add-button {
+.person-add-button,
+.tag-add-button {
   flex: 0 0 auto;
   font-weight: 700;
 }
 
-.person-dropdown {
+.person-dropdown,
+.tag-dropdown {
   position: absolute;
   top: calc(100% + 6px);
   left: 0;
@@ -437,7 +449,8 @@ button:disabled {
   padding: 6px;
 }
 
-.person-search-field {
+.person-search-field,
+.tag-search-field {
   width: 100%;
   min-height: 32px;
   border: 1px solid #c8cdd0;
@@ -448,7 +461,8 @@ button:disabled {
   padding: 5px 8px;
 }
 
-.person-options {
+.person-options,
+.tag-options {
   display: flex;
   max-height: 190px;
   flex-direction: column;
@@ -457,7 +471,8 @@ button:disabled {
   padding-top: 5px;
 }
 
-.person-option {
+.person-option,
+.tag-option {
   display: block;
   width: 100%;
   min-height: 30px;
@@ -470,7 +485,9 @@ button:disabled {
 }
 
 .person-option:hover,
-.person-option:focus-visible {
+.person-option:focus-visible,
+.tag-option:hover,
+.tag-option:focus-visible {
   background: #e8efec;
 }
 
@@ -516,11 +533,6 @@ button:disabled {
 .tile:hover,
 .tile:focus-visible {
   border-color: #23645d;
-}
-
-.image-tile[data-selected="true"] {
-  border-color: #23645d;
-  box-shadow: 0 0 0 2px rgba(35, 100, 93, 0.22);
 }
 
 .root-tile[data-connected="false"] {
@@ -867,9 +879,14 @@ button:disabled {
     order: 3;
   }
 
-  .people-editor {
+  .people-editor,
+  .tags-editor {
     flex-basis: 100%;
     order: 4;
+  }
+
+  .tags-editor {
+    order: 5;
   }
 
   .content-grid {

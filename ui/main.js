@@ -76,8 +76,12 @@ const state = {
   metadataRequestId: 0,
   peopleOptions: [],
   peopleOptionsLoaded: false,
+  tagOptions: [],
+  tagOptionsLoaded: false,
   personDropdownOpen: false,
   personSearch: "",
+  tagDropdownOpen: false,
+  tagSearch: "",
   slideshowTimer: null,
   slideshowActive: false,
   slideshowEnded: false,
@@ -152,8 +156,8 @@ document.addEventListener("keydown", (event) => {
     return;
   }
 
-  if (event.key === "Escape" && state.personDropdownOpen) {
-    closePersonDropdown();
+  if (event.key === "Escape" && (state.personDropdownOpen || state.tagDropdownOpen)) {
+    closeMetadataDropdowns();
     return;
   }
 
@@ -330,6 +334,9 @@ async function wireScanEvents() {
     await refreshOverview();
     if (payload.root_id === state.currentRootId) {
       scanButton.disabled = false;
+      if (!state.atRootOverview) {
+        await refreshCurrentFolder({ keepStatus: true, forceReload: true });
+      }
       resumeDeferredThumbnails();
       scheduleVisibleFolderValidation(100);
       setStatus(
@@ -365,6 +372,7 @@ async function refreshOverview() {
   const overview = await invoke("library_overview");
   state.roots = overview.roots;
   state.peopleOptionsLoaded = false;
+  state.tagOptionsLoaded = false;
   renderRootOverviewIfVisible({ keepStatus: true, keepScroll: true });
 }
 
@@ -856,6 +864,8 @@ function clearMetadataSelection() {
   state.metadataRequestId += 1;
   state.personDropdownOpen = false;
   state.personSearch = "";
+  state.tagDropdownOpen = false;
+  state.tagSearch = "";
   renderMetadataBar();
 }
 
@@ -908,6 +918,10 @@ async function loadCurrentFolderMetadata() {
       ...state.currentFolderMeta.people,
       ...state.currentFolderMeta.inherited_people,
     ]);
+    mergeTagOptions([
+      ...state.currentFolderMeta.tags,
+      ...state.currentFolderMeta.inherited_tags,
+    ]);
   } finally {
     const currentTarget = currentFolderMetadataTarget();
     if (
@@ -945,6 +959,22 @@ function normalizeFolderMetadata(metadata, target) {
             name: String(person.name),
           }))
       : [],
+    tags: Array.isArray(metadata?.tags)
+      ? metadata.tags
+          .filter((tag) => Number.isFinite(Number(tag?.id)) && tag?.name)
+          .map((tag) => ({
+            id: Number(tag.id),
+            name: String(tag.name),
+          }))
+      : [],
+    inherited_tags: Array.isArray(metadata?.inherited_tags)
+      ? metadata.inherited_tags
+          .filter((tag) => Number.isFinite(Number(tag?.id)) && tag?.name)
+          .map((tag) => ({
+            id: Number(tag.id),
+            name: String(tag.name),
+          }))
+      : [],
   };
 }
 
@@ -959,9 +989,13 @@ function renderMetadataBar(options = {}) {
   const inheritedRating = metadata?.inherited_rating ?? null;
   const people = metadata?.people ?? [];
   const inheritedPeople = metadata?.inherited_people ?? [];
+  const tags = metadata?.tags ?? [];
+  const inheritedTags = metadata?.inherited_tags ?? [];
   const personDropdown = state.personDropdownOpen && !editDisabled
     ? renderPersonDropdownHtml()
     : "";
+  const tagDropdown =
+    state.tagDropdownOpen && !editDisabled ? renderTagDropdownHtml() : "";
 
   metadataBar.innerHTML = `
     <div class="metadata-mode-tabs" role="tablist" aria-label="Metadata mode">
@@ -988,12 +1022,29 @@ function renderMetadataBar(options = {}) {
       <button class="person-add-button" type="button" data-action="toggle-person-dropdown" title="Add person" aria-label="Add person"${disabledAttr}>+</button>
       ${personDropdown}
     </div>
+    <div class="tags-editor">
+      <span class="metadata-label">Tags:</span>
+      <div class="tag-chips">
+        ${tags.map(renderTagChipHtml).join("")}
+        ${inheritedTags.map(renderInheritedTagChipHtml).join("")}
+      </div>
+      <button class="tag-add-button" type="button" data-action="toggle-tag-dropdown" title="Add tag" aria-label="Add tag"${disabledAttr}>+</button>
+      ${tagDropdown}
+    </div>
   `;
 
   updatePersonDropdownOptions();
+  updateTagDropdownOptions();
   if (options.focusPersonInput && state.personDropdownOpen) {
     requestAnimationFrame(() => {
       const input = metadataBar.querySelector(".person-search-field");
+      input?.focus({ preventScroll: true });
+      input?.select();
+    });
+  }
+  if (options.focusTagInput && state.tagDropdownOpen) {
+    requestAnimationFrame(() => {
+      const input = metadataBar.querySelector(".tag-search-field");
       input?.focus({ preventScroll: true });
       input?.select();
     });
@@ -1017,11 +1068,37 @@ function renderInheritedPersonChipHtml(person) {
   `;
 }
 
+function renderTagChipHtml(tag) {
+  return `
+    <span class="tag-chip">
+      <span title="${escapeHtml(tag.name)}">${escapeHtml(tag.name)}</span>
+      <button type="button" data-action="remove-tag" data-tag-id="${tag.id}" title="Remove tag" aria-label="Remove tag">x</button>
+    </span>
+  `;
+}
+
+function renderInheritedTagChipHtml(tag) {
+  return `
+    <span class="tag-chip" data-inherited="true" title="Inherited from a parent folder">
+      <span>${escapeHtml(tag.name)}</span>
+    </span>
+  `;
+}
+
 function renderPersonDropdownHtml() {
   return `
     <div class="person-dropdown">
       <input class="person-search-field" type="text" value="${escapeHtml(state.personSearch)}" placeholder="Name" aria-label="Person name" />
       <div class="person-options" role="listbox"></div>
+    </div>
+  `;
+}
+
+function renderTagDropdownHtml() {
+  return `
+    <div class="tag-dropdown">
+      <input class="tag-search-field" type="text" value="${escapeHtml(state.tagSearch)}" placeholder="Tag" aria-label="Tag name" />
+      <div class="tag-options" role="listbox"></div>
     </div>
   `;
 }
@@ -1034,12 +1111,12 @@ function updatePersonDropdownOptions() {
 
   const metadata = state.currentFolderMeta;
   const assignedNames = new Set([
-    ...(metadata?.people ?? []).map((person) => normalizedPersonName(person.name)),
-    ...(metadata?.inherited_people ?? []).map((person) => normalizedPersonName(person.name)),
+    ...(metadata?.people ?? []).map((person) => normalizedMetadataName(person.name)),
+    ...(metadata?.inherited_people ?? []).map((person) => normalizedMetadataName(person.name)),
   ]);
   const query = state.personSearch.trim().toLowerCase();
   const options = state.peopleOptions
-    .filter((person) => !assignedNames.has(normalizedPersonName(person.name)))
+    .filter((person) => !assignedNames.has(normalizedMetadataName(person.name)))
     .filter((person) => !query || person.name.toLowerCase().includes(query))
     .sort((left, right) =>
       left.name.localeCompare(right.name, undefined, { sensitivity: "base" }),
@@ -1057,6 +1134,37 @@ function updatePersonDropdownOptions() {
   );
 }
 
+function updateTagDropdownOptions() {
+  const optionsNode = metadataBar.querySelector(".tag-options");
+  if (!optionsNode) {
+    return;
+  }
+
+  const metadata = state.currentFolderMeta;
+  const assignedNames = new Set([
+    ...(metadata?.tags ?? []).map((tag) => normalizedMetadataName(tag.name)),
+    ...(metadata?.inherited_tags ?? []).map((tag) => normalizedMetadataName(tag.name)),
+  ]);
+  const query = state.tagSearch.trim().toLowerCase();
+  const options = state.tagOptions
+    .filter((tag) => !assignedNames.has(normalizedMetadataName(tag.name)))
+    .filter((tag) => !query || tag.name.toLowerCase().includes(query))
+    .sort((left, right) =>
+      left.name.localeCompare(right.name, undefined, { sensitivity: "base" }),
+    );
+
+  optionsNode.replaceChildren(
+    ...options.map((tag) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "tag-option";
+      button.dataset.tagName = tag.name;
+      button.textContent = tag.name;
+      return button;
+    }),
+  );
+}
+
 async function openPersonDropdown() {
   const target = currentFolderMetadataTarget();
   if (!target) {
@@ -1065,11 +1173,30 @@ async function openPersonDropdown() {
 
   state.personDropdownOpen = true;
   state.personSearch = "";
+  state.tagDropdownOpen = false;
+  state.tagSearch = "";
   if (!state.peopleOptionsLoaded) {
     state.peopleOptions = [];
   }
   renderMetadataBar({ focusPersonInput: true });
   await loadPeopleOptions();
+}
+
+async function openTagDropdown() {
+  const target = currentFolderMetadataTarget();
+  if (!target) {
+    return;
+  }
+
+  state.tagDropdownOpen = true;
+  state.tagSearch = "";
+  state.personDropdownOpen = false;
+  state.personSearch = "";
+  if (!state.tagOptionsLoaded) {
+    state.tagOptions = [];
+  }
+  renderMetadataBar({ focusTagInput: true });
+  await loadTagOptions();
 }
 
 function closePersonDropdown() {
@@ -1079,6 +1206,26 @@ function closePersonDropdown() {
   state.personDropdownOpen = false;
   state.personSearch = "";
   renderMetadataBar();
+}
+
+function closeTagDropdown() {
+  if (!state.tagDropdownOpen) {
+    return;
+  }
+  state.tagDropdownOpen = false;
+  state.tagSearch = "";
+  renderMetadataBar();
+}
+
+function closeMetadataDropdowns() {
+  const wasOpen = state.personDropdownOpen || state.tagDropdownOpen;
+  state.personDropdownOpen = false;
+  state.personSearch = "";
+  state.tagDropdownOpen = false;
+  state.tagSearch = "";
+  if (wasOpen) {
+    renderMetadataBar();
+  }
 }
 
 async function loadPeopleOptions() {
@@ -1092,13 +1239,28 @@ async function loadPeopleOptions() {
   renderMetadataBar({ focusPersonInput: true });
 }
 
+async function loadTagOptions() {
+  if (!invoke || state.tagOptionsLoaded) {
+    return;
+  }
+
+  const options = await invoke("metadata_tags");
+  state.tagOptionsLoaded = true;
+  state.tagOptions = normalizeMetadataOptions(options);
+  renderMetadataBar({ focusTagInput: true });
+}
+
 function normalizePeopleOptions(options) {
+  return normalizeMetadataOptions(options);
+}
+
+function normalizeMetadataOptions(options) {
   return Array.isArray(options)
     ? options
-        .filter((person) => Number.isFinite(Number(person?.id)) && person?.name)
-        .map((person) => ({
-          id: Number(person.id),
-          name: String(person.name),
+        .filter((item) => Number.isFinite(Number(item?.id)) && item?.name)
+        .map((item) => ({
+          id: Number(item.id),
+          name: String(item.name),
         }))
     : [];
 }
@@ -1109,10 +1271,10 @@ function mergePeopleOptions(people) {
   }
 
   const existing = new Set(
-    state.peopleOptions.map((person) => normalizedPersonName(person.name)),
+    state.peopleOptions.map((person) => normalizedMetadataName(person.name)),
   );
   for (const person of people) {
-    const key = normalizedPersonName(person.name);
+    const key = normalizedMetadataName(person.name);
     if (!existing.has(key)) {
       state.peopleOptions.push({
         id: Number(person.id),
@@ -1123,7 +1285,27 @@ function mergePeopleOptions(people) {
   }
 }
 
-function normalizedPersonName(name) {
+function mergeTagOptions(tags) {
+  if (!Array.isArray(tags) || tags.length === 0) {
+    return;
+  }
+
+  const existing = new Set(
+    state.tagOptions.map((tag) => normalizedMetadataName(tag.name)),
+  );
+  for (const tag of tags) {
+    const key = normalizedMetadataName(tag.name);
+    if (!existing.has(key)) {
+      state.tagOptions.push({
+        id: Number(tag.id),
+        name: String(tag.name),
+      });
+      existing.add(key);
+    }
+  }
+}
+
+function normalizedMetadataName(name) {
   return String(name || "").trim().toLowerCase();
 }
 
@@ -1152,8 +1334,20 @@ async function handleMetadataBarClick(event) {
       }
       return;
     }
+    if (action === "toggle-tag-dropdown") {
+      if (state.tagDropdownOpen) {
+        closeTagDropdown();
+      } else {
+        await openTagDropdown();
+      }
+      return;
+    }
     if (action === "remove-person") {
       await removeCurrentFolderPerson(Number(actionButton.dataset.personId));
+      return;
+    }
+    if (action === "remove-tag") {
+      await removeCurrentFolderTag(Number(actionButton.dataset.tagId));
       return;
     }
   }
@@ -1162,30 +1356,47 @@ async function handleMetadataBarClick(event) {
   if (personOption) {
     await addCurrentFolderPerson(personOption.dataset.personName);
   }
+
+  const tagOption = event.target.closest(".tag-option");
+  if (tagOption) {
+    await addCurrentFolderTag(tagOption.dataset.tagName);
+  }
 }
 
 function handleMetadataBarInput(event) {
-  if (!event.target.classList.contains("person-search-field")) {
-    return;
+  if (event.target.classList.contains("person-search-field")) {
+    state.personSearch = event.target.value;
+    updatePersonDropdownOptions();
+  } else if (event.target.classList.contains("tag-search-field")) {
+    state.tagSearch = event.target.value;
+    updateTagDropdownOptions();
   }
-  state.personSearch = event.target.value;
-  updatePersonDropdownOptions();
 }
 
 async function handleMetadataBarKeydown(event) {
-  if (!event.target.classList.contains("person-search-field")) {
+  const isPersonSearch = event.target.classList.contains("person-search-field");
+  const isTagSearch = event.target.classList.contains("tag-search-field");
+  if (!isPersonSearch && !isTagSearch) {
     return;
   }
 
   if (event.key === "Escape") {
     event.preventDefault();
-    closePersonDropdown();
+    if (isPersonSearch) {
+      closePersonDropdown();
+    } else {
+      closeTagDropdown();
+    }
     return;
   }
 
   if (event.key === "Enter") {
     event.preventDefault();
-    await addCurrentFolderPerson(event.target.value);
+    if (isPersonSearch) {
+      await addCurrentFolderPerson(event.target.value);
+    } else {
+      await addCurrentFolderTag(event.target.value);
+    }
   }
 }
 
@@ -1225,6 +1436,26 @@ async function addCurrentFolderPerson(name) {
   await patchCurrentFolderFromDb({ keepStatus: true });
 }
 
+async function addCurrentFolderTag(name) {
+  const target = currentFolderMetadataTarget();
+  const cleanName = String(name || "").trim();
+  if (!invoke || !target || !cleanName) {
+    return;
+  }
+
+  const metadata = await invoke("add_folder_tag", {
+    rootId: target.rootId,
+    folderId: target.folderId,
+    name: cleanName,
+  });
+  applyCurrentFolderMetadata(metadata, target);
+  state.tagSearch = "";
+  mergeTagOptions(state.currentFolderMeta?.tags ?? []);
+  closeTagDropdown();
+  invalidateFolderViewCache(target.rootId);
+  await patchCurrentFolderFromDb({ keepStatus: true });
+}
+
 async function removeCurrentFolderPerson(personId) {
   const target = currentFolderMetadataTarget();
   if (!invoke || !target || !Number.isFinite(personId)) {
@@ -1235,6 +1466,22 @@ async function removeCurrentFolderPerson(personId) {
     rootId: target.rootId,
     folderId: target.folderId,
     personId,
+  });
+  applyCurrentFolderMetadata(metadata, target);
+  invalidateFolderViewCache(target.rootId);
+  await patchCurrentFolderFromDb({ keepStatus: true });
+}
+
+async function removeCurrentFolderTag(tagId) {
+  const target = currentFolderMetadataTarget();
+  if (!invoke || !target || !Number.isFinite(tagId)) {
+    return;
+  }
+
+  const metadata = await invoke("remove_folder_tag", {
+    rootId: target.rootId,
+    folderId: target.folderId,
+    tagId,
   });
   applyCurrentFolderMetadata(metadata, target);
   invalidateFolderViewCache(target.rootId);
@@ -1253,6 +1500,7 @@ function applyCurrentFolderMetadata(metadata, target) {
   state.currentFolderMeta = normalizeFolderMetadata(metadata, target);
   state.metadataLoading = false;
   mergePeopleOptions(state.currentFolderMeta.people);
+  mergeTagOptions(state.currentFolderMeta.tags);
   renderMetadataBar();
 }
 
@@ -2091,6 +2339,8 @@ function handleDocumentContextMenu(event) {
           action: "play-folder-slideshow-random",
           label: "Play slideshow randomized",
         },
+        { action: "show-explorer", label: "Show in Explorer" },
+        { action: "recycle", label: "Move to recycle bin" },
       ],
       event.clientX,
       event.clientY,
@@ -2123,6 +2373,9 @@ function handleDocumentClick(event) {
   if (state.personDropdownOpen && shouldClosePersonDropdownForClick(event.target)) {
     closePersonDropdown();
   }
+  if (state.tagDropdownOpen && shouldCloseTagDropdownForClick(event.target)) {
+    closeTagDropdown();
+  }
 }
 
 function shouldClosePersonDropdownForClick(target) {
@@ -2130,6 +2383,16 @@ function shouldClosePersonDropdownForClick(target) {
     return false;
   }
   if (target.closest("button[data-action='toggle-person-dropdown']")) {
+    return false;
+  }
+  return true;
+}
+
+function shouldCloseTagDropdownForClick(target) {
+  if (target.closest(".tag-dropdown")) {
+    return false;
+  }
+  if (target.closest("button[data-action='toggle-tag-dropdown']")) {
     return false;
   }
   return true;
@@ -2161,13 +2424,24 @@ async function handleThumbContextAction(event) {
       await rotateImage(image, "right");
     } else if (action === "rotate-left" && image) {
       await rotateImage(image, "left");
-    } else if (action === "show-explorer" && image) {
-      await invoke("show_image_in_explorer", {
-        rootId: image.root_id,
-        imageId: image.id,
-      });
-    } else if (action === "recycle" && image) {
-      await moveImageToRecycleBin(image);
+    } else if (action === "show-explorer") {
+      if (image) {
+        await invoke("show_image_in_explorer", {
+          rootId: image.root_id,
+          imageId: image.id,
+        });
+      } else if (folder) {
+        await invoke("show_folder_in_explorer", {
+          rootId: folder.root_id,
+          relativePath: folder.relative_path,
+        });
+      }
+    } else if (action === "recycle") {
+      if (image) {
+        await moveImageToRecycleBin(image);
+      } else if (folder) {
+        await moveFolderToRecycleBin(folder);
+      }
     } else if (action === "open-with" && image && viewerId) {
       await invoke("open_image_with", {
         rootId: image.root_id,
@@ -2257,6 +2531,33 @@ async function moveImageToRecycleBin(image) {
   invalidateFolderViewCache(image.root_id, parentPathFor(state.currentPath));
   await refreshCurrentFolder({ keepStatus: true, forceReload: true });
   setStatus(`Moved ${image.file_name} to recycle bin`);
+}
+
+async function moveFolderToRecycleBin(folder) {
+  const folderName = folder.name || folder.relative_path || "folder";
+  setStatus(`Moving ${folderName} to recycle bin...`);
+  await invoke("move_folder_to_recycle_bin", {
+    rootId: folder.root_id,
+    relativePath: folder.relative_path,
+  });
+  state.imageUrlCache.clear();
+  state.imageDimensionCache.clear();
+  invalidateThumbnailDataCache(folder.root_id);
+  invalidateFolderViewCache(folder.root_id);
+
+  if (
+    state.currentRootId === folder.root_id &&
+    pathContainsPath(folder.relative_path, state.currentPath)
+  ) {
+    await openFolder(folder.root_id, parentPathFor(folder.relative_path), {
+      keepStatus: true,
+      forceReload: true,
+    });
+  } else {
+    await refreshCurrentFolder({ keepStatus: true, forceReload: true });
+  }
+
+  setStatus(`Moved ${folderName} to recycle bin`);
 }
 
 async function playFolderSlideshow(folder, options = {}) {

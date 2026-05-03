@@ -459,6 +459,15 @@ impl RootDatabase {
         ))
     }
 
+    pub fn folder_path(&self, relative_path: &str) -> Result<PathBuf> {
+        let normalized_relative_path = normalize_relative_path(relative_path);
+        self.folder_id(&normalized_relative_path)?;
+        Ok(path_from_relative(
+            &self.root_path,
+            &normalized_relative_path,
+        ))
+    }
+
     pub fn recursive_images_for_folder(
         &self,
         root_id: &str,
@@ -522,6 +531,20 @@ impl RootDatabase {
         Ok(())
     }
 
+    pub fn delete_folder(&mut self, relative_path: &str) -> Result<()> {
+        let normalized_relative_path = normalize_relative_path(relative_path);
+        if normalized_relative_path.is_empty() {
+            bail!("root folder cannot be moved to the recycle bin");
+        }
+
+        self.folder_id(&normalized_relative_path)?;
+        if !self.delete_folder_subtree(&normalized_relative_path)? {
+            bail!("folder not found: {normalized_relative_path}");
+        }
+
+        Ok(())
+    }
+
     pub fn set_folder_thumbnail(&self, folder_id: i64, image_id: i64) -> Result<()> {
         let image_exists = self
             .connection
@@ -553,6 +576,8 @@ impl RootDatabase {
         let inherited_rating = self.inherited_folder_rating(&relative_path)?;
         let people = self.folder_people(folder_id)?;
         let inherited_people = self.inherited_folder_people(&relative_path)?;
+        let tags = self.folder_keywords(folder_id)?;
+        let inherited_tags = self.inherited_folder_keywords(&relative_path)?;
 
         Ok(FolderMetadata {
             root_id: root_id.to_owned(),
@@ -562,6 +587,8 @@ impl RootDatabase {
             inherited_rating,
             people,
             inherited_people,
+            tags,
+            inherited_tags,
         })
     }
 
@@ -590,6 +617,20 @@ impl RootDatabase {
             .query_map([], metadata_tag_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(people)
+    }
+
+    pub fn keywords(&self) -> Result<Vec<MetadataTag>> {
+        let mut statement = self.connection.prepare(
+            "
+            SELECT id, name
+            FROM keywords
+            ORDER BY name COLLATE NOCASE
+            ",
+        )?;
+        let keywords = statement
+            .query_map([], metadata_tag_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(keywords)
     }
 
     pub fn add_folder_person(
@@ -635,6 +676,53 @@ impl RootDatabase {
         self.connection.execute(
             "DELETE FROM folder_people WHERE folder_id = ?1 AND person_id = ?2",
             params![folder_id, person_id],
+        )?;
+        self.folder_metadata(root_id, folder_id)
+    }
+
+    pub fn add_folder_keyword(
+        &self,
+        root_id: &str,
+        folder_id: i64,
+        name: &str,
+    ) -> Result<FolderMetadata> {
+        self.folder_relative_path(folder_id)?;
+        let name = normalize_metadata_name(name)?;
+        self.connection.execute(
+            "
+            INSERT INTO keywords(name)
+            VALUES(?1)
+            ON CONFLICT(name) DO NOTHING
+            ",
+            params![&name],
+        )?;
+        let keyword_id = self.connection.query_row(
+            "SELECT id FROM keywords WHERE name = ?1 COLLATE NOCASE",
+            params![&name],
+            |row| row.get::<_, i64>(0),
+        )?;
+        self.connection.execute(
+            "
+            INSERT INTO folder_keywords(folder_id, keyword_id)
+            VALUES(?1, ?2)
+            ON CONFLICT(folder_id, keyword_id) DO NOTHING
+            ",
+            params![folder_id, keyword_id],
+        )?;
+
+        self.folder_metadata(root_id, folder_id)
+    }
+
+    pub fn remove_folder_keyword(
+        &self,
+        root_id: &str,
+        folder_id: i64,
+        keyword_id: i64,
+    ) -> Result<FolderMetadata> {
+        self.folder_relative_path(folder_id)?;
+        self.connection.execute(
+            "DELETE FROM folder_keywords WHERE folder_id = ?1 AND keyword_id = ?2",
+            params![folder_id, keyword_id],
         )?;
         self.folder_metadata(root_id, folder_id)
     }
@@ -1048,6 +1136,38 @@ impl RootDatabase {
         });
         people.dedup_by(|left, right| left.id == right.id);
         Ok(people)
+    }
+
+    fn folder_keywords(&self, folder_id: i64) -> Result<Vec<MetadataTag>> {
+        let mut statement = self.connection.prepare(
+            "
+            SELECT keywords.id, keywords.name
+            FROM keywords
+            INNER JOIN folder_keywords ON folder_keywords.keyword_id = keywords.id
+            WHERE folder_keywords.folder_id = ?1
+            ORDER BY keywords.name COLLATE NOCASE
+            ",
+        )?;
+        let keywords = statement
+            .query_map(params![folder_id], metadata_tag_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(keywords)
+    }
+
+    fn inherited_folder_keywords(&self, relative_path: &str) -> Result<Vec<MetadataTag>> {
+        let mut keywords = Vec::new();
+        for ancestor in ancestor_paths(relative_path) {
+            let folder_id = self.folder_id(&ancestor)?;
+            keywords.extend(self.folder_keywords(folder_id)?);
+        }
+        keywords.sort_by(|left, right| {
+            left.name
+                .to_lowercase()
+                .cmp(&right.name.to_lowercase())
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        keywords.dedup_by(|left, right| left.id == right.id);
+        Ok(keywords)
     }
 
     fn ensure_column(&self, table: &str, column: &str, definition: &str) -> Result<()> {
@@ -1845,10 +1965,10 @@ fn metadata_tag_from_row(row: &Row<'_>) -> rusqlite::Result<MetadataTag> {
 fn normalize_metadata_name(name: &str) -> Result<String> {
     let normalized = name.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
-        bail!("person name is empty");
+        bail!("metadata name is empty");
     }
     if normalized.chars().count() > 160 {
-        bail!("person name is too long");
+        bail!("metadata name is too long");
     }
     Ok(normalized)
 }
@@ -2108,11 +2228,15 @@ mod tests {
         assert!(parent_metadata.inherited_people.is_empty());
 
         db.set_folder_rating(&root_id, parent_id, Some("happy"))?;
+        db.add_folder_keyword(&root_id, parent_id, "portrait")?;
 
         let child_metadata = db.folder_metadata(&root_id, child_id)?;
         assert!(child_metadata.people.is_empty());
         assert_eq!(child_metadata.inherited_people.len(), 1);
         assert_eq!(child_metadata.inherited_people[0].name, "Ada Lovelace");
+        assert!(child_metadata.tags.is_empty());
+        assert_eq!(child_metadata.inherited_tags.len(), 1);
+        assert_eq!(child_metadata.inherited_tags[0].name, "portrait");
         assert_eq!(child_metadata.rating, None);
         assert_eq!(child_metadata.inherited_rating.as_deref(), Some("happy"));
 
@@ -2124,6 +2248,64 @@ mod tests {
             .context("child folder was not visible")?;
         assert!(child_summary.direct_people.is_empty());
         assert_eq!(child_summary.inherited_people, vec!["Ada Lovelace"]);
+        assert!(child_summary.direct_keywords.is_empty());
+        assert_eq!(child_summary.inherited_keywords, vec!["portrait"]);
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn delete_folder_removes_indexed_subtree() -> Result<()> {
+        let root = temp_root_path("delete_folder_removes_indexed_subtree");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("Ada").join("Set"))?;
+        fs::write(
+            root.join("Ada").join("Set").join("portrait.jpg"),
+            b"image bytes",
+        )?;
+
+        let mut db = RootDatabase::open(&root)?;
+        let root_id = db.root_id()?;
+        db.scan(&root_id)?;
+        let folder_id = db.folder_id("Ada")?;
+        db.add_folder_person(&root_id, folder_id, "Ada Lovelace")?;
+
+        assert_eq!(db.folder_path("Ada/Set")?, root.join("Ada").join("Set"));
+        assert_eq!(db.recursive_images_for_folder(&root_id, "Ada")?.len(), 1);
+
+        db.delete_folder("Ada")?;
+
+        assert!(db.folder_path("Ada").is_err());
+        assert!(db.recursive_images_for_folder(&root_id, "Ada")?.is_empty());
+        assert!(db.folder_metadata(&root_id, folder_id).is_err());
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn rescan_removes_deleted_child_folder_from_view() -> Result<()> {
+        let root = temp_root_path("rescan_removes_deleted_child_folder_from_view");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("Parent").join("Child"))?;
+        fs::write(
+            root.join("Parent").join("Child").join("portrait.jpg"),
+            b"image bytes",
+        )?;
+
+        let mut db = RootDatabase::open(&root)?;
+        let root_id = db.root_id()?;
+        db.scan(&root_id)?;
+        assert!(db.folder_path("Parent/Child").is_ok());
+
+        fs::remove_dir_all(root.join("Parent").join("Child"))?;
+        db.rescan_with_progress(&root_id, "Parent", |_| {})?;
+
+        let view = db.folder_view(&root_id, "Root", "Parent")?;
+        assert!(view.folders.is_empty());
+        assert!(view.images.is_empty());
+        assert!(db.folder_path("Parent/Child").is_err());
 
         let _ = fs::remove_dir_all(&root);
         Ok(())
