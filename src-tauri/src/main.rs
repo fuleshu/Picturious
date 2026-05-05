@@ -1,31 +1,74 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use picturious_core::{
     FolderMetadata, FolderSummary, FolderView, FolderViewHeader, FolderViewTarget,
     GeneratedThumbnail, ImageMetadata, ImageSummary, LibraryManager, LibraryOverview, LibraryRoot,
     MetadataPersonSummary, MetadataSearchQuery, MetadataTag, RootDatabase,
     RotationDirection as CoreRotationDirection, ScanReport, ScanTarget, ThumbnailCache,
-    ThumbnailResponse, generate_thumbnail, rotate_image as rotate_image_file,
+    ThumbnailResponse, convert_png_to_jpg as convert_png_to_jpg_file, generate_thumbnail,
+    rotate_image as rotate_image_file,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{
     AppHandle, Emitter, Manager, Monitor, PhysicalPosition, PhysicalSize, Position, Size, State,
     WebviewWindow, Window, WindowEvent,
 };
 
+const KLUTZGAMES_HOMEPAGE: &str = "https://www.klutzgames.com";
+
 struct AppState {
     library: Arc<Mutex<LibraryManager>>,
     thumbnails: Arc<Mutex<ThumbnailCache>>,
     active_scans: Arc<Mutex<HashSet<String>>>,
+    active_movie_jobs: Arc<Mutex<HashMap<String, MovieJobControl>>>,
     settings: Arc<Mutex<UiSettings>>,
     settings_path: Arc<PathBuf>,
+}
+
+struct ActiveRootGuard {
+    active_scans: Arc<Mutex<HashSet<String>>>,
+    root_id: String,
+}
+
+impl Drop for ActiveRootGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active_scans) = self.active_scans.lock() {
+            active_scans.remove(&self.root_id);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MovieJobControl {
+    cancel_requested: Arc<AtomicBool>,
+    child_id: Arc<Mutex<Option<u32>>>,
+}
+
+struct TempPathCleanup {
+    path: PathBuf,
+}
+
+impl TempPathCleanup {
+    fn file(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for TempPathCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +83,28 @@ struct UiSettings {
     slideshow_loop: bool,
     #[serde(default)]
     slideshow_ignore_smaller_than: u32,
+    #[serde(default = "default_jpg_quality")]
+    jpg_quality: u8,
+    #[serde(default)]
+    movie_create_enabled: bool,
+    #[serde(default)]
+    ffmpeg_path: String,
+    #[serde(default)]
+    movie_codec: MovieCodec,
+    #[serde(default)]
+    movie_quality: MovieQuality,
+    #[serde(default)]
+    movie_output_folder: String,
+    #[serde(default)]
+    movie_resolution: MovieResolution,
+    #[serde(default = "default_movie_custom_resolution")]
+    movie_custom_resolution: String,
+    #[serde(default)]
+    movie_mode: MovieMode,
+    #[serde(default = "default_movie_fps")]
+    movie_fps: u32,
+    #[serde(default = "default_movie_slideshow_seconds")]
+    movie_slideshow_seconds: f64,
     #[serde(default)]
     external_viewers: Vec<ExternalViewer>,
     #[serde(default)]
@@ -54,6 +119,17 @@ impl Default for UiSettings {
             slideshow_speed_seconds: default_slideshow_speed_seconds(),
             slideshow_loop: false,
             slideshow_ignore_smaller_than: 0,
+            jpg_quality: default_jpg_quality(),
+            movie_create_enabled: false,
+            ffmpeg_path: String::new(),
+            movie_codec: MovieCodec::default(),
+            movie_quality: MovieQuality::default(),
+            movie_output_folder: String::new(),
+            movie_resolution: MovieResolution::default(),
+            movie_custom_resolution: default_movie_custom_resolution(),
+            movie_mode: MovieMode::default(),
+            movie_fps: default_movie_fps(),
+            movie_slideshow_seconds: default_movie_slideshow_seconds(),
             external_viewers: Vec::new(),
             window: None,
         }
@@ -67,6 +143,44 @@ struct ExternalViewer {
     path: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+enum MovieCodec {
+    #[default]
+    H264,
+    H265,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+enum MovieQuality {
+    High,
+    #[default]
+    Balanced,
+    Small,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+enum MovieResolution {
+    #[serde(rename = "720p")]
+    P720,
+    #[default]
+    #[serde(rename = "1080p")]
+    P1080,
+    #[serde(rename = "4k")]
+    P4k,
+    Custom,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+enum MovieMode {
+    #[default]
+    Movie,
+    Slideshow,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct UiPreferences {
     #[serde(default)]
@@ -77,6 +191,28 @@ struct UiPreferences {
     slideshow_loop: bool,
     #[serde(default)]
     slideshow_ignore_smaller_than: u32,
+    #[serde(default = "default_jpg_quality")]
+    jpg_quality: u8,
+    #[serde(default)]
+    movie_create_enabled: bool,
+    #[serde(default)]
+    ffmpeg_path: String,
+    #[serde(default)]
+    movie_codec: MovieCodec,
+    #[serde(default)]
+    movie_quality: MovieQuality,
+    #[serde(default)]
+    movie_output_folder: String,
+    #[serde(default)]
+    movie_resolution: MovieResolution,
+    #[serde(default = "default_movie_custom_resolution")]
+    movie_custom_resolution: String,
+    #[serde(default)]
+    movie_mode: MovieMode,
+    #[serde(default = "default_movie_fps")]
+    movie_fps: u32,
+    #[serde(default = "default_movie_slideshow_seconds")]
+    movie_slideshow_seconds: f64,
     #[serde(default)]
     external_viewers: Vec<ExternalViewer>,
 }
@@ -146,6 +282,61 @@ struct FolderValidationError {
     message: String,
 }
 
+#[derive(Clone, Serialize)]
+struct PngConversionReport {
+    converted: u32,
+}
+
+#[derive(Clone, Serialize)]
+struct MovieCreationReport {
+    output_path: String,
+    image_count: u32,
+}
+
+#[derive(Clone, Serialize)]
+struct MovieOutputPreview {
+    output_path: String,
+    exists: bool,
+    image_count: u32,
+}
+
+#[derive(Clone, Serialize)]
+struct MovieCreationStarted {
+    job_id: String,
+    output_path: String,
+    image_count: u32,
+}
+
+#[derive(Clone, Serialize)]
+struct MovieCreationOutput {
+    job_id: String,
+    stream: String,
+    text: String,
+}
+
+#[derive(Clone, Serialize)]
+struct MovieCreationFinished {
+    job_id: String,
+    output_path: String,
+    image_count: u32,
+    success: bool,
+    canceled: bool,
+    message: String,
+}
+
+#[derive(Debug, Clone)]
+struct MovieJobSettings {
+    ffmpeg_path: PathBuf,
+    codec: MovieCodec,
+    quality: MovieQuality,
+    output_folder: Option<PathBuf>,
+    width: u32,
+    height: u32,
+    mode: MovieMode,
+    fps: u32,
+    slideshow_seconds: f64,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum RotationDirection {
@@ -195,6 +386,17 @@ fn save_app_preferences(
     settings.slideshow_speed_seconds = preferences.slideshow_speed_seconds;
     settings.slideshow_loop = preferences.slideshow_loop;
     settings.slideshow_ignore_smaller_than = preferences.slideshow_ignore_smaller_than;
+    settings.jpg_quality = preferences.jpg_quality;
+    settings.movie_create_enabled = preferences.movie_create_enabled;
+    settings.ffmpeg_path = preferences.ffmpeg_path;
+    settings.movie_codec = preferences.movie_codec;
+    settings.movie_quality = preferences.movie_quality;
+    settings.movie_output_folder = preferences.movie_output_folder;
+    settings.movie_resolution = preferences.movie_resolution;
+    settings.movie_custom_resolution = preferences.movie_custom_resolution;
+    settings.movie_mode = preferences.movie_mode;
+    settings.movie_fps = preferences.movie_fps;
+    settings.movie_slideshow_seconds = preferences.movie_slideshow_seconds;
     settings.external_viewers = preferences.external_viewers;
     sanitize_ui_settings(&mut settings);
     write_ui_settings(state.settings_path.as_ref().as_path(), &settings).map_err(error_message)?;
@@ -235,6 +437,26 @@ fn pick_external_viewer() -> Option<ExternalViewer> {
     dialog
         .pick_file()
         .map(|path| external_viewer_for_path(&path))
+}
+
+#[tauri::command]
+fn pick_ffmpeg_executable() -> Option<String> {
+    let mut dialog = rfd::FileDialog::new()
+        .set_title("Choose ffmpeg.exe")
+        .add_filter("Programs", &["exe"]);
+    if let Some(program_files) = std::env::var_os("ProgramFiles") {
+        dialog = dialog.set_directory(PathBuf::from(program_files));
+    }
+
+    dialog.pick_file().map(|path| clean_path_string(&path))
+}
+
+#[tauri::command]
+fn pick_movie_output_folder() -> Option<String> {
+    rfd::FileDialog::new()
+        .set_title("Choose Movie Output Folder")
+        .pick_folder()
+        .map(|path| clean_path_string(&path))
 }
 
 #[tauri::command]
@@ -558,6 +780,185 @@ async fn rotate_image(
 }
 
 #[tauri::command]
+async fn convert_image_png_to_jpg(
+    root_id: String,
+    image_id: i64,
+    folder_relative_path: String,
+    state: State<'_, AppState>,
+) -> Result<PngConversionReport, String> {
+    let _active_root = begin_active_root_job(
+        &state.active_scans,
+        &root_id,
+        "PNG conversion is paused while scanning",
+    )?;
+
+    let quality = state
+        .settings
+        .lock()
+        .map_err(|_| "app settings are locked".to_owned())?
+        .jpg_quality;
+    let library = state.library.clone();
+    let (path, _) = image_path_for(&library, &root_id, image_id)?;
+
+    tauri::async_runtime::spawn_blocking(move || convert_png_to_jpg_file(&path, quality))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(error_message)?;
+
+    scan_folder_blocking(library, root_id, folder_relative_path).await?;
+    Ok(PngConversionReport { converted: 1 })
+}
+
+#[tauri::command]
+async fn convert_folder_pngs_to_jpg(
+    root_id: String,
+    relative_path: String,
+    state: State<'_, AppState>,
+) -> Result<PngConversionReport, String> {
+    let _active_root = begin_active_root_job(
+        &state.active_scans,
+        &root_id,
+        "PNG conversion is paused while scanning",
+    )?;
+
+    let quality = state
+        .settings
+        .lock()
+        .map_err(|_| "app settings are locked".to_owned())?
+        .jpg_quality;
+    let library = state.library.clone();
+    let folder_path = folder_path_for(&library, &root_id, &relative_path)?;
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        convert_png_folder_recursive(&folder_path, quality)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(error_message)?;
+
+    if report.converted > 0 {
+        scan_folder_blocking(library, root_id, relative_path).await?;
+    }
+
+    Ok(report)
+}
+
+#[tauri::command]
+async fn movie_output_preview(
+    root_id: String,
+    relative_path: String,
+    state: State<'_, AppState>,
+) -> Result<MovieOutputPreview, String> {
+    let settings = state
+        .settings
+        .lock()
+        .map_err(|_| "app settings are locked".to_owned())?
+        .clone();
+    if !settings.movie_create_enabled {
+        return Err("movie creation is disabled".to_owned());
+    }
+
+    let job = movie_job_settings(&settings)?;
+    let folder_path = folder_path_for(&state.library, &root_id, &relative_path)?;
+    tauri::async_runtime::spawn_blocking(move || preview_movie_output(&folder_path, &job))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(error_message)
+}
+
+#[tauri::command]
+async fn start_movie_creation(
+    root_id: String,
+    relative_path: String,
+    overwrite: bool,
+    job_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<MovieCreationStarted, String> {
+    let job_id = sanitize_movie_job_id(&job_id)?;
+    let settings = state
+        .settings
+        .lock()
+        .map_err(|_| "app settings are locked".to_owned())?
+        .clone();
+    if !settings.movie_create_enabled {
+        return Err("movie creation is disabled".to_owned());
+    }
+
+    let job = movie_job_settings(&settings)?;
+    let folder_path = folder_path_for(&state.library, &root_id, &relative_path)?;
+    let preview = preview_movie_output(&folder_path, &job).map_err(error_message)?;
+    if preview.exists && !overwrite {
+        return Err(format!(
+            "movie output already exists: {}",
+            preview.output_path
+        ));
+    }
+
+    let control = MovieJobControl {
+        cancel_requested: Arc::new(AtomicBool::new(false)),
+        child_id: Arc::new(Mutex::new(None)),
+    };
+    {
+        let mut active_jobs = state
+            .active_movie_jobs
+            .lock()
+            .map_err(|_| "movie job state is locked".to_owned())?;
+        if active_jobs
+            .insert(job_id.clone(), control.clone())
+            .is_some()
+        {
+            return Err("movie job id is already active".to_owned());
+        }
+    }
+
+    let active_movie_jobs = state.active_movie_jobs.clone();
+    let started = MovieCreationStarted {
+        job_id: job_id.clone(),
+        output_path: preview.output_path.clone(),
+        image_count: preview.image_count,
+    };
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        run_movie_creation_job(
+            job_id,
+            folder_path,
+            job,
+            overwrite,
+            preview.output_path,
+            preview.image_count,
+            control,
+            app,
+            active_movie_jobs,
+        );
+    });
+
+    Ok(started)
+}
+
+#[tauri::command]
+fn cancel_movie_creation(job_id: String, state: State<'_, AppState>) -> Result<bool, String> {
+    let control = state
+        .active_movie_jobs
+        .lock()
+        .map_err(|_| "movie job state is locked".to_owned())?
+        .get(&job_id)
+        .cloned();
+    let Some(control) = control else {
+        return Ok(false);
+    };
+
+    control.cancel_requested.store(true, AtomicOrdering::SeqCst);
+    if let Some(child_id) = *control
+        .child_id
+        .lock()
+        .map_err(|_| "movie process state is locked".to_owned())?
+    {
+        terminate_process_tree(child_id).map_err(error_message)?;
+    }
+
+    Ok(true)
+}
+
+#[tauri::command]
 fn show_image_in_explorer(
     root_id: String,
     image_id: i64,
@@ -575,6 +976,11 @@ fn show_folder_in_explorer(
 ) -> Result<(), String> {
     let path = folder_path_for(&state.library, &root_id, &relative_path)?;
     show_in_explorer(&path).map_err(error_message)
+}
+
+#[tauri::command]
+fn open_homepage() -> Result<(), String> {
+    open_url_in_default_browser(KLUTZGAMES_HOMEPAGE).map_err(error_message)
 }
 
 #[tauri::command]
@@ -961,6 +1367,7 @@ fn main() {
                 library: Arc::new(Mutex::new(LibraryManager::new(&config_dir)?)),
                 thumbnails: Arc::new(Mutex::new(ThumbnailCache::default())),
                 active_scans: Arc::new(Mutex::new(HashSet::new())),
+                active_movie_jobs: Arc::new(Mutex::new(HashMap::new())),
                 settings: settings.clone(),
                 settings_path: settings_path.clone(),
             });
@@ -979,6 +1386,8 @@ fn main() {
             library_overview,
             pick_root_folder,
             pick_external_viewer,
+            pick_ffmpeg_executable,
+            pick_movie_output_folder,
             add_root,
             remove_root,
             start_scan,
@@ -990,8 +1399,14 @@ fn main() {
             image_file_path,
             set_viewer_fullscreen,
             rotate_image,
+            convert_image_png_to_jpg,
+            convert_folder_pngs_to_jpg,
+            movie_output_preview,
+            start_movie_creation,
+            cancel_movie_creation,
             show_image_in_explorer,
             show_folder_in_explorer,
+            open_homepage,
             open_image_with,
             move_image_to_recycle_bin,
             move_folder_to_recycle_bin,
@@ -1019,10 +1434,7 @@ fn main() {
 }
 
 fn external_viewer_for_path(path: &Path) -> ExternalViewer {
-    let clean_path = path
-        .to_string_lossy()
-        .trim_start_matches(r"\\?\")
-        .to_owned();
+    let clean_path = clean_path_string(path);
     let name = path
         .file_stem()
         .and_then(|value| value.to_str())
@@ -1035,6 +1447,12 @@ fn external_viewer_for_path(path: &Path) -> ExternalViewer {
         name,
         path: clean_path,
     }
+}
+
+fn clean_path_string(path: &Path) -> String {
+    path.to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .to_owned()
 }
 
 fn run_scan(target: ScanTarget, app: &AppHandle) -> anyhow::Result<ScanReport> {
@@ -1155,6 +1573,752 @@ fn validate_folder_view_for_target(
     Ok(changed_paths)
 }
 
+async fn scan_folder_blocking(
+    library: Arc<Mutex<LibraryManager>>,
+    root_id: String,
+    relative_path: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| anyhow::anyhow!("library state is locked"))?
+            .scan_folder_with_progress(&root_id, &relative_path, |_| {})
+            .map(|_| ())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(error_message)
+}
+
+fn convert_png_folder_recursive(
+    folder_path: &Path,
+    quality: u8,
+) -> anyhow::Result<PngConversionReport> {
+    let images = collect_png_images_recursive(folder_path)?;
+    let mut converted = 0_u32;
+    for image_path in images {
+        convert_png_to_jpg_file(&image_path, quality)
+            .with_context(|| format!("could not convert {}", image_path.display()))?;
+        converted = converted.saturating_add(1);
+    }
+
+    Ok(PngConversionReport { converted })
+}
+
+fn collect_png_images_recursive(folder_path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut directories = vec![folder_path.to_path_buf()];
+    let mut images = Vec::new();
+
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(&directory)
+            .with_context(|| format!("could not read directory {}", directory.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(".picturious")
+                {
+                    continue;
+                }
+                directories.push(path);
+            } else if file_type.is_file() && is_png_path(&path) {
+                images.push(path);
+            }
+        }
+    }
+
+    images.sort_by(compare_paths_alphanumeric);
+    Ok(images)
+}
+
+fn movie_job_settings(settings: &UiSettings) -> Result<MovieJobSettings, String> {
+    let ffmpeg_path = PathBuf::from(settings.ffmpeg_path.trim().trim_matches('"'));
+    if !ffmpeg_path.is_file() {
+        return Err("ffmpeg.exe is not configured or is no longer available".to_owned());
+    }
+
+    let output_folder = settings.movie_output_folder.trim().trim_matches('"');
+    let output_folder = if output_folder.is_empty() {
+        None
+    } else {
+        let path = PathBuf::from(output_folder);
+        if !path.is_dir() {
+            return Err(format!(
+                "movie output folder is not available: {}",
+                path.display()
+            ));
+        }
+        Some(path)
+    };
+
+    let (width, height) = movie_resolution_dimensions(settings)?;
+    Ok(MovieJobSettings {
+        ffmpeg_path,
+        codec: settings.movie_codec,
+        quality: settings.movie_quality,
+        output_folder,
+        width,
+        height,
+        mode: settings.movie_mode,
+        fps: normalize_movie_fps(settings.movie_fps),
+        slideshow_seconds: normalize_movie_slideshow_seconds(settings.movie_slideshow_seconds),
+    })
+}
+
+fn movie_resolution_dimensions(settings: &UiSettings) -> Result<(u32, u32), String> {
+    match settings.movie_resolution {
+        MovieResolution::P720 => Ok((1280, 720)),
+        MovieResolution::P1080 => Ok((1920, 1080)),
+        MovieResolution::P4k => Ok((3840, 2160)),
+        MovieResolution::Custom => parse_custom_movie_resolution(&settings.movie_custom_resolution),
+    }
+}
+
+fn parse_custom_movie_resolution(value: &str) -> Result<(u32, u32), String> {
+    let parts = value
+        .split(|character: char| {
+            character == 'x'
+                || character == 'X'
+                || character == '*'
+                || character == ','
+                || character.is_ascii_whitespace()
+        })
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() != 2 {
+        return Err("custom movie resolution must look like 1920x1080".to_owned());
+    }
+
+    let width = parts[0]
+        .parse::<u32>()
+        .map_err(|_| "custom movie resolution width is invalid".to_owned())?;
+    let height = parts[1]
+        .parse::<u32>()
+        .map_err(|_| "custom movie resolution height is invalid".to_owned())?;
+    if width < 16 || height < 16 {
+        return Err("custom movie resolution must be at least 16x16".to_owned());
+    }
+    if width > 8192 || height > 8192 {
+        return Err("custom movie resolution cannot exceed 8192x8192".to_owned());
+    }
+
+    Ok((even_video_dimension(width), even_video_dimension(height)))
+}
+
+fn preview_movie_output(
+    folder_path: &Path,
+    settings: &MovieJobSettings,
+) -> anyhow::Result<MovieOutputPreview> {
+    if !folder_path.is_dir() {
+        bail!("folder is not available: {}", folder_path.display());
+    }
+
+    let images = collect_direct_movie_images(folder_path)?;
+    if images.is_empty() {
+        bail!("folder has no supported images: {}", folder_path.display());
+    }
+
+    let output_path = movie_output_path(folder_path, settings.output_folder.as_deref())?;
+    Ok(MovieOutputPreview {
+        exists: output_path.exists(),
+        output_path: clean_path_string(&output_path),
+        image_count: images.len().min(u32::MAX as usize) as u32,
+    })
+}
+
+fn create_movie_file(
+    folder_path: &Path,
+    settings: &MovieJobSettings,
+    overwrite: bool,
+    output_path: &Path,
+    app: &AppHandle,
+    job_id: &str,
+    control: &MovieJobControl,
+) -> anyhow::Result<MovieCreationReport> {
+    let images = collect_direct_movie_images(folder_path)?;
+    if images.is_empty() {
+        bail!("folder has no supported images: {}", folder_path.display());
+    }
+    if output_path.exists() && !overwrite {
+        bail!("movie output already exists: {}", output_path.display());
+    }
+
+    let mut temp_cleanups = Vec::new();
+    let encoder_output_path = temporary_movie_output_path(output_path)?;
+    temp_cleanups.push(TempPathCleanup::file(encoder_output_path.clone()));
+    emit_movie_output(
+        app,
+        job_id,
+        "status",
+        &format!(
+            "Creating {} from {} images\n",
+            output_path.display(),
+            images.len()
+        ),
+    );
+    if control.cancel_requested.load(AtomicOrdering::SeqCst) {
+        bail!("movie creation canceled");
+    }
+
+    let mut command = Command::new(&settings.ffmpeg_path);
+    command
+        .arg("-y")
+        .arg("-nostdin")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-stats");
+
+    match settings.mode {
+        MovieMode::Movie => {
+            let concat_path = temporary_concat_path();
+            fs::write(
+                &concat_path,
+                ffconcat_content(&images, movie_frame_duration_seconds(settings)),
+            )
+            .with_context(|| format!("could not write {}", concat_path.display()))?;
+            command
+                .arg("-f")
+                .arg("concat")
+                .arg("-safe")
+                .arg("0")
+                .arg("-i")
+                .arg(&concat_path)
+                .arg("-an")
+                .arg("-vf")
+                .arg(movie_filter(
+                    settings.width,
+                    settings.height,
+                    movie_output_fps(settings),
+                ));
+            temp_cleanups.push(TempPathCleanup::file(concat_path));
+        }
+        MovieMode::Slideshow => {
+            let filter_path = temporary_filter_script_path();
+            fs::write(&filter_path, slideshow_filter_script(&images, settings))
+                .with_context(|| format!("could not write {}", filter_path.display()))?;
+            for image in &images {
+                command.arg("-i").arg(image);
+            }
+            command
+                .arg("-filter_complex_script")
+                .arg(&filter_path)
+                .arg("-map")
+                .arg("[v]")
+                .arg("-an");
+            temp_cleanups.push(TempPathCleanup::file(filter_path));
+        }
+    }
+
+    command
+        .arg("-fps_mode")
+        .arg("cfr")
+        .arg("-r")
+        .arg(movie_output_fps(settings).to_string())
+        .arg("-c:v")
+        .arg(movie_encoder(settings.codec))
+        .arg("-preset")
+        .arg("medium")
+        .arg("-crf")
+        .arg(movie_crf(settings.codec, settings.quality))
+        .arg("-movflags")
+        .arg("+faststart")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if settings.codec == MovieCodec::H265 {
+        command
+            .arg("-tag:v")
+            .arg("hvc1")
+            .arg("-x265-params")
+            .arg("log-level=error");
+    }
+
+    let mut child = match command.arg(&encoder_output_path).spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("could not run {}", settings.ffmpeg_path.display()));
+        }
+    };
+    if let Ok(mut child_id) = control.child_id.lock() {
+        *child_id = Some(child.id());
+    }
+    if control.cancel_requested.load(AtomicOrdering::SeqCst) {
+        let _ = terminate_process_tree(child.id());
+    }
+
+    let mut readers = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        readers.push(spawn_movie_output_reader(
+            stdout,
+            app.clone(),
+            job_id.to_owned(),
+            "stdout",
+        ));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        readers.push(spawn_movie_output_reader(
+            stderr,
+            app.clone(),
+            job_id.to_owned(),
+            "stderr",
+        ));
+    }
+
+    let status = child.wait()?;
+    if let Ok(mut child_id) = control.child_id.lock() {
+        *child_id = None;
+    }
+    for reader in readers {
+        let _ = reader.join();
+    }
+    if control.cancel_requested.load(AtomicOrdering::SeqCst) {
+        bail!("movie creation canceled");
+    }
+    if !status.success() {
+        bail!("ffmpeg failed with {status}");
+    }
+
+    replace_file(&encoder_output_path, output_path)?;
+    Ok(MovieCreationReport {
+        output_path: clean_path_string(&output_path),
+        image_count: images.len().min(u32::MAX as usize) as u32,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_movie_creation_job(
+    job_id: String,
+    folder_path: PathBuf,
+    settings: MovieJobSettings,
+    overwrite: bool,
+    output_path: String,
+    image_count: u32,
+    control: MovieJobControl,
+    app: AppHandle,
+    active_movie_jobs: Arc<Mutex<HashMap<String, MovieJobControl>>>,
+) {
+    let output_path_buf = PathBuf::from(&output_path);
+    let result = create_movie_file(
+        &folder_path,
+        &settings,
+        overwrite,
+        &output_path_buf,
+        &app,
+        &job_id,
+        &control,
+    );
+    let canceled = control.cancel_requested.load(AtomicOrdering::SeqCst);
+    let finished = match result {
+        Ok(report) => MovieCreationFinished {
+            job_id: job_id.clone(),
+            output_path: report.output_path,
+            image_count: report.image_count,
+            success: true,
+            canceled: false,
+            message: "Movie created".to_owned(),
+        },
+        Err(error) => MovieCreationFinished {
+            job_id: job_id.clone(),
+            output_path,
+            image_count,
+            success: false,
+            canceled,
+            message: if canceled {
+                "Movie creation canceled".to_owned()
+            } else {
+                error_message(error)
+            },
+        },
+    };
+
+    if let Ok(mut active_jobs) = active_movie_jobs.lock() {
+        active_jobs.remove(&job_id);
+    }
+    let _ = app.emit("movie-create-finished", &finished);
+}
+
+fn spawn_movie_output_reader<R>(
+    mut reader: R,
+    app: AppHandle,
+    job_id: String,
+    stream: &'static str,
+) -> thread::JoinHandle<()>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let count = match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => count,
+                Err(_) => break,
+            };
+            let text = String::from_utf8_lossy(&buffer[..count]).to_string();
+            emit_movie_output(&app, &job_id, stream, &text);
+        }
+    })
+}
+
+fn emit_movie_output(app: &AppHandle, job_id: &str, stream: &str, text: &str) {
+    let _ = app.emit(
+        "movie-create-output",
+        &MovieCreationOutput {
+            job_id: job_id.to_owned(),
+            stream: stream.to_owned(),
+            text: text.to_owned(),
+        },
+    );
+}
+
+fn replace_file(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    if destination.exists() {
+        fs::remove_file(destination)
+            .with_context(|| format!("could not replace {}", destination.display()))?;
+    }
+
+    match fs::rename(source, destination) {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            fs::copy(source, destination).with_context(|| {
+                format!(
+                    "could not copy {} to {} after rename failed: {rename_error}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+            fs::remove_file(source)
+                .with_context(|| format!("could not remove {}", source.display()))?;
+            Ok(())
+        }
+    }
+}
+
+fn sanitize_movie_job_id(job_id: &str) -> Result<String, String> {
+    let normalized = job_id.trim();
+    if normalized.len() < 8 || normalized.len() > 96 {
+        return Err("movie job id is invalid".to_owned());
+    }
+    if !normalized
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
+    {
+        return Err("movie job id is invalid".to_owned());
+    }
+    Ok(normalized.to_owned())
+}
+
+#[cfg(windows)]
+fn terminate_process_tree(process_id: u32) -> anyhow::Result<()> {
+    let status = Command::new("taskkill")
+        .arg("/PID")
+        .arg(process_id.to_string())
+        .arg("/T")
+        .arg("/F")
+        .status()
+        .with_context(|| format!("could not terminate ffmpeg process {process_id}"))?;
+    if !status.success() {
+        bail!("could not terminate ffmpeg process {process_id}: {status}");
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn terminate_process_tree(process_id: u32) -> anyhow::Result<()> {
+    let status = Command::new("kill")
+        .arg("-TERM")
+        .arg(process_id.to_string())
+        .status()
+        .with_context(|| format!("could not terminate ffmpeg process {process_id}"))?;
+    if !status.success() {
+        bail!("could not terminate ffmpeg process {process_id}: {status}");
+    }
+    Ok(())
+}
+
+fn collect_direct_movie_images(folder_path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut images = Vec::new();
+    for entry in fs::read_dir(folder_path)
+        .with_context(|| format!("could not read directory {}", folder_path.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_file() && is_supported_movie_image_path(&path) {
+            images.push(path);
+        }
+    }
+
+    images.sort_by(compare_paths_alphanumeric);
+    Ok(images)
+}
+
+fn even_video_dimension(value: u32) -> u32 {
+    let value = value.max(2);
+    if value % 2 == 0 { value } else { value - 1 }
+}
+
+fn movie_output_path(folder_path: &Path, output_folder: Option<&Path>) -> anyhow::Result<PathBuf> {
+    let folder_name = folder_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("movie");
+    let output_directory = match output_folder {
+        Some(path) => path.to_path_buf(),
+        None => folder_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| folder_path.to_path_buf()),
+    };
+
+    if !output_directory.is_dir() {
+        bail!(
+            "movie output folder is not available: {}",
+            output_directory.display()
+        );
+    }
+
+    Ok(output_directory.join(format!("{folder_name}.mp4")))
+}
+
+fn temporary_concat_path() -> PathBuf {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    std::env::temp_dir().join(format!(
+        "picturious-ffmpeg-{}-{millis}.ffconcat",
+        std::process::id()
+    ))
+}
+
+fn temporary_movie_output_path(output_path: &Path) -> anyhow::Result<PathBuf> {
+    let parent = output_path
+        .parent()
+        .with_context(|| format!("movie output has no parent: {}", output_path.display()))?;
+    let stem = output_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("movie");
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+
+    Ok(parent.join(format!(
+        ".{stem}.picturious-{}-{millis}.mp4",
+        std::process::id()
+    )))
+}
+
+fn temporary_filter_script_path() -> PathBuf {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    std::env::temp_dir().join(format!(
+        "picturious-ffmpeg-filter-{}-{millis}.txt",
+        std::process::id()
+    ))
+}
+
+fn ffconcat_content(images: &[PathBuf], duration_seconds: f64) -> String {
+    let mut content = String::from("ffconcat version 1.0\n");
+    for image in images {
+        push_concat_file(&mut content, image);
+        content.push_str(&format!("duration {duration_seconds:.6}\n"));
+    }
+    if let Some(last) = images.last() {
+        push_concat_file(&mut content, last);
+    }
+    content
+}
+
+fn push_concat_file(content: &mut String, path: &Path) {
+    content.push_str("file ");
+    content.push_str(&quote_ffconcat_path(path));
+    content.push('\n');
+}
+
+fn quote_ffconcat_path(path: &Path) -> String {
+    let normalized = clean_path_string(path).replace('\\', "/");
+    format!("'{}'", normalized.replace('\'', "'\\''"))
+}
+
+fn slideshow_filter_script(images: &[PathBuf], settings: &MovieJobSettings) -> String {
+    let fps = movie_output_fps(settings);
+    let frame_count = movie_slideshow_frame_count(settings);
+    let loop_count = frame_count.saturating_sub(1);
+    let mut script = String::new();
+    for index in 0..images.len() {
+        script.push_str(&format!(
+            "[{index}:v]trim=end_frame=1,setpts=PTS-STARTPTS,{}format=yuv420p,loop=loop={loop_count}:size=1:start=0,setpts=N/({fps}*TB)[v{index}];\n",
+            movie_base_filter(settings.width, settings.height)
+        ));
+    }
+    for index in 0..images.len() {
+        script.push_str(&format!("[v{index}]"));
+    }
+    script.push_str(&format!(
+        "concat=n={}:v=1:a=0,format=yuv420p[v]\n",
+        images.len()
+    ));
+    script
+}
+
+fn movie_frame_duration_seconds(settings: &MovieJobSettings) -> f64 {
+    match settings.mode {
+        MovieMode::Movie => 1.0 / f64::from(settings.fps),
+        MovieMode::Slideshow => {
+            f64::from(movie_slideshow_frame_count(settings)) / f64::from(movie_output_fps(settings))
+        }
+    }
+}
+
+fn movie_output_fps(settings: &MovieJobSettings) -> u32 {
+    match settings.mode {
+        MovieMode::Movie => settings.fps,
+        MovieMode::Slideshow => 30,
+    }
+}
+
+fn movie_slideshow_frame_count(settings: &MovieJobSettings) -> u32 {
+    let fps = f64::from(movie_output_fps(settings));
+    (settings.slideshow_seconds * fps).round().max(1.0) as u32
+}
+
+fn movie_filter(width: u32, height: u32, fps: u32) -> String {
+    format!(
+        "{}fps={fps}:round=near,format=yuv420p",
+        movie_base_filter(width, height)
+    )
+}
+
+fn movie_base_filter(width: u32, height: u32) -> String {
+    format!(
+        "scale={width}:{height}:force_original_aspect_ratio=decrease:in_range=full:out_range=limited,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,"
+    )
+}
+
+fn movie_encoder(codec: MovieCodec) -> &'static str {
+    match codec {
+        MovieCodec::H264 => "libx264",
+        MovieCodec::H265 => "libx265",
+    }
+}
+
+fn movie_crf(codec: MovieCodec, quality: MovieQuality) -> &'static str {
+    match (codec, quality) {
+        (MovieCodec::H264, MovieQuality::High) => "18",
+        (MovieCodec::H264, MovieQuality::Balanced) => "23",
+        (MovieCodec::H264, MovieQuality::Small) => "28",
+        (MovieCodec::H265, MovieQuality::High) => "20",
+        (MovieCodec::H265, MovieQuality::Balanced) => "26",
+        (MovieCodec::H265, MovieQuality::Small) => "31",
+    }
+}
+
+fn is_png_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("png"))
+        .unwrap_or(false)
+}
+
+fn is_supported_movie_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            [
+                "jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "avif",
+            ]
+            .iter()
+            .any(|supported| extension.eq_ignore_ascii_case(supported))
+        })
+        .unwrap_or(false)
+}
+
+fn compare_paths_alphanumeric(left: &PathBuf, right: &PathBuf) -> Ordering {
+    let left_name = sortable_path_name(left);
+    let right_name = sortable_path_name(right);
+    compare_alphanumeric(&left_name, &right_name).then_with(|| left_name.cmp(&right_name))
+}
+
+fn sortable_path_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| clean_path_string(path))
+}
+
+fn compare_alphanumeric(left: &str, right: &str) -> Ordering {
+    let left_bytes = left.as_bytes();
+    let right_bytes = right.as_bytes();
+    let mut left_index = 0;
+    let mut right_index = 0;
+
+    while left_index < left_bytes.len() && right_index < right_bytes.len() {
+        let left_byte = left_bytes[left_index];
+        let right_byte = right_bytes[right_index];
+        if left_byte.is_ascii_digit() && right_byte.is_ascii_digit() {
+            let ordering = compare_number_segments(left, &mut left_index, right, &mut right_index);
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+            continue;
+        }
+
+        let ordering = left_byte
+            .to_ascii_lowercase()
+            .cmp(&right_byte.to_ascii_lowercase());
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+        left_index += 1;
+        right_index += 1;
+    }
+
+    left_bytes.len().cmp(&right_bytes.len())
+}
+
+fn compare_number_segments(
+    left: &str,
+    left_index: &mut usize,
+    right: &str,
+    right_index: &mut usize,
+) -> Ordering {
+    let left_start = *left_index;
+    let right_start = *right_index;
+    while *left_index < left.len() && left.as_bytes()[*left_index].is_ascii_digit() {
+        *left_index += 1;
+    }
+    while *right_index < right.len() && right.as_bytes()[*right_index].is_ascii_digit() {
+        *right_index += 1;
+    }
+
+    let left_digits = &left[left_start..*left_index];
+    let right_digits = &right[right_start..*right_index];
+    let left_significant = significant_digits(left_digits);
+    let right_significant = significant_digits(right_digits);
+    left_significant
+        .len()
+        .cmp(&right_significant.len())
+        .then_with(|| left_significant.cmp(right_significant))
+        .then_with(|| left_digits.len().cmp(&right_digits.len()))
+}
+
+fn significant_digits(digits: &str) -> &str {
+    let trimmed = digits.trim_start_matches('0');
+    if trimmed.is_empty() { "0" } else { trimmed }
+}
+
 fn error_message(error: anyhow::Error) -> String {
     error
         .chain()
@@ -1173,12 +2337,47 @@ fn root_is_scanning(
         .map_err(|_| "scan state is locked".to_owned())
 }
 
+fn begin_active_root_job(
+    active_scans: &Arc<Mutex<HashSet<String>>>,
+    root_id: &str,
+    busy_message: &str,
+) -> Result<ActiveRootGuard, String> {
+    let mut active_scans_lock = active_scans
+        .lock()
+        .map_err(|_| "scan state is locked".to_owned())?;
+    if !active_scans_lock.insert(root_id.to_owned()) {
+        return Err(busy_message.to_owned());
+    }
+    drop(active_scans_lock);
+
+    Ok(ActiveRootGuard {
+        active_scans: active_scans.clone(),
+        root_id: root_id.to_owned(),
+    })
+}
+
 fn default_thumb_scale() -> f64 {
     1.0
 }
 
 fn default_slideshow_speed_seconds() -> f64 {
     3.0
+}
+
+fn default_jpg_quality() -> u8 {
+    90
+}
+
+fn default_movie_fps() -> u32 {
+    30
+}
+
+fn default_movie_slideshow_seconds() -> f64 {
+    3.0
+}
+
+fn default_movie_custom_resolution() -> String {
+    "1920x1080".to_owned()
 }
 
 fn clamp_thumb_scale(value: f64) -> f64 {
@@ -1204,12 +2403,50 @@ fn normalize_slideshow_ignore_smaller_than(value: u32) -> u32 {
     }
 }
 
+fn normalize_jpg_quality(value: u8) -> u8 {
+    value.clamp(1, 100)
+}
+
+fn normalize_movie_fps(value: u32) -> u32 {
+    match value {
+        24 | 25 | 30 | 50 | 60 => value,
+        _ => default_movie_fps(),
+    }
+}
+
+fn normalize_movie_slideshow_seconds(value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        (value * 1000.0).round() / 1000.0
+    } else {
+        default_movie_slideshow_seconds()
+    }
+}
+
+fn clean_settings_path(value: &str) -> String {
+    value.trim().trim_matches('"').trim().to_owned()
+}
+
+fn normalize_movie_custom_resolution(value: &str) -> String {
+    match parse_custom_movie_resolution(value) {
+        Ok((width, height)) => format!("{width}x{height}"),
+        Err(_) => default_movie_custom_resolution(),
+    }
+}
+
 fn sanitize_ui_settings(settings: &mut UiSettings) {
     settings.thumb_scale = clamp_thumb_scale(settings.thumb_scale);
     settings.slideshow_speed_seconds =
         normalize_slideshow_speed_seconds(settings.slideshow_speed_seconds);
     settings.slideshow_ignore_smaller_than =
         normalize_slideshow_ignore_smaller_than(settings.slideshow_ignore_smaller_than);
+    settings.jpg_quality = normalize_jpg_quality(settings.jpg_quality);
+    settings.ffmpeg_path = clean_settings_path(&settings.ffmpeg_path);
+    settings.movie_output_folder = clean_settings_path(&settings.movie_output_folder);
+    settings.movie_custom_resolution =
+        normalize_movie_custom_resolution(&settings.movie_custom_resolution);
+    settings.movie_fps = normalize_movie_fps(settings.movie_fps);
+    settings.movie_slideshow_seconds =
+        normalize_movie_slideshow_seconds(settings.movie_slideshow_seconds);
     settings.external_viewers.retain(|viewer| {
         let path = Path::new(&viewer.path);
         path.is_file() && is_external_viewer_path(path)
@@ -1459,6 +2696,50 @@ fn open_with_external_viewer(viewer: &ExternalViewer, image_path: &Path) -> anyh
             })?;
     }
 
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_url_in_default_browser(url: &str) -> anyhow::Result<()> {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+
+    let wide_url = url
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            wide_url.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        ) as isize
+    };
+
+    if result <= 32 {
+        anyhow::bail!("could not open homepage in the default browser");
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn open_url_in_default_browser(url: &str) -> anyhow::Result<()> {
+    Command::new("open")
+        .arg(url)
+        .spawn()
+        .with_context(|| format!("could not open {url} in the default browser"))?;
+    Ok(())
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn open_url_in_default_browser(url: &str) -> anyhow::Result<()> {
+    Command::new("xdg-open")
+        .arg(url)
+        .spawn()
+        .with_context(|| format!("could not open {url} in the default browser"))?;
     Ok(())
 }
 

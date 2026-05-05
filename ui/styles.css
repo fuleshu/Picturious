@@ -119,6 +119,17 @@ button:disabled {
   line-height: 1;
 }
 
+.icon-button svg {
+  display: block;
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
+}
+
 .roots {
   display: flex;
   flex-direction: column;
@@ -915,7 +926,8 @@ button:disabled {
   background: #e8efec;
 }
 
-.settings-dialog {
+.settings-dialog,
+.about-dialog {
   width: min(620px, calc(100vw - 36px));
   max-height: calc(100vh - 48px);
   border: 1px solid #c8cdd0;
@@ -926,11 +938,55 @@ button:disabled {
   box-shadow: 0 24px 70px rgba(20, 24, 27, 0.25);
 }
 
-.settings-dialog::backdrop {
+.about-dialog {
+  width: min(460px, calc(100vw - 36px));
+}
+
+.settings-dialog::backdrop,
+.about-dialog::backdrop {
+  background: rgba(18, 22, 24, 0.32);
+}
+
+.movie-progress-dialog {
+  width: min(860px, calc(100vw - 36px));
+  max-height: calc(100vh - 48px);
+  border: 1px solid #c8cdd0;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #202326;
+  padding: 0;
+  box-shadow: 0 24px 70px rgba(20, 24, 27, 0.25);
+}
+
+.movie-progress-dialog::backdrop {
+  background: rgba(18, 22, 24, 0.32);
+}
+
+.warning-dialog {
+  position: fixed;
+  inset: 0;
+  width: min(420px, calc(100vw - 36px));
+  border: 1px solid #c8cdd0;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #202326;
+  margin: auto;
+  padding: 0;
+  box-shadow: 0 24px 70px rgba(20, 24, 27, 0.25);
+}
+
+.warning-dialog::backdrop {
   background: rgba(18, 22, 24, 0.32);
 }
 
 .settings-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 18px;
+}
+
+.about-panel {
   display: flex;
   flex-direction: column;
   gap: 18px;
@@ -951,9 +1007,183 @@ button:disabled {
   font-size: 16px;
 }
 
+.about-brand {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  gap: 14px;
+  align-items: center;
+}
+
+.about-mark {
+  display: grid;
+  width: 52px;
+  height: 52px;
+  place-items: center;
+  border-radius: 8px;
+  background: #23645d;
+  color: #ffffff;
+  font-size: 25px;
+  font-weight: 750;
+}
+
+.about-copy h3 {
+  margin: 0;
+  font-size: 20px;
+}
+
+.about-copy p {
+  margin: 4px 0 0;
+  color: #646b70;
+  font-size: 13px;
+}
+
+.about-details {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin: 0;
+  border-top: 1px solid #e0e4e5;
+}
+
+.about-details div {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: 12px;
+  border-bottom: 1px solid #e0e4e5;
+  padding: 10px 0;
+}
+
+.about-details dt,
+.about-details dd {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.35;
+}
+
+.about-details dt {
+  color: #646b70;
+}
+
+.about-details dd {
+  min-width: 0;
+  color: #202326;
+  overflow-wrap: anywhere;
+}
+
+.about-details a {
+  color: #23645d;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+.movie-progress-panel {
+  display: flex;
+  max-height: calc(100vh - 48px);
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+}
+
+.movie-progress-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.movie-progress-header h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.movie-progress-header p {
+  margin: 4px 0 0;
+  overflow: hidden;
+  color: #646b70;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.movie-progress-output {
+  height: clamp(280px, calc(100vh - 180px), 520px);
+  overflow: auto;
+  border: 1px solid #c8cdd0;
+  border-radius: 6px;
+  background: #101315;
+  color: #e8efec;
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  margin: 0;
+  padding: 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.movie-progress-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.movie-progress-actions button {
+  min-width: 88px;
+  padding: 0 14px;
+}
+
+.warning-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 18px;
+}
+
+.warning-header h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.warning-message,
+.warning-detail {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.warning-detail {
+  overflow-wrap: anywhere;
+  color: #394044;
+}
+
+.warning-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding-top: 8px;
+}
+
+.warning-actions button {
+  min-width: 74px;
+  padding: 0 14px;
+}
+
+.warning-primary-button {
+  border-color: #23645d;
+  background: #23645d;
+  color: #ffffff;
+}
+
+.warning-primary-button:hover:not(:disabled) {
+  border-color: #174c46;
+  background: #174c46;
+}
+
 .check-row,
 .range-row,
-.select-row {
+.select-row,
+.number-row,
+.text-row {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -982,7 +1212,16 @@ button:disabled {
   color: #52595d;
 }
 
-.select-row {
+.range-row .settings-value {
+  width: 34px;
+  flex: 0 0 auto;
+  color: #52595d;
+  text-align: right;
+}
+
+.select-row,
+.number-row,
+.text-row {
   justify-content: space-between;
 }
 
@@ -994,6 +1233,69 @@ button:disabled {
   padding: 6px 8px;
   color: #202326;
   font: inherit;
+}
+
+.number-row .number-input {
+  width: 112px;
+  border: 1px solid #c8cdd0;
+  border-radius: 6px;
+  background: #ffffff;
+  padding: 6px 8px;
+  color: #202326;
+  font: inherit;
+  text-align: right;
+}
+
+.text-row input {
+  width: 132px;
+  border: 1px solid #c8cdd0;
+  border-radius: 6px;
+  background: #ffffff;
+  padding: 6px 8px;
+  color: #202326;
+  font: inherit;
+}
+
+.movie-settings,
+.movie-settings-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.movie-settings {
+  border-top: 1px solid #e0e4e5;
+  padding-top: 2px;
+}
+
+.movie-settings-fields[hidden],
+.number-row[hidden],
+.select-row[hidden],
+.text-row[hidden] {
+  display: none;
+}
+
+.path-row {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  font-size: 14px;
+}
+
+.path-row input {
+  min-width: 0;
+  border: 1px solid #c8cdd0;
+  border-radius: 6px;
+  background: #f9faf8;
+  padding: 6px 8px;
+  color: #202326;
+  font: inherit;
+}
+
+.path-row button {
+  min-height: 32px;
+  padding: 0 10px;
 }
 
 .external-viewers {
@@ -1124,6 +1426,10 @@ button:disabled {
 
   .toolbar-actions button {
     flex: 1;
+  }
+
+  .toolbar-actions .icon-button {
+    flex: 0 0 36px;
   }
 
   .metadata-bar {

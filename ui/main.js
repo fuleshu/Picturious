@@ -23,6 +23,7 @@ const titleNode = document.querySelector("#view-title");
 const metadataBar = document.querySelector("#metadata-bar");
 const breadcrumbsNode = document.querySelector("#breadcrumbs");
 const addRootButton = document.querySelector("#add-root-button");
+const aboutButton = document.querySelector("#about-button");
 const settingsButton = document.querySelector("#settings-button");
 const backButton = document.querySelector("#back-button");
 const forwardButton = document.querySelector("#forward-button");
@@ -31,13 +32,46 @@ const viewer = document.querySelector("#viewer");
 const viewerImage = document.querySelector("#viewer-image");
 const viewerCloseHotspot = document.querySelector("#viewer-close-hotspot");
 const thumbContextMenu = document.querySelector("#thumb-context-menu");
+const aboutDialog = document.querySelector("#about-dialog");
+const aboutCloseButton = document.querySelector("#about-close-button");
+const aboutHomepageLink = document.querySelector("#about-homepage-link");
 const settingsDialog = document.querySelector("#settings-dialog");
 const settingsCloseButton = document.querySelector("#settings-close-button");
+const movieProgressDialog = document.querySelector("#movie-progress-dialog");
+const movieProgressTitle = document.querySelector("#movie-progress-title");
+const movieProgressMeta = document.querySelector("#movie-progress-meta");
+const movieProgressOutput = document.querySelector("#movie-progress-output");
+const movieCancelButton = document.querySelector("#movie-cancel-button");
+const movieCloseButton = document.querySelector("#movie-close-button");
+const warningDialog = document.querySelector("#warning-dialog");
+const warningMessage = document.querySelector("#warning-message");
+const warningDetail = document.querySelector("#warning-detail");
+const warningOkButton = document.querySelector("#warning-ok-button");
+const warningCancelButton = document.querySelector("#warning-cancel-button");
 const upscaleFullscreenInput = document.querySelector("#upscale-fullscreen");
 const slideshowLoopInput = document.querySelector("#slideshow-loop");
 const slideshowSpeedInput = document.querySelector("#slideshow-speed");
 const slideshowSpeedNumberInput = document.querySelector("#slideshow-speed-number");
 const slideshowIgnoreSmallerInput = document.querySelector("#slideshow-ignore-smaller");
+const jpgQualityInput = document.querySelector("#jpg-quality");
+const jpgQualityValue = document.querySelector("#jpg-quality-value");
+const movieCreateEnabledInput = document.querySelector("#movie-create-enabled");
+const movieSettingsFields = document.querySelector("#movie-settings-fields");
+const ffmpegPathInput = document.querySelector("#ffmpeg-path");
+const pickFfmpegButton = document.querySelector("#pick-ffmpeg-button");
+const movieCodecInput = document.querySelector("#movie-codec");
+const movieQualityInput = document.querySelector("#movie-quality");
+const movieOutputFolderInput = document.querySelector("#movie-output-folder");
+const pickMovieOutputFolderButton = document.querySelector("#pick-movie-output-folder-button");
+const clearMovieOutputFolderButton = document.querySelector("#clear-movie-output-folder-button");
+const movieResolutionInput = document.querySelector("#movie-resolution");
+const movieCustomResolutionRow = document.querySelector("#movie-custom-resolution-row");
+const movieCustomResolutionInput = document.querySelector("#movie-custom-resolution");
+const movieModeInput = document.querySelector("#movie-mode");
+const movieFpsRow = document.querySelector("#movie-fps-row");
+const movieFpsInput = document.querySelector("#movie-fps");
+const movieSlideshowSecondsRow = document.querySelector("#movie-slideshow-seconds-row");
+const movieSlideshowSecondsInput = document.querySelector("#movie-slideshow-seconds");
 const addExternalViewerButton = document.querySelector("#add-external-viewer-button");
 const externalViewersList = document.querySelector("#external-viewers-list");
 
@@ -118,8 +152,21 @@ const state = {
     slideshow_speed_seconds: 3,
     slideshow_loop: false,
     slideshow_ignore_smaller_than: 0,
+    jpg_quality: 90,
+    movie_create_enabled: false,
+    ffmpeg_path: "",
+    movie_codec: "h264",
+    movie_quality: "balanced",
+    movie_output_folder: "",
+    movie_resolution: "1080p",
+    movie_custom_resolution: "1920x1080",
+    movie_mode: "movie",
+    movie_fps: 30,
+    movie_slideshow_seconds: 3,
     external_viewers: [],
   },
+  movieJob: null,
+  warningDialogResolve: null,
   thumbScale: 1,
   tileSize: BASE_TILE_SIZE,
   thumbScaleSaveTimer: null,
@@ -141,11 +188,27 @@ const thumbnailObserver =
     : null;
 
 addRootButton.addEventListener("click", addRoot);
+aboutButton.addEventListener("click", openAboutDialog);
 settingsButton.addEventListener("click", openSettingsDialog);
 backButton.addEventListener("click", () => goBackHistory().catch(showError));
 forwardButton.addEventListener("click", () => goForwardHistory().catch(showError));
 thumbScaleInput.addEventListener("input", handleThumbScaleInput);
+aboutCloseButton.addEventListener("click", closeAboutDialog);
+aboutHomepageLink.addEventListener("click", openAboutHomepage);
 settingsCloseButton.addEventListener("click", closeSettingsDialog);
+movieCancelButton.addEventListener("click", cancelActiveMovieCreation);
+movieCloseButton.addEventListener("click", closeMovieProgressDialog);
+movieProgressDialog.addEventListener("cancel", (event) => {
+  if (state.movieJob?.running) {
+    event.preventDefault();
+  }
+});
+warningOkButton.addEventListener("click", () => resolveWarningDialog(true));
+warningCancelButton.addEventListener("click", () => resolveWarningDialog(false));
+warningDialog.addEventListener("cancel", (event) => {
+  event.preventDefault();
+  resolveWarningDialog(false);
+});
 metadataBar.addEventListener("click", (event) => {
   handleMetadataBarClick(event).catch(showError);
 });
@@ -160,6 +223,21 @@ slideshowSpeedInput.addEventListener("change", handleSettingsInput);
 slideshowSpeedNumberInput.addEventListener("input", handleSlideshowSpeedNumberInput);
 slideshowSpeedNumberInput.addEventListener("change", handleSettingsInput);
 slideshowIgnoreSmallerInput.addEventListener("change", handleSettingsInput);
+jpgQualityInput.addEventListener("input", handleJpgQualityInput);
+jpgQualityInput.addEventListener("change", handleSettingsInput);
+movieCreateEnabledInput.addEventListener("change", handleSettingsInput);
+pickFfmpegButton.addEventListener("click", pickFfmpegPath);
+movieCodecInput.addEventListener("change", handleSettingsInput);
+movieQualityInput.addEventListener("change", handleSettingsInput);
+pickMovieOutputFolderButton.addEventListener("click", pickMovieOutputFolder);
+clearMovieOutputFolderButton.addEventListener("click", clearMovieOutputFolder);
+movieResolutionInput.addEventListener("change", handleSettingsInput);
+movieCustomResolutionInput.addEventListener("input", handleMovieCustomResolutionInput);
+movieCustomResolutionInput.addEventListener("change", handleSettingsInput);
+movieModeInput.addEventListener("change", handleSettingsInput);
+movieFpsInput.addEventListener("change", handleSettingsInput);
+movieSlideshowSecondsInput.addEventListener("input", handleMovieSlideshowSecondsInput);
+movieSlideshowSecondsInput.addEventListener("change", handleSettingsInput);
 addExternalViewerButton.addEventListener("click", addExternalViewer);
 viewerCloseHotspot.addEventListener("click", closeViewer);
 viewer.addEventListener("wheel", handleViewerWheel, { passive: false });
@@ -421,6 +499,14 @@ async function wireScanEvents() {
       setStatus(payload.message);
     }
   });
+
+  await listen("movie-create-output", ({ payload }) => {
+    appendMovieProgressOutput(payload);
+  });
+
+  await listen("movie-create-finished", ({ payload }) => {
+    finishMovieProgress(payload);
+  });
 }
 
 async function refreshOverview() {
@@ -499,8 +585,9 @@ async function removeRoot(rootId) {
     return;
   }
 
-  const confirmed = window.confirm(
-    `Remove ${root.display_name} from Picturious? The root database and pictures are not deleted.`,
+  const confirmed = await confirmWarning(
+    `Remove ${root.display_name} from Picturious?`,
+    "The root database and pictures are not deleted.",
   );
   if (!confirmed) {
     return;
@@ -3155,6 +3242,21 @@ function normalizeAppSettings(settings) {
     slideshow_ignore_smaller_than: normalizeIgnoreSmallerValue(
       Number(settings?.slideshow_ignore_smaller_than ?? 0),
     ),
+    jpg_quality: normalizeJpgQuality(Number(settings?.jpg_quality ?? 90)),
+    movie_create_enabled: Boolean(settings?.movie_create_enabled),
+    ffmpeg_path: String(settings?.ffmpeg_path ?? ""),
+    movie_codec: normalizeMovieCodec(settings?.movie_codec),
+    movie_quality: normalizeMovieQuality(settings?.movie_quality),
+    movie_output_folder: String(settings?.movie_output_folder ?? ""),
+    movie_resolution: normalizeMovieResolution(settings?.movie_resolution),
+    movie_custom_resolution: normalizeMovieCustomResolution(
+      settings?.movie_custom_resolution,
+    ),
+    movie_mode: normalizeMovieMode(settings?.movie_mode),
+    movie_fps: normalizeMovieFps(Number(settings?.movie_fps ?? 30)),
+    movie_slideshow_seconds: normalizeMovieSlideshowSeconds(
+      Number(settings?.movie_slideshow_seconds ?? 3),
+    ),
     external_viewers: Array.isArray(settings?.external_viewers)
       ? settings.external_viewers
           .filter((viewer) => viewer?.id && viewer?.path)
@@ -3174,6 +3276,26 @@ function openSettingsDialog() {
   }
 }
 
+function openAboutDialog() {
+  if (!aboutDialog.open) {
+    aboutDialog.showModal();
+  }
+}
+
+function closeAboutDialog() {
+  aboutDialog.close();
+}
+
+function openAboutHomepage(event) {
+  event.preventDefault();
+  if (invoke) {
+    invoke("open_homepage").catch(showError);
+    return;
+  }
+
+  window.open(aboutHomepageLink.href, "_blank", "noopener");
+}
+
 function closeSettingsDialog() {
   settingsDialog.close();
 }
@@ -3183,6 +3305,18 @@ function renderSettingsDialog() {
   slideshowLoopInput.checked = state.settings.slideshow_loop;
   syncSlideshowSpeedControls();
   slideshowIgnoreSmallerInput.value = String(state.settings.slideshow_ignore_smaller_than);
+  syncJpgQualityControl();
+  movieCreateEnabledInput.checked = state.settings.movie_create_enabled;
+  ffmpegPathInput.value = state.settings.ffmpeg_path;
+  movieCodecInput.value = state.settings.movie_codec;
+  movieQualityInput.value = state.settings.movie_quality;
+  movieOutputFolderInput.value = state.settings.movie_output_folder;
+  movieResolutionInput.value = state.settings.movie_resolution;
+  movieCustomResolutionInput.value = state.settings.movie_custom_resolution;
+  movieModeInput.value = state.settings.movie_mode;
+  movieFpsInput.value = String(state.settings.movie_fps);
+  movieSlideshowSecondsInput.value = state.settings.movie_slideshow_seconds.toFixed(3);
+  updateMovieSettingsVisibility();
   externalViewersList.replaceChildren(
     ...state.settings.external_viewers.map(renderExternalViewerRow),
   );
@@ -3243,6 +3377,24 @@ function handleSlideshowSpeedNumberInput() {
   }
 }
 
+function handleJpgQualityInput() {
+  state.settings.jpg_quality = normalizeJpgQuality(Number(jpgQualityInput.value));
+  syncJpgQualityControl();
+}
+
+function handleMovieSlideshowSecondsInput() {
+  const value = Number(movieSlideshowSecondsInput.value);
+  if (!Number.isFinite(value) || value <= 0) {
+    return;
+  }
+
+  state.settings.movie_slideshow_seconds = normalizeMovieSlideshowSeconds(value);
+}
+
+function handleMovieCustomResolutionInput() {
+  state.settings.movie_custom_resolution = movieCustomResolutionInput.value.trim();
+}
+
 function handleSettingsInput() {
   state.settings.upscale_fullscreen_images = upscaleFullscreenInput.checked;
   state.settings.slideshow_loop = slideshowLoopInput.checked;
@@ -3251,11 +3403,62 @@ function handleSettingsInput() {
   state.settings.slideshow_ignore_smaller_than = normalizeIgnoreSmallerValue(
     Number(slideshowIgnoreSmallerInput.value),
   );
+  state.settings.jpg_quality = normalizeJpgQuality(Number(jpgQualityInput.value));
+  state.settings.movie_create_enabled = movieCreateEnabledInput.checked;
+  state.settings.movie_codec = normalizeMovieCodec(movieCodecInput.value);
+  state.settings.movie_quality = normalizeMovieQuality(movieQualityInput.value);
+  state.settings.movie_resolution = normalizeMovieResolution(movieResolutionInput.value);
+  state.settings.movie_custom_resolution = normalizeMovieCustomResolution(
+    movieCustomResolutionInput.value,
+  );
+  state.settings.movie_mode = normalizeMovieMode(movieModeInput.value);
+  state.settings.movie_fps = normalizeMovieFps(Number(movieFpsInput.value));
+  state.settings.movie_slideshow_seconds = normalizeMovieSlideshowSeconds(
+    Number(movieSlideshowSecondsInput.value),
+  );
+  syncJpgQualityControl();
+  updateMovieSettingsVisibility();
   applyViewerUpscaleSetting();
   saveSettingsPreferences().catch(showError);
   if (state.slideshowActive) {
     scheduleSlideshow();
   }
+}
+
+async function pickFfmpegPath() {
+  if (!invoke) {
+    return;
+  }
+
+  const path = await invoke("pick_ffmpeg_executable");
+  if (!path) {
+    return;
+  }
+
+  state.settings.ffmpeg_path = path;
+  await saveSettingsPreferences();
+  renderSettingsDialog();
+}
+
+async function pickMovieOutputFolder() {
+  if (!invoke) {
+    return;
+  }
+
+  const path = await invoke("pick_movie_output_folder");
+  if (!path) {
+    return;
+  }
+
+  state.settings.movie_output_folder = path;
+  await saveSettingsPreferences();
+  renderSettingsDialog();
+}
+
+function clearMovieOutputFolder() {
+  state.settings.movie_output_folder = "";
+  saveSettingsPreferences().catch(showError);
+  renderSettingsDialog();
 }
 
 async function addExternalViewer() {
@@ -3287,6 +3490,17 @@ async function saveSettingsPreferences() {
       slideshow_speed_seconds: state.settings.slideshow_speed_seconds,
       slideshow_loop: state.settings.slideshow_loop,
       slideshow_ignore_smaller_than: state.settings.slideshow_ignore_smaller_than,
+      jpg_quality: state.settings.jpg_quality,
+      movie_create_enabled: state.settings.movie_create_enabled,
+      ffmpeg_path: state.settings.ffmpeg_path,
+      movie_codec: state.settings.movie_codec,
+      movie_quality: state.settings.movie_quality,
+      movie_output_folder: state.settings.movie_output_folder,
+      movie_resolution: state.settings.movie_resolution,
+      movie_custom_resolution: state.settings.movie_custom_resolution,
+      movie_mode: state.settings.movie_mode,
+      movie_fps: state.settings.movie_fps,
+      movie_slideshow_seconds: state.settings.movie_slideshow_seconds,
       external_viewers: state.settings.external_viewers,
     },
   });
@@ -3336,6 +3550,78 @@ function syncSlideshowSpeedControls(options = {}) {
 
 function normalizeIgnoreSmallerValue(value) {
   return [512, 800, 1024].includes(value) ? value : 0;
+}
+
+function normalizeJpgQuality(value) {
+  if (!Number.isFinite(value)) {
+    return 90;
+  }
+  return Math.min(100, Math.max(1, Math.round(value)));
+}
+
+function syncJpgQualityControl() {
+  const value = normalizeJpgQuality(state.settings.jpg_quality);
+  state.settings.jpg_quality = value;
+  jpgQualityInput.value = String(value);
+  jpgQualityValue.textContent = String(value);
+}
+
+function normalizeMovieCodec(value) {
+  return ["h264", "h265"].includes(value) ? value : "h264";
+}
+
+function normalizeMovieQuality(value) {
+  return ["high", "balanced", "small"].includes(value) ? value : "balanced";
+}
+
+function normalizeMovieResolution(value) {
+  return ["720p", "1080p", "4k", "custom"].includes(value) ? value : "1080p";
+}
+
+function normalizeMovieCustomResolution(value) {
+  const match = String(value ?? "")
+    .trim()
+    .match(/^(\d{2,5})\s*[xX,* ]\s*(\d{2,5})$/);
+  if (!match) {
+    return "1920x1080";
+  }
+
+  const width = normalizeMovieDimension(Number(match[1]));
+  const height = normalizeMovieDimension(Number(match[2]));
+  return `${width}x${height}`;
+}
+
+function normalizeMovieDimension(value) {
+  if (!Number.isFinite(value)) {
+    return 1920;
+  }
+  const clamped = Math.min(8192, Math.max(16, Math.round(value)));
+  return clamped % 2 === 0 ? clamped : clamped - 1;
+}
+
+function normalizeMovieMode(value) {
+  return ["movie", "slideshow"].includes(value) ? value : "movie";
+}
+
+function normalizeMovieFps(value) {
+  return [24, 25, 30, 50, 60].includes(value) ? value : 30;
+}
+
+function normalizeMovieSlideshowSeconds(value) {
+  if (!Number.isFinite(value) || value <= 0) {
+    return 3;
+  }
+  return Math.round(value * 1000) / 1000;
+}
+
+function updateMovieSettingsVisibility() {
+  const enabled = state.settings.movie_create_enabled;
+  movieSettingsFields.hidden = !enabled;
+  movieCustomResolutionRow.hidden =
+    !enabled || state.settings.movie_resolution !== "custom";
+  const mode = normalizeMovieMode(state.settings.movie_mode);
+  movieFpsRow.hidden = !enabled || mode !== "movie";
+  movieSlideshowSecondsRow.hidden = !enabled || mode !== "slideshow";
 }
 
 function clampThumbScale(value) {
@@ -3806,8 +4092,15 @@ function handleDocumentContextMenu(event) {
         action: "play-folder-slideshow-random",
         label: "Play slideshow randomized",
       },
+      { action: "convert-png-to-jpg", label: "Convert PNG to JPG" },
       { action: "show-explorer", label: "Show in Explorer" },
     ];
+    if (state.settings.movie_create_enabled) {
+      items.splice(3, 0, {
+        action: "create-movie",
+        label: "Create movie from pictures",
+      });
+    }
     if (canSetParentCoverFromFolder(folder)) {
       items.unshift({ action: "set-parent-cover", label: "Set as parent cover" });
     }
@@ -3944,6 +4237,14 @@ async function handleThumbContextAction(event) {
       await rotateImage(image, "right");
     } else if (action === "rotate-left" && image) {
       await rotateImage(image, "left");
+    } else if (action === "convert-png-to-jpg") {
+      if (image) {
+        await convertImagePngToJpg(image);
+      } else if (folder) {
+        await convertFolderPngsToJpg(folder);
+      }
+    } else if (action === "create-movie" && folder) {
+      await createMovieFromFolder(folder);
     } else if (action === "show-explorer") {
       if (image) {
         await invoke("show_image_in_explorer", {
@@ -3982,6 +4283,10 @@ function imageContextMenuItems() {
     { action: "show-explorer", label: "Show in Explorer" },
     { action: "recycle", label: "Move to recycle bin" },
   ];
+
+  if (isPngFileName(state.contextMenuImage?.file_name)) {
+    items.splice(3, 0, { action: "convert-png-to-jpg", label: "Convert PNG to JPG" });
+  }
 
   for (const viewer of state.settings.external_viewers) {
     items.push({
@@ -4036,6 +4341,231 @@ async function rotateImage(image, direction) {
   invalidateFolderViewCache(image.root_id, parentPathFor(state.currentPath));
   await refreshCurrentFolder({ keepStatus: true, forceReload: true });
   setStatus(`Rotated ${image.file_name}`);
+}
+
+async function convertImagePngToJpg(image) {
+  setStatus(`Converting ${image.file_name} to JPG...`);
+  await invoke("convert_image_png_to_jpg", {
+    rootId: image.root_id,
+    imageId: image.id,
+    folderRelativePath: state.currentPath,
+  });
+  state.imageUrlCache.clear();
+  state.imageDimensionCache.clear();
+  invalidateThumbnailDataCache(image.root_id);
+  invalidateFolderViewCache(image.root_id, state.currentPath);
+  invalidateFolderViewCache(image.root_id, parentPathFor(state.currentPath));
+  await refreshCurrentFolder({ keepStatus: true, forceReload: true });
+  setStatus(`Created JPG from ${image.file_name}`);
+}
+
+async function convertFolderPngsToJpg(folder) {
+  const folderName = folder.name || folder.relative_path || "folder";
+  setStatus(`Converting PNG images in ${folderName}...`);
+  const report = await invoke("convert_folder_pngs_to_jpg", {
+    rootId: folder.root_id,
+    relativePath: folder.relative_path,
+  });
+  state.imageUrlCache.clear();
+  state.imageDimensionCache.clear();
+  invalidateThumbnailDataCache(folder.root_id);
+  invalidateFolderViewCache(folder.root_id);
+
+  if (!state.searchActive) {
+    await refreshCurrentFolder({ keepStatus: true, forceReload: true });
+  }
+
+  const converted = Number(report?.converted ?? 0);
+  if (converted === 0) {
+    setStatus(`No PNG images found in ${folderName}`);
+  } else {
+    setStatus(`Created ${converted} JPG ${converted === 1 ? "file" : "files"} in ${folderName}`);
+  }
+}
+
+async function createMovieFromFolder(folder) {
+  if (state.movieJob?.running) {
+    setStatus("A movie creation is already running");
+    return;
+  }
+
+  const folderName = folder.name || folder.relative_path || "folder";
+  setStatus(`Preparing movie from ${folderName}...`);
+  const preview = await invoke("movie_output_preview", {
+    rootId: folder.root_id,
+    relativePath: folder.relative_path,
+  });
+  if (preview?.exists) {
+    const confirmed = await confirmWarning(
+      "Overwrite existing movie?",
+      preview.output_path,
+    );
+    if (!confirmed) {
+      setStatus("Movie creation canceled");
+      return;
+    }
+  }
+
+  const jobId = newMovieJobId();
+  openMovieProgressDialog({
+    jobId,
+    folderName,
+    outputPath: preview?.output_path ?? "",
+    imageCount: Number(preview?.image_count ?? 0),
+  });
+  setStatus(`Creating movie from ${folderName}...`);
+  try {
+    await invoke("start_movie_creation", {
+      rootId: folder.root_id,
+      relativePath: folder.relative_path,
+      overwrite: Boolean(preview?.exists),
+      jobId,
+    });
+  } catch (error) {
+    failMovieProgress(jobId, String(error));
+    throw error;
+  }
+}
+
+function newMovieJobId() {
+  const random = Math.random().toString(36).slice(2, 10);
+  return `movie-${Date.now()}-${random}`;
+}
+
+function openMovieProgressDialog({ jobId, folderName, outputPath, imageCount }) {
+  state.movieJob = {
+    id: jobId,
+    folderName,
+    outputPath,
+    imageCount,
+    running: true,
+  };
+  movieProgressTitle.textContent = `Creating ${folderName}`;
+  movieProgressMeta.textContent = `${imageCount} images -> ${outputPath}`;
+  movieProgressOutput.textContent = "";
+  appendMovieProgressText(`Output: ${outputPath}\nImages: ${imageCount}\n\n`);
+  movieCancelButton.disabled = false;
+  movieCancelButton.textContent = "Cancel";
+  movieCancelButton.hidden = false;
+  movieCloseButton.hidden = true;
+  movieCloseButton.disabled = true;
+  if (!movieProgressDialog.open) {
+    movieProgressDialog.showModal();
+  }
+}
+
+function closeMovieProgressDialog() {
+  if (state.movieJob?.running) {
+    return;
+  }
+  if (movieProgressDialog.open) {
+    movieProgressDialog.close();
+  }
+}
+
+async function cancelActiveMovieCreation() {
+  const job = state.movieJob;
+  if (!job?.running) {
+    return;
+  }
+
+  movieCancelButton.disabled = true;
+  movieCancelButton.textContent = "Canceling...";
+  appendMovieProgressText("\nCancel requested...\n");
+  setStatus("Canceling movie creation...");
+  try {
+    await invoke("cancel_movie_creation", { jobId: job.id });
+  } catch (error) {
+    appendMovieProgressText(`\nCancel failed: ${String(error)}\n`);
+    movieCancelButton.disabled = false;
+    movieCancelButton.textContent = "Cancel";
+    showError(error);
+  }
+}
+
+function appendMovieProgressOutput(payload) {
+  if (!payload || payload.job_id !== state.movieJob?.id) {
+    return;
+  }
+  appendMovieProgressText(String(payload.text ?? ""));
+}
+
+function appendMovieProgressText(text) {
+  movieProgressOutput.textContent += text.replaceAll("\r", "\n");
+  if (movieProgressOutput.textContent.length > 240000) {
+    movieProgressOutput.textContent = movieProgressOutput.textContent.slice(-180000);
+  }
+  movieProgressOutput.scrollTop = movieProgressOutput.scrollHeight;
+}
+
+function finishMovieProgress(payload) {
+  if (!payload || payload.job_id !== state.movieJob?.id) {
+    return;
+  }
+
+  state.movieJob.running = false;
+  movieCancelButton.hidden = true;
+  movieCancelButton.disabled = true;
+  movieCloseButton.hidden = false;
+  movieCloseButton.disabled = false;
+  const message = String(payload.message || "");
+  if (payload.success) {
+    appendMovieProgressText(`\n\nDone: ${payload.output_path}\n`);
+    setStatus(
+      `Created movie from ${Number(payload.image_count ?? 0)} images: ${payload.output_path}`,
+    );
+  } else if (payload.canceled) {
+    appendMovieProgressText("\n\nCanceled.\n");
+    setStatus("Movie creation canceled");
+  } else {
+    appendMovieProgressText(`\n\nFailed: ${message}\n`);
+    setStatus(message || "Movie creation failed");
+  }
+}
+
+function failMovieProgress(jobId, message) {
+  if (jobId !== state.movieJob?.id) {
+    return;
+  }
+
+  state.movieJob.running = false;
+  appendMovieProgressText(`\nFailed: ${message}\n`);
+  movieCancelButton.hidden = true;
+  movieCancelButton.disabled = true;
+  movieCloseButton.hidden = false;
+  movieCloseButton.disabled = false;
+  setStatus(message);
+}
+
+function confirmWarning(message, detail = "") {
+  if (state.warningDialogResolve) {
+    return Promise.resolve(false);
+  }
+
+  warningMessage.textContent = message;
+  warningDetail.textContent = detail;
+  warningDetail.hidden = !detail;
+  if (!warningDialog.open) {
+    warningDialog.showModal();
+  }
+  warningOkButton.focus({ preventScroll: true });
+
+  return new Promise((resolve) => {
+    state.warningDialogResolve = resolve;
+  });
+}
+
+function resolveWarningDialog(confirmed) {
+  const resolve = state.warningDialogResolve;
+  if (!resolve) {
+    return;
+  }
+
+  state.warningDialogResolve = null;
+  if (warningDialog.open) {
+    warningDialog.close();
+  }
+  resolve(Boolean(confirmed));
 }
 
 async function moveImageToRecycleBin(image) {
@@ -4259,6 +4789,10 @@ function fullImagePath(image) {
   const separator = root.path.includes("/") && !root.path.includes("\\") ? "/" : "\\";
   const rootPath = root.path.replace(/[\\/]+$/, "");
   return `${rootPath}${separator}${image.relative_path.replaceAll("/", separator)}`;
+}
+
+function isPngFileName(fileName) {
+  return String(fileName || "").toLowerCase().endsWith(".png");
 }
 
 function resetThumbnailWork() {

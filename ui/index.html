@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Picturious</title>
-    <link rel="stylesheet" href="./styles.css?v=layout-23" />
+    <link rel="stylesheet" href="./styles.css?v=layout-27" />
   </head>
   <body>
     <main class="workspace">
@@ -50,6 +50,13 @@
               <path d="M5 12h14"></path>
             </svg>
             <span>Add root</span>
+          </button>
+          <button id="about-button" class="icon-button" type="button" title="About" aria-label="About">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <circle cx="12" cy="12" r="8.5"></circle>
+              <path d="M12 10.6v5.2"></path>
+              <path d="M12 7.8h.01"></path>
+            </svg>
           </button>
           <button id="settings-button" class="icon-button" type="button" title="Settings" aria-label="Settings">
             &#9881;
@@ -123,6 +130,109 @@
           </select>
         </label>
 
+        <label class="range-row">
+          <span>JPG quality</span>
+          <input
+            id="jpg-quality"
+            type="range"
+            min="1"
+            max="100"
+            step="1"
+            value="90"
+          />
+          <span id="jpg-quality-value" class="settings-value">90</span>
+        </label>
+
+        <section class="movie-settings">
+          <label class="check-row">
+            <input id="movie-create-enabled" type="checkbox" />
+            <span>Enable movie create</span>
+          </label>
+
+          <div id="movie-settings-fields" class="movie-settings-fields" hidden>
+            <label class="path-row">
+              <span>FFmpeg</span>
+              <input id="ffmpeg-path" type="text" readonly />
+              <button id="pick-ffmpeg-button" type="button">Browse</button>
+            </label>
+
+            <label class="select-row">
+              <span>Codec</span>
+              <select id="movie-codec">
+                <option value="h264">H.264</option>
+                <option value="h265">H.265</option>
+              </select>
+            </label>
+
+            <label class="select-row">
+              <span>Quality</span>
+              <select id="movie-quality">
+                <option value="high">High</option>
+                <option value="balanced">Balanced</option>
+                <option value="small">Small file</option>
+              </select>
+            </label>
+
+            <label class="select-row">
+              <span>Resolution</span>
+              <select id="movie-resolution">
+                <option value="720p">720p</option>
+                <option value="1080p">1080p</option>
+                <option value="4k">4K</option>
+                <option value="custom">Custom</option>
+              </select>
+            </label>
+
+            <label id="movie-custom-resolution-row" class="text-row" hidden>
+              <span>Custom resolution</span>
+              <input
+                id="movie-custom-resolution"
+                type="text"
+                inputmode="text"
+                value="1920x1080"
+              />
+            </label>
+
+            <label class="path-row">
+              <span>Output folder</span>
+              <input id="movie-output-folder" type="text" readonly />
+              <button id="pick-movie-output-folder-button" type="button">Browse</button>
+              <button id="clear-movie-output-folder-button" type="button">Clear</button>
+            </label>
+
+            <label class="select-row">
+              <span>Type</span>
+              <select id="movie-mode">
+                <option value="movie">Movie</option>
+                <option value="slideshow">Slideshow</option>
+              </select>
+            </label>
+
+            <label id="movie-fps-row" class="select-row">
+              <span>FPS</span>
+              <select id="movie-fps">
+                <option value="24">24</option>
+                <option value="25">25</option>
+                <option value="30">30</option>
+                <option value="50">50</option>
+                <option value="60">60</option>
+              </select>
+            </label>
+
+            <label id="movie-slideshow-seconds-row" class="number-row" hidden>
+              <span>Seconds per image</span>
+              <input
+                id="movie-slideshow-seconds"
+                class="number-input"
+                type="number"
+                min="0.001"
+                step="0.001"
+                value="3.000"
+              />
+            </label>
+          </div>
+        </section>
+
         <section class="external-viewers">
           <div class="section-heading">
             <h3>Open with</h3>
@@ -133,6 +243,76 @@
       </form>
     </dialog>
 
-    <script src="./main.js?v=layout-23"></script>
+    <dialog id="about-dialog" class="about-dialog" aria-labelledby="about-title">
+      <section class="about-panel">
+        <header class="settings-header">
+          <h2 id="about-title">About Picturious</h2>
+          <button id="about-close-button" class="icon-button" type="button" title="Close" aria-label="Close">
+            x
+          </button>
+        </header>
+
+        <div class="about-brand">
+          <div class="about-mark" aria-hidden="true">P</div>
+          <div class="about-copy">
+            <h3>Picturious</h3>
+            <p>Folder-first picture library manager</p>
+          </div>
+        </div>
+
+        <dl class="about-details">
+          <div>
+            <dt>Creator</dt>
+            <dd>Timo Fleisch</dd>
+          </div>
+          <div>
+            <dt>d.b.a.</dt>
+            <dd>klutzGames</dd>
+          </div>
+          <div>
+            <dt>Homepage</dt>
+            <dd>
+              <a id="about-homepage-link" href="https://www.klutzgames.com">https://www.klutzgames.com</a>
+            </dd>
+          </div>
+          <div>
+            <dt>License</dt>
+            <dd>Apache-2.0</dd>
+          </div>
+        </dl>
+      </section>
+    </dialog>
+
+    <dialog id="warning-dialog" class="warning-dialog">
+      <section class="warning-panel">
+        <header class="warning-header">
+          <h2>Warning</h2>
+        </header>
+        <p id="warning-message" class="warning-message"></p>
+        <p id="warning-detail" class="warning-detail"></p>
+        <footer class="warning-actions">
+          <button id="warning-ok-button" class="warning-primary-button" type="button">OK</button>
+          <button id="warning-cancel-button" type="button">Cancel</button>
+        </footer>
+      </section>
+    </dialog>
+
+    <dialog id="movie-progress-dialog" class="movie-progress-dialog">
+      <section class="movie-progress-panel">
+        <header class="movie-progress-header">
+          <div>
+            <h2 id="movie-progress-title">Creating movie</h2>
+            <p id="movie-progress-meta"></p>
+          </div>
+        </header>
+        <pre id="movie-progress-output" class="movie-progress-output"></pre>
+        <footer class="movie-progress-actions">
+          <button id="movie-cancel-button" type="button">Cancel</button>
+          <button id="movie-close-button" type="button" hidden>Close</button>
+        </footer>
+      </section>
+    </dialog>
+
+    <script src="./main.js?v=layout-27"></script>
   </body>
 </html>
