@@ -4,11 +4,23 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Picturious</title>
-    <link rel="stylesheet" href="./styles.css?v=layout-16" />
+    <link rel="stylesheet" href="./styles.css?v=layout-23" />
   </head>
   <body>
     <main class="workspace">
       <header class="toolbar">
+        <div class="toolbar-nav" aria-label="Navigation">
+          <button id="back-button" class="nav-button" type="button" disabled title="Back" aria-label="Back">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M15 6l-6 6 6 6"></path>
+            </svg>
+          </button>
+          <button id="forward-button" class="nav-button" type="button" disabled title="Forward" aria-label="Forward">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M9 6l6 6-6 6"></path>
+            </svg>
+          </button>
+        </div>
         <div class="title-block">
           <h2 id="view-title">Library</h2>
           <div class="status-row">
@@ -21,7 +33,7 @@
         </div>
         <div class="toolbar-actions">
           <label class="thumb-scale-control" title="Thumbnail item size">
-            <span>Size</span>
+            <span>Thumb size</span>
             <input
               id="thumb-scale"
               type="range"
@@ -32,12 +44,16 @@
               aria-label="Thumbnail item size"
             />
           </label>
-          <button id="add-root-button" type="button">Add root</button>
+          <button id="add-root-button" class="toolbar-icon-button" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M12 5v14"></path>
+              <path d="M5 12h14"></path>
+            </svg>
+            <span>Add root</span>
+          </button>
           <button id="settings-button" class="icon-button" type="button" title="Settings" aria-label="Settings">
             &#9881;
           </button>
-          <button id="up-button" type="button">Up</button>
-          <button id="scan-button" type="button">Scan</button>
         </div>
       </header>
 
@@ -117,6 +133,6 @@
       </form>
     </dialog>
 
-    <script src="./main.js?v=layout-16"></script>
+    <script src="./main.js?v=layout-23"></script>
   </body>
 </html>

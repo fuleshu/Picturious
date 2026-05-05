@@ -63,6 +63,48 @@ pub struct FolderMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataCombineMode {
+    And,
+    Or,
+}
+
+impl Default for MetadataCombineMode {
+    fn default() -> Self {
+        Self::And
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct MetadataNameFilter {
+    #[serde(default)]
+    pub names: Vec<String>,
+    #[serde(default)]
+    pub combine: MetadataCombineMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct MetadataSearchQuery {
+    #[serde(default)]
+    pub person: Option<String>,
+    #[serde(default)]
+    pub include_tags: MetadataNameFilter,
+    #[serde(default)]
+    pub exclude_tags: MetadataNameFilter,
+    #[serde(default)]
+    pub minimum_rating: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetadataPersonSummary {
+    pub id: i64,
+    pub name: String,
+    pub root_id: Option<String>,
+    pub thumbnail_image_id: Option<i64>,
+    pub folder_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImageMetadata {
     pub root_id: String,
     pub image_id: i64,

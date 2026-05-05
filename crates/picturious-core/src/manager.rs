@@ -3,12 +3,12 @@ use crate::db::{
     validate_root_path,
 };
 use crate::models::{
-    FolderMetadata, FolderView, ImageMetadata, ImageSummary, LibraryOverview, LibraryRoot,
-    MetadataTag, ScanProgress, ScanReport,
+    FolderMetadata, FolderSummary, FolderView, ImageMetadata, ImageSummary, LibraryOverview,
+    LibraryRoot, MetadataPersonSummary, MetadataSearchQuery, MetadataTag, ScanProgress, ScanReport,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -222,6 +222,17 @@ impl LibraryManager {
         db.set_folder_thumbnail(folder_id, image_id)
     }
 
+    pub fn set_folder_thumbnail_by_path(
+        &mut self,
+        root_id: &str,
+        relative_path: &str,
+        image_id: i64,
+    ) -> Result<()> {
+        let known_root = self.known_root(root_id)?;
+        let db = self.open_connected_database(known_root)?;
+        db.set_folder_thumbnail_by_path(relative_path, image_id)
+    }
+
     pub fn image_metadata(&self, root_id: &str, image_id: i64) -> Result<ImageMetadata> {
         let known_root = self.known_root(root_id)?;
         let db = self.open_connected_database(known_root)?;
@@ -288,6 +299,134 @@ impl LibraryManager {
             .map(|(index, name)| MetadataTag {
                 id: index as i64 + 1,
                 name,
+            })
+            .collect())
+    }
+
+    pub fn search_metadata(&self, query: &MetadataSearchQuery) -> Result<Vec<FolderSummary>> {
+        let mut folders = Vec::new();
+        for root in &self.roots {
+            let Ok(db) = self.open_connected_database(root) else {
+                continue;
+            };
+            folders.extend(db.search_folders(&root.id, query)?);
+        }
+
+        folders.sort_by(|left, right| {
+            let left_root = self
+                .roots
+                .iter()
+                .find(|root| root.id == left.root_id)
+                .map(|root| root.display_name.as_str())
+                .unwrap_or(left.root_id.as_str());
+            let right_root = self
+                .roots
+                .iter()
+                .find(|root| root.id == right.root_id)
+                .map(|root| root.display_name.as_str())
+                .unwrap_or(right.root_id.as_str());
+            left_root
+                .to_lowercase()
+                .cmp(&right_root.to_lowercase())
+                .then_with(|| {
+                    left.relative_path
+                        .to_lowercase()
+                        .cmp(&right.relative_path.to_lowercase())
+                })
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(folders)
+    }
+
+    pub fn all_people_with_thumbnails(&self) -> Result<Vec<MetadataPersonSummary>> {
+        let mut people_by_key = BTreeMap::<String, MetadataPersonSummary>::new();
+        for root in &self.roots {
+            let Ok(db) = self.open_connected_database(root) else {
+                continue;
+            };
+            for person in db.person_summaries(&root.id)? {
+                let key = person.name.to_lowercase();
+                people_by_key
+                    .entry(key)
+                    .and_modify(|existing| {
+                        existing.folder_count =
+                            existing.folder_count.saturating_add(person.folder_count);
+                        if existing.thumbnail_image_id.is_none() {
+                            existing.root_id = person.root_id.clone();
+                            existing.thumbnail_image_id = person.thumbnail_image_id;
+                        }
+                    })
+                    .or_insert(person);
+            }
+        }
+
+        Ok(people_by_key
+            .into_values()
+            .enumerate()
+            .map(|(index, mut person)| {
+                person.id = index as i64 + 1;
+                person
+            })
+            .collect())
+    }
+
+    pub fn filtered_people_with_thumbnails(
+        &self,
+        query: &MetadataSearchQuery,
+    ) -> Result<Vec<MetadataPersonSummary>> {
+        let people = self.all_people_with_thumbnails()?;
+        if !person_summary_query_has_filters(query) {
+            return Ok(people);
+        }
+
+        let mut personless_query = query.clone();
+        personless_query.person = None;
+        let matching_folders = self.search_metadata(&personless_query)?;
+        let final_folders = matching_folders
+            .iter()
+            .filter(|folder| folder.image_count > 0)
+            .collect::<Vec<_>>();
+        let folders = if final_folders.is_empty() {
+            matching_folders.iter().collect::<Vec<_>>()
+        } else {
+            final_folders
+        };
+
+        let mut counts_by_person = HashMap::<String, u32>::new();
+        for folder in folders {
+            let mut folder_people = HashSet::new();
+            for name in folder
+                .direct_people
+                .iter()
+                .chain(folder.inherited_people.iter())
+            {
+                let key = normalized_person_summary_key(name);
+                if !key.is_empty() {
+                    folder_people.insert(key);
+                }
+            }
+
+            for key in folder_people {
+                let count = counts_by_person.entry(key).or_default();
+                *count = count.saturating_add(1);
+            }
+        }
+
+        Ok(people
+            .into_iter()
+            .filter_map(|mut person| {
+                let key = normalized_person_summary_key(&person.name);
+                let folder_count = counts_by_person.get(&key).copied()?;
+                if folder_count == 0 {
+                    return None;
+                }
+                person.folder_count = folder_count;
+                Some(person)
+            })
+            .enumerate()
+            .map(|(index, mut person)| {
+                person.id = index as i64 + 1;
+                person
             })
             .collect())
     }
@@ -445,6 +584,19 @@ impl LibraryManager {
             .with_context(|| format!("could not write {}", self.config_path.display()))?;
         Ok(())
     }
+}
+
+fn person_summary_query_has_filters(query: &MetadataSearchQuery) -> bool {
+    !query.include_tags.names.is_empty()
+        || !query.exclude_tags.names.is_empty()
+        || query.minimum_rating.is_some()
+}
+
+fn normalized_person_summary_key(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 fn read_config(path: &Path) -> Result<AppConfig> {

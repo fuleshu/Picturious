@@ -9,6 +9,11 @@ const VIEWER_CURSOR_HIDE_DELAY_MS = 3000;
 const MAX_FOLDER_VIEW_CACHE_ENTRIES = 80;
 const MAX_THUMBNAIL_DATA_CACHE_ENTRIES = 700;
 const RATING_OPTIONS = [1, 2, 3, 4, 5];
+const APP_MODES = {
+  FOLDER: "folder",
+  PERSONS: "persons",
+  SEARCH: "search",
+};
 
 const gridNode = document.querySelector("#content-grid");
 const statusNode = document.querySelector("#status");
@@ -19,8 +24,8 @@ const metadataBar = document.querySelector("#metadata-bar");
 const breadcrumbsNode = document.querySelector("#breadcrumbs");
 const addRootButton = document.querySelector("#add-root-button");
 const settingsButton = document.querySelector("#settings-button");
-const scanButton = document.querySelector("#scan-button");
-const upButton = document.querySelector("#up-button");
+const backButton = document.querySelector("#back-button");
+const forwardButton = document.querySelector("#forward-button");
 const thumbScaleInput = document.querySelector("#thumb-scale");
 const viewer = document.querySelector("#viewer");
 const viewerImage = document.querySelector("#viewer-image");
@@ -66,10 +71,33 @@ const state = {
   contextMenuImage: null,
   contextMenuFolder: null,
   contextMenuRoot: null,
-  metadataMode: "edit",
+  metadataMode: APP_MODES.FOLDER,
   currentFolderMeta: null,
   metadataLoading: false,
   metadataRequestId: 0,
+  searchActive: false,
+  searchLoading: false,
+  searchRequestId: 0,
+  searchResults: [],
+  searchDisplayedFolders: [],
+  searchPersonResults: [],
+  searchPeopleLoaded: false,
+  searchPeopleFilterKey: "",
+  searchPerson: null,
+  searchIncludeTags: [],
+  searchIncludeCombine: "and",
+  searchExcludeTags: [],
+  searchExcludeCombine: "or",
+  searchMinimumRating: null,
+  searchHierarchy: false,
+  searchPersonDropdownOpen: false,
+  searchPersonSearch: "",
+  searchTagDropdownTarget: null,
+  searchTagSearch: "",
+  searchSlideshowMenuOpen: false,
+  historyBack: [],
+  historyForward: [],
+  restoringHistory: false,
   peopleOptions: [],
   peopleOptionsLoaded: false,
   tagOptions: [],
@@ -114,8 +142,8 @@ const thumbnailObserver =
 
 addRootButton.addEventListener("click", addRoot);
 settingsButton.addEventListener("click", openSettingsDialog);
-scanButton.addEventListener("click", scanCurrentRoot);
-upButton.addEventListener("click", openParentFolder);
+backButton.addEventListener("click", () => goBackHistory().catch(showError));
+forwardButton.addEventListener("click", () => goForwardHistory().catch(showError));
 thumbScaleInput.addEventListener("input", handleThumbScaleInput);
 settingsCloseButton.addEventListener("click", closeSettingsDialog);
 metadataBar.addEventListener("click", (event) => {
@@ -152,8 +180,38 @@ document.addEventListener("keydown", (event) => {
     return;
   }
 
-  if (event.key === "Escape" && (state.personDropdownOpen || state.tagDropdownOpen)) {
+  if (
+    event.altKey &&
+    event.key === "ArrowLeft" &&
+    canGoBackHistory() &&
+    viewer.classList.contains("hidden")
+  ) {
+    event.preventDefault();
+    goBackHistory().catch(showError);
+    return;
+  }
+
+  if (
+    event.altKey &&
+    event.key === "ArrowRight" &&
+    canGoForwardHistory() &&
+    viewer.classList.contains("hidden")
+  ) {
+    event.preventDefault();
+    goForwardHistory().catch(showError);
+    return;
+  }
+
+  if (
+    event.key === "Escape" &&
+    (state.personDropdownOpen ||
+      state.tagDropdownOpen ||
+      state.searchPersonDropdownOpen ||
+      state.searchTagDropdownTarget ||
+      state.searchSlideshowMenuOpen)
+  ) {
     closeMetadataDropdowns();
+    closeSearchDropdowns();
     return;
   }
 
@@ -306,6 +364,7 @@ async function wireScanEvents() {
       `Scanning ${payload.folders_seen} folders`,
     );
     updateBusyIndicator();
+    updateRescanButton();
     if (!wasActive) {
       renderRootOverviewIfVisible({ keepStatus: true, keepScroll: true });
     }
@@ -329,7 +388,7 @@ async function wireScanEvents() {
     invalidateThumbnailDataCache(payload.root_id);
     await refreshOverview();
     if (payload.root_id === state.currentRootId) {
-      scanButton.disabled = false;
+      updateRescanButton();
       if (!state.atRootOverview) {
         await refreshCurrentFolder({ keepStatus: true, forceReload: true });
       }
@@ -352,7 +411,7 @@ async function wireScanEvents() {
     clearValidationPatchTimer();
     updateBusyIndicator();
     if (payload.root_id === state.currentRootId) {
-      scanButton.disabled = false;
+      updateRescanButton();
       resumeDeferredThumbnails();
     }
     renderRootOverviewIfVisible({ keepStatus: true, keepScroll: true });
@@ -369,6 +428,7 @@ async function refreshOverview() {
   state.roots = overview.roots;
   state.peopleOptionsLoaded = false;
   state.tagOptionsLoaded = false;
+  invalidateSearchCaches();
   renderRootOverviewIfVisible({ keepStatus: true, keepScroll: true });
 }
 
@@ -409,7 +469,7 @@ async function startScan(rootId, relativePath = "") {
   updateBusyIndicator();
   pauseThumbnailWorkForRoot(rootId);
   renderRootOverviewIfVisible({ keepStatus: true, keepScroll: true });
-  scanButton.disabled = true;
+  updateRescanButton();
   setStatus(`Scanning ${scanTarget}...`);
   let started;
   try {
@@ -472,8 +532,14 @@ async function openFolder(rootId, relativePath, options = {}) {
     return;
   }
 
-  rememberCurrentScrollPosition();
+  const historyEntry = beginHistoryNavigation();
+  if (!state.restoringHistory) {
+    rememberCurrentScrollPosition();
+  }
 
+  state.metadataMode = APP_MODES.FOLDER;
+  closeSearchDropdowns();
+  state.searchActive = false;
   state.currentRootId = rootId;
   state.currentPath = relativePath ?? "";
   state.atRootOverview = false;
@@ -499,6 +565,7 @@ async function openFolder(rootId, relativePath, options = {}) {
     restorePendingScrollPosition();
     updateBusyIndicator();
     scheduleVisibleFolderValidation(100);
+    commitHistoryNavigation(historyEntry);
     return;
   }
 
@@ -532,6 +599,7 @@ async function openFolder(rootId, relativePath, options = {}) {
       showError(error);
     }
   });
+  commitHistoryNavigation(historyEntry);
 }
 
 async function refreshCurrentFolder(options = {}) {
@@ -636,6 +704,7 @@ async function patchCurrentFolderFromDb(options = {}) {
 function scheduleVisibleFolderValidation(delay = 200) {
   if (
     !invoke ||
+    state.searchActive ||
     state.atRootOverview ||
     !state.currentRootId ||
     state.folderLoading ||
@@ -656,6 +725,7 @@ function scheduleVisibleFolderValidation(delay = 200) {
 
 async function startVisibleFolderValidation() {
   if (
+    state.searchActive ||
     state.atRootOverview ||
     !state.currentRootId ||
     !state.currentView ||
@@ -724,21 +794,14 @@ function visibleFolderValidationPaths() {
   return paths;
 }
 
-function openParentFolder() {
-  if (state.atRootOverview) {
-    return;
-  }
-
-  if (!state.currentRootId || !state.currentView || state.currentView.parent_relative_path === null) {
-    openRootOverview();
-    return;
-  }
-
-  openFolder(state.currentRootId, state.currentView.parent_relative_path ?? "").catch(showError);
-}
-
 function openRootOverview(options = {}) {
-  rememberCurrentScrollPosition();
+  const historyEntry = beginHistoryNavigation();
+  if (!state.restoringHistory) {
+    rememberCurrentScrollPosition();
+  }
+  state.metadataMode = APP_MODES.FOLDER;
+  closeSearchDropdowns();
+  state.searchActive = false;
   state.atRootOverview = true;
   state.currentRootId = null;
   state.currentPath = "";
@@ -750,11 +813,13 @@ function openRootOverview(options = {}) {
   clearValidationPatchTimer();
   clearVisibleValidationTimer();
   updateBusyIndicator();
+  updateNavigationButtons();
   resetStreamRenderQueue();
   resetThumbnailWork();
   clearMetadataSelection();
   prepareScrollRestore(null, "", options);
   renderRootOverview(options);
+  commitHistoryNavigation(historyEntry);
 }
 
 function renderRootOverviewIfVisible(options = {}) {
@@ -769,8 +834,7 @@ function renderRootOverview(options = {}) {
   if (!options.keepStatus) {
     setStatus(rootOverviewStatus());
   }
-  upButton.disabled = true;
-  scanButton.disabled = true;
+  updateNavigationButtons();
   renderMetadataBar();
   breadcrumbsNode.replaceChildren();
 
@@ -975,12 +1039,24 @@ function normalizeFolderMetadata(metadata, target) {
 }
 
 function renderMetadataBar(options = {}) {
+  if (state.metadataMode === APP_MODES.SEARCH) {
+    renderSearchMetadataBar(options);
+    return;
+  }
+
+  if (state.metadataMode === APP_MODES.PERSONS) {
+    renderPersonsMetadataBar(options);
+    return;
+  }
+
+  renderEditMetadataBar(options);
+}
+
+function renderEditMetadataBar(options = {}) {
   const target = currentFolderMetadataTarget();
   const metadata = target ? state.currentFolderMeta : null;
-  const editDisabled = !target || state.metadataMode !== "edit";
+  const editDisabled = !target || state.metadataMode !== APP_MODES.FOLDER;
   const disabledAttr = editDisabled ? " disabled" : "";
-  const targetLabel = target ? `Folder: ${target.displayName}` : "No folder";
-  const targetTitle = target?.relativePath ?? "";
   const rating = normalizeRating(metadata?.rating);
   const inheritedRating = normalizeRating(metadata?.inherited_rating);
   const people = metadata?.people ?? [];
@@ -992,13 +1068,10 @@ function renderMetadataBar(options = {}) {
     : "";
   const tagDropdown =
     state.tagDropdownOpen && !editDisabled ? renderTagDropdownHtml() : "";
+  const rescanDisabled = rescanButtonDisabled() ? " disabled" : "";
 
   metadataBar.innerHTML = `
-    <div class="metadata-mode-tabs" role="tablist" aria-label="Metadata mode">
-      <button type="button" data-metadata-mode="search" disabled>Search</button>
-      <button type="button" data-metadata-mode="edit" data-active="${state.metadataMode === "edit"}">Edit</button>
-    </div>
-    <div class="metadata-target" title="${escapeHtml(targetTitle)}">${escapeHtml(targetLabel)}</div>
+    ${renderMetadataModeTabs()}
     <div class="rating-toggle-group" role="group" aria-label="Rating">
       ${RATING_OPTIONS.map((option) => {
         const displayRating = rating ?? inheritedRating ?? 0;
@@ -1031,6 +1104,11 @@ function renderMetadataBar(options = {}) {
       <button class="tag-add-button" type="button" data-action="toggle-tag-dropdown" title="Add tag" aria-label="Add tag"${disabledAttr}>+</button>
       ${tagDropdown}
     </div>
+    <div class="folder-row-actions">
+      <button class="folder-rescan-button" type="button" data-action="rescan-folder" title="Rescan folder" aria-label="Rescan folder"${rescanDisabled}>
+        ${iconSvg("refresh")}<span>Rescan</span>
+      </button>
+    </div>
   `;
 
   updatePersonDropdownOptions();
@@ -1049,6 +1127,122 @@ function renderMetadataBar(options = {}) {
       input?.select();
     });
   }
+}
+
+function renderSearchMetadataBar(options = {}) {
+  renderSearchFilterMetadataBar({
+    ...options,
+    showPersonFilter: true,
+    showGroupToggle: true,
+    showSlideshowButton: true,
+  });
+}
+
+function renderPersonsMetadataBar(options = {}) {
+  renderSearchFilterMetadataBar({
+    ...options,
+    showPersonFilter: false,
+    showGroupToggle: false,
+    showSlideshowButton: false,
+  });
+}
+
+function renderSearchFilterMetadataBar(options = {}) {
+  const personDropdown = state.searchPersonDropdownOpen
+    ? renderSearchPersonDropdownHtml()
+    : "";
+  const tagDropdown = state.searchTagDropdownTarget
+    ? renderSearchTagDropdownHtml(state.searchTagDropdownTarget)
+    : "";
+  const minimumRating = normalizeRating(state.searchMinimumRating);
+  const showPersonFilter = Boolean(options.showPersonFilter);
+  const showGroupToggle = Boolean(options.showGroupToggle);
+  const showSlideshowButton = Boolean(options.showSlideshowButton);
+  const slideshowDisabled = !searchSlideshowAvailable();
+  const slideshowMenu =
+    showSlideshowButton && state.searchSlideshowMenuOpen && !slideshowDisabled
+      ? renderSearchSlideshowMenuHtml()
+      : "";
+
+  metadataBar.innerHTML = `
+    ${renderMetadataModeTabs()}
+    ${showGroupToggle ? `<button class="search-group-toggle" type="button" data-action="toggle-search-hierarchy" data-active="${state.searchHierarchy}" aria-pressed="${state.searchHierarchy}" title="Group by folder structure" aria-label="Group by folder structure">
+      <span class="mode-icon">${iconSvg("folderTree")}</span><span>Group</span>
+    </button>` : ""}
+    <button class="search-reset-button" type="button" data-action="reset-search-filters" title="Reset search filters" aria-label="Reset search filters">
+      ${iconSvg("reset")}<span>Reset</span>
+    </button>
+    <div class="rating-toggle-group search-rating-group" role="group" aria-label="Minimum rating">
+      ${RATING_OPTIONS.map((option) => {
+        const active = minimumRating === option;
+        const filled = Boolean(minimumRating && minimumRating >= option);
+        const title = active
+          ? `Clear minimum ${option} star rating`
+          : `Minimum ${option} stars`;
+        return `<button class="rating-toggle" type="button" data-rating="${option}" data-active="${active}" data-filled="${filled}" aria-pressed="${active}" title="${title}" aria-label="${title}"><span class="star-icon" aria-hidden="true">${filled ? "&#9733;" : "&#9734;"}</span></button>`;
+      }).join("")}
+    </div>
+    ${showPersonFilter ? `<div class="people-editor search-person-editor">
+      <span class="metadata-label">Person:</span>
+      <div class="person-chips">
+        ${state.searchPerson ? renderSearchPersonChipHtml(state.searchPerson) : ""}
+      </div>
+      <button class="person-add-button" type="button" data-action="toggle-search-person-dropdown" title="Choose person" aria-label="Choose person">+</button>
+      ${personDropdown}
+    </div>` : ""}
+    <div class="tags-editor search-tags-editor" data-search-tag-list="include">
+      <span class="metadata-label">Include:</span>
+      ${renderSearchCombineHtml("include", state.searchIncludeCombine)}
+      <div class="tag-chips">
+        ${state.searchIncludeTags.map((tag) => renderSearchTagChipHtml(tag, "include")).join("")}
+      </div>
+      <button class="tag-add-button" type="button" data-action="toggle-search-tag-dropdown" data-tag-list="include" title="Add include tag" aria-label="Add include tag">+</button>
+      ${state.searchTagDropdownTarget === "include" ? tagDropdown : ""}
+    </div>
+    <div class="tags-editor search-tags-editor" data-search-tag-list="exclude">
+      <span class="metadata-label">Exclude:</span>
+      ${renderSearchCombineHtml("exclude", state.searchExcludeCombine)}
+      <div class="tag-chips">
+        ${state.searchExcludeTags.map((tag) => renderSearchTagChipHtml(tag, "exclude")).join("")}
+      </div>
+      <button class="tag-add-button" type="button" data-action="toggle-search-tag-dropdown" data-tag-list="exclude" title="Add exclude tag" aria-label="Add exclude tag">+</button>
+      ${state.searchTagDropdownTarget === "exclude" ? tagDropdown : ""}
+    </div>
+    ${showSlideshowButton ? `<div class="search-actions">
+      <button class="icon-button search-play-button" type="button" data-action="toggle-search-slideshow-menu" title="Play search results" aria-label="Play search results"${slideshowDisabled ? " disabled" : ""}>
+        ${iconSvg("play")}
+      </button>
+      ${slideshowMenu}
+    </div>` : ""}
+  `;
+
+  if (showPersonFilter) {
+    updateSearchPersonDropdownOptions();
+  }
+  updateSearchTagDropdownOptions();
+  if (showPersonFilter && options.focusSearchPersonInput && state.searchPersonDropdownOpen) {
+    requestAnimationFrame(() => {
+      const input = metadataBar.querySelector(".search-person-search-field");
+      input?.focus({ preventScroll: true });
+      input?.select();
+    });
+  }
+  if (options.focusSearchTagInput && state.searchTagDropdownTarget) {
+    requestAnimationFrame(() => {
+      const input = metadataBar.querySelector(".search-tag-search-field");
+      input?.focus({ preventScroll: true });
+      input?.select();
+    });
+  }
+}
+
+function renderSearchSlideshowMenuHtml() {
+  return `
+    <div class="search-slideshow-menu" role="menu">
+      <button type="button" data-action="play-search-slideshow">Play slideshow from search results</button>
+      <button type="button" data-action="play-search-slideshow-random">Play slideshow from search results randomized</button>
+    </div>
+  `;
 }
 
 function renderPersonChipHtml(person) {
@@ -1085,6 +1279,34 @@ function renderInheritedTagChipHtml(tag) {
   `;
 }
 
+function renderSearchPersonChipHtml(person) {
+  return `
+    <span class="person-chip">
+      <span title="${escapeHtml(person.name)}">${escapeHtml(person.name)}</span>
+      <button type="button" data-action="clear-search-person" title="Clear person" aria-label="Clear person">x</button>
+    </span>
+  `;
+}
+
+function renderSearchTagChipHtml(tag, listName) {
+  return `
+    <span class="tag-chip">
+      <span title="${escapeHtml(tag.name)}">${escapeHtml(tag.name)}</span>
+      <button type="button" data-action="remove-search-tag" data-tag-list="${listName}" data-tag-name="${escapeHtml(tag.name)}" title="Remove tag" aria-label="Remove tag">x</button>
+    </span>
+  `;
+}
+
+function renderSearchCombineHtml(listName, combineMode) {
+  const mode = normalizeCombineMode(combineMode);
+  return `
+    <div class="search-combine-toggle" role="group" aria-label="${listName} tag combine mode">
+      <button type="button" data-action="set-search-tag-combine" data-tag-list="${listName}" data-combine="and" data-active="${mode === "and"}">AND</button>
+      <button type="button" data-action="set-search-tag-combine" data-tag-list="${listName}" data-combine="or" data-active="${mode === "or"}">OR</button>
+    </div>
+  `;
+}
+
 function renderPersonDropdownHtml() {
   return `
     <div class="person-dropdown">
@@ -1099,6 +1321,24 @@ function renderTagDropdownHtml() {
     <div class="tag-dropdown">
       <input class="tag-search-field" type="text" value="${escapeHtml(state.tagSearch)}" placeholder="Tag" aria-label="Tag name" />
       <div class="tag-options" role="listbox"></div>
+    </div>
+  `;
+}
+
+function renderSearchPersonDropdownHtml() {
+  return `
+    <div class="person-dropdown search-person-dropdown">
+      <input class="search-person-search-field" type="text" value="${escapeHtml(state.searchPersonSearch)}" placeholder="Name" aria-label="Person name" />
+      <div class="search-person-options person-options" role="listbox"></div>
+    </div>
+  `;
+}
+
+function renderSearchTagDropdownHtml(target) {
+  return `
+    <div class="tag-dropdown search-tag-dropdown" data-search-tag-target="${target}">
+      <input class="search-tag-search-field" type="text" value="${escapeHtml(state.searchTagSearch)}" placeholder="Tag" aria-label="Tag name" />
+      <div class="search-tag-options tag-options" role="listbox"></div>
     </div>
   `;
 }
@@ -1158,6 +1398,61 @@ function updateTagDropdownOptions() {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "tag-option";
+      button.dataset.tagName = tag.name;
+      button.textContent = tag.name;
+      return button;
+    }),
+  );
+}
+
+function updateSearchPersonDropdownOptions() {
+  const optionsNode = metadataBar.querySelector(".search-person-options");
+  if (!optionsNode) {
+    return;
+  }
+
+  const selectedName = normalizedMetadataName(state.searchPerson?.name);
+  const query = state.searchPersonSearch.trim().toLowerCase();
+  const options = state.peopleOptions
+    .filter((person) => normalizedMetadataName(person.name) !== selectedName)
+    .filter((person) => !query || person.name.toLowerCase().includes(query))
+    .sort((left, right) =>
+      left.name.localeCompare(right.name, undefined, { sensitivity: "base" }),
+    );
+
+  optionsNode.replaceChildren(
+    ...options.map((person) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "search-person-option person-option";
+      button.dataset.personName = person.name;
+      button.textContent = person.name;
+      return button;
+    }),
+  );
+}
+
+function updateSearchTagDropdownOptions() {
+  const optionsNode = metadataBar.querySelector(".search-tag-options");
+  if (!optionsNode || !state.searchTagDropdownTarget) {
+    return;
+  }
+
+  const list = searchTagList(state.searchTagDropdownTarget);
+  const assignedNames = new Set(list.map((tag) => normalizedMetadataName(tag.name)));
+  const query = state.searchTagSearch.trim().toLowerCase();
+  const options = state.tagOptions
+    .filter((tag) => !assignedNames.has(normalizedMetadataName(tag.name)))
+    .filter((tag) => !query || tag.name.toLowerCase().includes(query))
+    .sort((left, right) =>
+      left.name.localeCompare(right.name, undefined, { sensitivity: "base" }),
+    );
+
+  optionsNode.replaceChildren(
+    ...options.map((tag) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "search-tag-option tag-option";
       button.dataset.tagName = tag.name;
       button.textContent = tag.name;
       return button;
@@ -1228,6 +1523,77 @@ function closeMetadataDropdowns() {
   }
 }
 
+async function openSearchPersonDropdown() {
+  if (state.metadataMode !== APP_MODES.SEARCH) {
+    return;
+  }
+  state.searchPersonDropdownOpen = true;
+  state.searchPersonSearch = "";
+  state.searchTagDropdownTarget = null;
+  state.searchTagSearch = "";
+  state.searchSlideshowMenuOpen = false;
+  if (!state.peopleOptionsLoaded) {
+    state.peopleOptions = [];
+  }
+  renderMetadataBar({ focusSearchPersonInput: true });
+  await loadPeopleOptions();
+}
+
+async function openSearchTagDropdown(target) {
+  const listName = normalizeSearchTagListName(target);
+  state.searchTagDropdownTarget = listName;
+  state.searchTagSearch = "";
+  state.searchPersonDropdownOpen = false;
+  state.searchPersonSearch = "";
+  state.searchSlideshowMenuOpen = false;
+  if (!state.tagOptionsLoaded) {
+    state.tagOptions = [];
+  }
+  renderMetadataBar({ focusSearchTagInput: true });
+  await loadTagOptions();
+}
+
+function closeSearchPersonDropdown() {
+  if (!state.searchPersonDropdownOpen) {
+    return;
+  }
+  state.searchPersonDropdownOpen = false;
+  state.searchPersonSearch = "";
+  renderMetadataBar();
+}
+
+function closeSearchTagDropdown() {
+  if (!state.searchTagDropdownTarget) {
+    return;
+  }
+  state.searchTagDropdownTarget = null;
+  state.searchTagSearch = "";
+  renderMetadataBar();
+}
+
+function closeSearchDropdowns() {
+  const wasOpen =
+    state.searchPersonDropdownOpen ||
+    state.searchTagDropdownTarget ||
+    state.searchSlideshowMenuOpen;
+  state.searchPersonDropdownOpen = false;
+  state.searchPersonSearch = "";
+  state.searchTagDropdownTarget = null;
+  state.searchTagSearch = "";
+  state.searchSlideshowMenuOpen = false;
+  if (wasOpen) {
+    renderMetadataBar();
+  }
+}
+
+function closeSearchSlideshowMenu() {
+  if (!state.searchSlideshowMenuOpen) {
+    return;
+  }
+  state.searchSlideshowMenuOpen = false;
+  renderMetadataBar();
+}
+
 async function loadPeopleOptions() {
   if (!invoke || state.peopleOptionsLoaded) {
     return;
@@ -1236,7 +1602,11 @@ async function loadPeopleOptions() {
   const options = await invoke("metadata_people");
   state.peopleOptionsLoaded = true;
   state.peopleOptions = normalizePeopleOptions(options);
-  renderMetadataBar({ focusPersonInput: true });
+  renderMetadataBar(
+    state.metadataMode === APP_MODES.SEARCH
+      ? { focusSearchPersonInput: true }
+      : { focusPersonInput: true },
+  );
 }
 
 async function loadTagOptions() {
@@ -1247,7 +1617,11 @@ async function loadTagOptions() {
   const options = await invoke("metadata_tags");
   state.tagOptionsLoaded = true;
   state.tagOptions = normalizeMetadataOptions(options);
-  renderMetadataBar({ focusTagInput: true });
+  renderMetadataBar(
+    isFilterMode()
+      ? { focusSearchTagInput: true }
+      : { focusTagInput: true },
+  );
 }
 
 function normalizePeopleOptions(options) {
@@ -1314,23 +1688,69 @@ function normalizeRating(value) {
   return Number.isInteger(rating) && rating >= 1 && rating <= 5 ? rating : null;
 }
 
+function isFilterMode(mode = state.metadataMode) {
+  return mode === APP_MODES.SEARCH || mode === APP_MODES.PERSONS;
+}
+
+function iconSvg(name) {
+  const icons = {
+    folder: `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3.5 6.5a2 2 0 0 1 2-2h4.2l2 2H18.5a2 2 0 0 1 2 2v8.8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2Z"></path></svg>`,
+    folderTree: `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 5.5v12.8"></path><path d="M6 9.3h3.1"></path><path d="M6 16.2h3.1"></path><path d="M9.2 7.2h3l1 1h3.6a1.2 1.2 0 0 1 1.2 1.2v2.3a1.2 1.2 0 0 1-1.2 1.2H9.2Z"></path><path d="M9.2 14.1h3l1 1h3.6a1.2 1.2 0 0 1 1.2 1.2v2.3a1.2 1.2 0 0 1-1.2 1.2H9.2Z"></path></svg>`,
+    persons: `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M9.2 11.2a3.2 3.2 0 1 0 0-6.4 3.2 3.2 0 0 0 0 6.4Z"></path><path d="M15.9 11.1a2.7 2.7 0 1 0 0-5.4 2.7 2.7 0 0 0 0 5.4Z"></path><path d="M3.5 19.2c.5-3.4 2.4-5.1 5.7-5.1s5.2 1.7 5.7 5.1Z"></path><path d="M14.2 18.9c.5-2.6 2-4 4.4-4 1 0 1.8.2 2.5.7v3.3Z"></path></svg>`,
+    search: `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="10.7" cy="10.7" r="5.9"></circle><path d="m15.1 15.1 5.4 5.4"></path></svg>`,
+    play: `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M8 5.2v13.6L18.7 12Z"></path></svg>`,
+    reset: `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5.5 8.5A7.3 7.3 0 0 1 18 6.9"></path><path d="M18 4.2v3.4h-3.4"></path><path d="M18.5 15.5A7.3 7.3 0 0 1 6 17.1"></path><path d="M6 19.8v-3.4h3.4"></path></svg>`,
+    refresh: `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M20 11a8 8 0 0 0-14.2-4.9"></path><path d="M5 3.8v4h4"></path><path d="M4 13a8 8 0 0 0 14.2 4.9"></path><path d="M19 20.2v-4h-4"></path></svg>`,
+  };
+  return icons[name] ?? "";
+}
+
+function renderMetadataModeTabs() {
+  const mode = state.metadataMode;
+  return `
+    <div class="metadata-mode-tabs" role="tablist" aria-label="App state">
+      <button type="button" data-metadata-mode="${APP_MODES.FOLDER}" data-active="${mode === APP_MODES.FOLDER}" title="Folder" aria-label="Folder">
+        <span class="mode-icon">${iconSvg("folder")}</span><span>Folder</span>
+      </button>
+      <button type="button" data-metadata-mode="${APP_MODES.PERSONS}" data-active="${mode === APP_MODES.PERSONS}" title="Persons" aria-label="Persons">
+        <span class="mode-icon">${iconSvg("persons")}</span><span>Persons</span>
+      </button>
+      <button type="button" data-metadata-mode="${APP_MODES.SEARCH}" data-active="${mode === APP_MODES.SEARCH}" title="Search" aria-label="Search">
+        <span class="mode-icon">${iconSvg("search")}</span><span>Search</span>
+      </button>
+    </div>
+  `;
+}
+
 async function handleMetadataBarClick(event) {
   const modeButton = event.target.closest("button[data-metadata-mode]");
   if (modeButton && !modeButton.disabled) {
-    state.metadataMode = modeButton.dataset.metadataMode;
-    renderMetadataBar();
+    await switchMetadataMode(modeButton.dataset.metadataMode);
     return;
   }
 
   const ratingButton = event.target.closest("button[data-rating]");
   if (ratingButton && !ratingButton.disabled) {
-    await setCurrentFolderRating(Number(ratingButton.dataset.rating));
+    if (isFilterMode()) {
+      await setSearchMinimumRating(Number(ratingButton.dataset.rating));
+    } else {
+      await setCurrentFolderRating(Number(ratingButton.dataset.rating));
+    }
     return;
   }
 
   const actionButton = event.target.closest("button[data-action]");
   if (actionButton && !actionButton.disabled) {
+    if (isFilterMode()) {
+      await handleSearchMetadataAction(actionButton);
+      return;
+    }
+
     const action = actionButton.dataset.action;
+    if (action === "rescan-folder") {
+      await scanCurrentRoot();
+      return;
+    }
     if (action === "toggle-person-dropdown") {
       if (state.personDropdownOpen) {
         closePersonDropdown();
@@ -1357,6 +1777,20 @@ async function handleMetadataBarClick(event) {
     }
   }
 
+  if (isFilterMode()) {
+    const searchPersonOption = event.target.closest(".search-person-option");
+    if (searchPersonOption && state.metadataMode === APP_MODES.SEARCH) {
+      await setSearchPerson(searchPersonOption.dataset.personName);
+      return;
+    }
+
+    const searchTagOption = event.target.closest(".search-tag-option");
+    if (searchTagOption) {
+      await addSearchTag(state.searchTagDropdownTarget, searchTagOption.dataset.tagName);
+      return;
+    }
+  }
+
   const personOption = event.target.closest(".person-option");
   if (personOption) {
     await addCurrentFolderPerson(personOption.dataset.personName);
@@ -1369,7 +1803,13 @@ async function handleMetadataBarClick(event) {
 }
 
 function handleMetadataBarInput(event) {
-  if (event.target.classList.contains("person-search-field")) {
+  if (event.target.classList.contains("search-person-search-field")) {
+    state.searchPersonSearch = event.target.value;
+    updateSearchPersonDropdownOptions();
+  } else if (event.target.classList.contains("search-tag-search-field")) {
+    state.searchTagSearch = event.target.value;
+    updateSearchTagDropdownOptions();
+  } else if (event.target.classList.contains("person-search-field")) {
     state.personSearch = event.target.value;
     updatePersonDropdownOptions();
   } else if (event.target.classList.contains("tag-search-field")) {
@@ -1379,6 +1819,32 @@ function handleMetadataBarInput(event) {
 }
 
 async function handleMetadataBarKeydown(event) {
+  const isSearchPersonSearch = event.target.classList.contains(
+    "search-person-search-field",
+  );
+  const isSearchTagSearch = event.target.classList.contains("search-tag-search-field");
+  if (isSearchPersonSearch || isSearchTagSearch) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      if (isSearchPersonSearch) {
+        closeSearchPersonDropdown();
+      } else {
+        closeSearchTagDropdown();
+      }
+      return;
+    }
+
+    if (event.key === "Enter") {
+      event.preventDefault();
+      if (isSearchPersonSearch) {
+        await setSearchPerson(event.target.value);
+      } else {
+        await addSearchTag(state.searchTagDropdownTarget, event.target.value);
+      }
+    }
+    return;
+  }
+
   const isPersonSearch = event.target.classList.contains("person-search-field");
   const isTagSearch = event.target.classList.contains("tag-search-field");
   if (!isPersonSearch && !isTagSearch) {
@@ -1405,6 +1871,256 @@ async function handleMetadataBarKeydown(event) {
   }
 }
 
+async function switchMetadataMode(mode) {
+  if (mode === state.metadataMode) {
+    return;
+  }
+
+  const historyEntry = beginHistoryNavigation();
+  if (mode === APP_MODES.SEARCH) {
+    state.metadataMode = APP_MODES.SEARCH;
+    closeMetadataDropdowns();
+    state.searchSlideshowMenuOpen = false;
+    renderMetadataBar();
+    await refreshSearchSurface();
+    commitHistoryNavigation(historyEntry);
+    return;
+  }
+
+  if (mode === APP_MODES.PERSONS) {
+    state.metadataMode = APP_MODES.PERSONS;
+    state.searchPerson = null;
+    state.searchPersonDropdownOpen = false;
+    state.searchPersonSearch = "";
+    state.searchSlideshowMenuOpen = false;
+    closeMetadataDropdowns();
+    renderMetadataBar();
+    await refreshSearchSurface();
+    commitHistoryNavigation(historyEntry);
+    return;
+  }
+
+  state.metadataMode = APP_MODES.FOLDER;
+  closeSearchDropdowns();
+  state.searchActive = false;
+  state.searchLoading = false;
+  state.searchRequestId += 1;
+  renderCurrentLibrarySurface({ keepStatus: true });
+  restoreCurrentLibraryScrollPosition();
+  commitHistoryNavigation(historyEntry);
+}
+
+async function handleSearchMetadataAction(button) {
+  const action = button.dataset.action;
+  if (action === "toggle-search-person-dropdown") {
+    if (state.metadataMode !== APP_MODES.SEARCH) {
+      return;
+    }
+    if (state.searchPersonDropdownOpen) {
+      closeSearchPersonDropdown();
+    } else {
+      await openSearchPersonDropdown();
+    }
+    return;
+  }
+
+  if (action === "toggle-search-slideshow-menu") {
+    state.searchSlideshowMenuOpen = !state.searchSlideshowMenuOpen;
+    state.searchPersonDropdownOpen = false;
+    state.searchPersonSearch = "";
+    state.searchTagDropdownTarget = null;
+    state.searchTagSearch = "";
+    renderMetadataBar();
+    return;
+  }
+
+  if (action === "toggle-search-hierarchy") {
+    const historyEntry = beginHistoryNavigation();
+    state.searchHierarchy = !state.searchHierarchy;
+    renderMetadataBar();
+    if (state.searchActive && state.metadataMode === APP_MODES.SEARCH) {
+      renderSearchResults();
+    }
+    commitHistoryNavigation(historyEntry);
+    return;
+  }
+
+  if (action === "clear-search-person") {
+    await setSearchPerson(null);
+    return;
+  }
+
+  if (action === "reset-search-filters") {
+    await resetSearchFilters();
+    return;
+  }
+
+  if (action === "play-search-slideshow") {
+    closeSearchSlideshowMenu();
+    await playSearchResultsSlideshow({ randomized: false });
+    return;
+  }
+
+  if (action === "play-search-slideshow-random") {
+    closeSearchSlideshowMenu();
+    await playSearchResultsSlideshow({ randomized: true });
+    return;
+  }
+
+  if (action === "toggle-search-tag-dropdown") {
+    const target = normalizeSearchTagListName(button.dataset.tagList);
+    if (state.searchTagDropdownTarget === target) {
+      closeSearchTagDropdown();
+    } else {
+      await openSearchTagDropdown(target);
+    }
+    return;
+  }
+
+  if (action === "remove-search-tag") {
+    await removeSearchTag(button.dataset.tagList, button.dataset.tagName);
+    return;
+  }
+
+  if (action === "set-search-tag-combine") {
+    await setSearchTagCombine(button.dataset.tagList, button.dataset.combine);
+  }
+}
+
+async function setSearchPerson(name, options = {}) {
+  const historyEntry = beginHistoryNavigation();
+  const cleanName = String(name || "").trim();
+  state.searchPerson = cleanName ? { name: cleanName } : null;
+  if (options.switchToSearch) {
+    state.metadataMode = APP_MODES.SEARCH;
+  }
+  state.searchPersonSearch = "";
+  state.searchPersonDropdownOpen = false;
+  state.searchSlideshowMenuOpen = false;
+  renderMetadataBar();
+  await refreshSearchSurface();
+  commitHistoryNavigation(historyEntry);
+}
+
+async function resetSearchFilters() {
+  const historyEntry = beginHistoryNavigation();
+  state.searchPerson = null;
+  state.searchIncludeTags = [];
+  state.searchIncludeCombine = "and";
+  state.searchExcludeTags = [];
+  state.searchExcludeCombine = "or";
+  state.searchMinimumRating = null;
+  state.searchHierarchy = false;
+  state.searchPersonDropdownOpen = false;
+  state.searchPersonSearch = "";
+  state.searchTagDropdownTarget = null;
+  state.searchTagSearch = "";
+  state.searchSlideshowMenuOpen = false;
+  state.searchResults = [];
+  state.searchDisplayedFolders = [];
+  state.searchPersonResults = [];
+  state.searchPeopleLoaded = false;
+  state.searchPeopleFilterKey = "";
+  state.searchLoading = false;
+  state.searchRequestId += 1;
+  renderMetadataBar();
+  if (state.metadataMode === APP_MODES.PERSONS) {
+    await refreshSearchSurface();
+    commitHistoryNavigation(historyEntry);
+    return;
+  }
+
+  prepareSearchSurface();
+  updateBusyIndicator();
+  setStatus("Choose search filters");
+  renderEmptyState("Choose search filters", { keepBreadcrumbs: true });
+  commitHistoryNavigation(historyEntry);
+}
+
+async function addSearchTag(listName, name) {
+  const cleanName = String(name || "").trim();
+  if (!cleanName) {
+    return;
+  }
+
+  const historyEntry = beginHistoryNavigation();
+  const list = searchTagList(listName);
+  const key = normalizedMetadataName(cleanName);
+  if (!list.some((tag) => normalizedMetadataName(tag.name) === key)) {
+    list.push({ id: Date.now(), name: cleanName });
+  }
+
+  state.searchTagSearch = "";
+  state.searchPeopleLoaded = false;
+  closeSearchTagDropdown();
+  renderMetadataBar();
+  await refreshSearchSurface();
+  commitHistoryNavigation(historyEntry);
+}
+
+async function removeSearchTag(listName, name) {
+  const historyEntry = beginHistoryNavigation();
+  const normalizedName = normalizedMetadataName(name);
+  const target = normalizeSearchTagListName(listName);
+  if (target === "include") {
+    state.searchIncludeTags = state.searchIncludeTags.filter(
+      (tag) => normalizedMetadataName(tag.name) !== normalizedName,
+    );
+  } else {
+    state.searchExcludeTags = state.searchExcludeTags.filter(
+      (tag) => normalizedMetadataName(tag.name) !== normalizedName,
+    );
+  }
+  state.searchPeopleLoaded = false;
+  renderMetadataBar();
+  await refreshSearchSurface();
+  commitHistoryNavigation(historyEntry);
+}
+
+async function setSearchTagCombine(listName, combine) {
+  const historyEntry = beginHistoryNavigation();
+  const target = normalizeSearchTagListName(listName);
+  const mode = normalizeCombineMode(combine);
+  if (target === "include") {
+    state.searchIncludeCombine = mode;
+  } else {
+    state.searchExcludeCombine = mode;
+  }
+  state.searchPeopleLoaded = false;
+  renderMetadataBar();
+  await refreshSearchSurface();
+  commitHistoryNavigation(historyEntry);
+}
+
+async function setSearchMinimumRating(rating) {
+  const normalized = normalizeRating(rating);
+  if (!normalized) {
+    return;
+  }
+
+  const historyEntry = beginHistoryNavigation();
+  state.searchMinimumRating =
+    normalizeRating(state.searchMinimumRating) === normalized ? null : normalized;
+  state.searchPeopleLoaded = false;
+  renderMetadataBar();
+  await refreshSearchSurface();
+  commitHistoryNavigation(historyEntry);
+}
+
+function searchTagList(listName) {
+  return normalizeSearchTagListName(listName) === "include"
+    ? state.searchIncludeTags
+    : state.searchExcludeTags;
+}
+
+function normalizeSearchTagListName(listName) {
+  return listName === "exclude" ? "exclude" : "include";
+}
+
+function normalizeCombineMode(value) {
+  return value === "or" ? "or" : "and";
+}
+
 async function setCurrentFolderRating(rating) {
   const target = currentFolderMetadataTarget();
   rating = normalizeRating(rating);
@@ -1421,6 +2137,7 @@ async function setCurrentFolderRating(rating) {
   });
   applyCurrentFolderMetadata(metadata, target);
   invalidateFolderViewCache(target.rootId);
+  invalidateSearchCaches();
   await patchCurrentFolderFromDb({ keepStatus: true });
 }
 
@@ -1441,6 +2158,7 @@ async function addCurrentFolderPerson(name) {
   mergePeopleOptions(state.currentFolderMeta?.people ?? []);
   closePersonDropdown();
   invalidateFolderViewCache(target.rootId);
+  invalidateSearchCaches();
   await patchCurrentFolderFromDb({ keepStatus: true });
 }
 
@@ -1461,6 +2179,7 @@ async function addCurrentFolderTag(name) {
   mergeTagOptions(state.currentFolderMeta?.tags ?? []);
   closeTagDropdown();
   invalidateFolderViewCache(target.rootId);
+  invalidateSearchCaches();
   await patchCurrentFolderFromDb({ keepStatus: true });
 }
 
@@ -1477,6 +2196,7 @@ async function removeCurrentFolderPerson(personId) {
   });
   applyCurrentFolderMetadata(metadata, target);
   invalidateFolderViewCache(target.rootId);
+  invalidateSearchCaches();
   await patchCurrentFolderFromDb({ keepStatus: true });
 }
 
@@ -1493,6 +2213,7 @@ async function removeCurrentFolderTag(tagId) {
   });
   applyCurrentFolderMetadata(metadata, target);
   invalidateFolderViewCache(target.rootId);
+  invalidateSearchCaches();
   await patchCurrentFolderFromDb({ keepStatus: true });
 }
 
@@ -1512,6 +2233,655 @@ function applyCurrentFolderMetadata(metadata, target) {
   renderMetadataBar();
 }
 
+function invalidateSearchCaches() {
+  state.searchResults = [];
+  state.searchDisplayedFolders = [];
+  state.searchPersonResults = [];
+  state.searchPeopleLoaded = false;
+  state.searchPeopleFilterKey = "";
+  updateNavigationButtons();
+}
+
+function switchSearchNavigationToEditMode() {
+  if (!isFilterMode()) {
+    return;
+  }
+
+  state.metadataMode = APP_MODES.FOLDER;
+  closeSearchDropdowns();
+}
+
+function cloneSearchTags(tags) {
+  return tags.map((tag) => ({
+    id: Number(tag.id ?? Date.now()),
+    name: String(tag.name),
+  }));
+}
+
+function cloneSearchHistoryState() {
+  return {
+    person: state.searchPerson ? { name: state.searchPerson.name } : null,
+    includeTags: cloneSearchTags(state.searchIncludeTags),
+    includeCombine: normalizeCombineMode(state.searchIncludeCombine),
+    excludeTags: cloneSearchTags(state.searchExcludeTags),
+    excludeCombine: normalizeCombineMode(state.searchExcludeCombine),
+    minimumRating: normalizeRating(state.searchMinimumRating),
+    hierarchy: Boolean(state.searchHierarchy),
+  };
+}
+
+function applySearchHistoryState(search) {
+  state.searchPerson = search?.person?.name ? { name: String(search.person.name) } : null;
+  state.searchIncludeTags = cloneSearchTags(search?.includeTags ?? []);
+  state.searchIncludeCombine = normalizeCombineMode(search?.includeCombine);
+  state.searchExcludeTags = cloneSearchTags(search?.excludeTags ?? []);
+  state.searchExcludeCombine = normalizeCombineMode(search?.excludeCombine);
+  state.searchMinimumRating = normalizeRating(search?.minimumRating);
+  state.searchHierarchy = Boolean(search?.hierarchy);
+  state.searchPersonDropdownOpen = false;
+  state.searchPersonSearch = "";
+  state.searchTagDropdownTarget = null;
+  state.searchTagSearch = "";
+  state.searchSlideshowMenuOpen = false;
+}
+
+function currentHistoryEntry() {
+  return {
+    mode: state.metadataMode,
+    atRootOverview: Boolean(state.atRootOverview),
+    currentRootId: state.currentRootId,
+    currentPath: state.currentPath ?? "",
+    search: cloneSearchHistoryState(),
+    scroll: {
+      left: gridNode.scrollLeft,
+      top: gridNode.scrollTop,
+    },
+  };
+}
+
+function historyEntrySignature(entry) {
+  if (!entry) {
+    return "";
+  }
+
+  if (entry.mode === APP_MODES.FOLDER) {
+    return JSON.stringify({
+      mode: entry.mode,
+      atRootOverview: Boolean(entry.atRootOverview),
+      currentRootId: entry.currentRootId ?? null,
+      currentPath: entry.currentPath ?? "",
+    });
+  }
+
+  const search = entry.search ?? {};
+  return JSON.stringify({
+    mode: entry.mode,
+    person: search.person?.name ?? null,
+    includeTags: (search.includeTags ?? []).map((tag) => tag.name),
+    includeCombine: normalizeCombineMode(search.includeCombine),
+    excludeTags: (search.excludeTags ?? []).map((tag) => tag.name),
+    excludeCombine: normalizeCombineMode(search.excludeCombine),
+    minimumRating: normalizeRating(search.minimumRating),
+    hierarchy: entry.mode === APP_MODES.SEARCH ? Boolean(search.hierarchy) : false,
+  });
+}
+
+function beginHistoryNavigation() {
+  return state.restoringHistory ? null : currentHistoryEntry();
+}
+
+function commitHistoryNavigation(previousEntry) {
+  if (state.restoringHistory || !previousEntry) {
+    updateNavigationButtons();
+    return;
+  }
+
+  const currentEntry = currentHistoryEntry();
+  if (historyEntrySignature(previousEntry) === historyEntrySignature(currentEntry)) {
+    updateNavigationButtons();
+    return;
+  }
+
+  const lastEntry = state.historyBack[state.historyBack.length - 1];
+  if (historyEntrySignature(lastEntry) !== historyEntrySignature(previousEntry)) {
+    state.historyBack.push(previousEntry);
+    if (state.historyBack.length > 100) {
+      state.historyBack.shift();
+    }
+  }
+  state.historyForward = [];
+  updateNavigationButtons();
+}
+
+function canGoBackHistory() {
+  return state.historyBack.length > 0;
+}
+
+function canGoForwardHistory() {
+  return state.historyForward.length > 0;
+}
+
+function updateNavigationButtons() {
+  if (backButton) {
+    backButton.disabled = !canGoBackHistory();
+  }
+  if (forwardButton) {
+    forwardButton.disabled = !canGoForwardHistory();
+  }
+}
+
+function rescanButtonDisabled() {
+  return (
+    state.metadataMode !== APP_MODES.FOLDER ||
+    !state.currentRootId ||
+    state.activeScans.has(state.currentRootId)
+  );
+}
+
+function updateRescanButton() {
+  const button = metadataBar.querySelector("button[data-action='rescan-folder']");
+  if (button) {
+    button.disabled = rescanButtonDisabled();
+  }
+}
+
+async function goBackHistory() {
+  if (!canGoBackHistory()) {
+    return;
+  }
+
+  const currentEntry = currentHistoryEntry();
+  const targetEntry = state.historyBack.pop();
+  state.historyForward.push(currentEntry);
+  await restoreHistoryEntry(targetEntry);
+}
+
+async function goForwardHistory() {
+  if (!canGoForwardHistory()) {
+    return;
+  }
+
+  const currentEntry = currentHistoryEntry();
+  const targetEntry = state.historyForward.pop();
+  state.historyBack.push(currentEntry);
+  await restoreHistoryEntry(targetEntry);
+}
+
+async function restoreHistoryEntry(entry) {
+  if (!entry) {
+    updateNavigationButtons();
+    return;
+  }
+
+  state.restoringHistory = true;
+  try {
+    closeMetadataDropdowns();
+    closeSearchDropdowns();
+    applySearchHistoryState(entry.search);
+
+    if (entry.mode === APP_MODES.SEARCH || entry.mode === APP_MODES.PERSONS) {
+      state.metadataMode = entry.mode;
+      state.searchActive = false;
+      state.searchLoading = false;
+      state.searchRequestId += 1;
+      renderMetadataBar();
+      await refreshSearchSurface();
+      restoreSearchScroll(entry.scroll);
+      return;
+    }
+
+    state.metadataMode = APP_MODES.FOLDER;
+    state.searchActive = false;
+    state.searchLoading = false;
+    state.searchRequestId += 1;
+    if (entry.atRootOverview || !entry.currentRootId) {
+      state.viewScrollPositions.set(viewKey(null, ""), entry.scroll ?? { left: 0, top: 0 });
+      openRootOverview({ keepStatus: true });
+    } else {
+      state.viewScrollPositions.set(
+        viewKey(entry.currentRootId, entry.currentPath ?? ""),
+        entry.scroll ?? { left: 0, top: 0 },
+      );
+      await openFolder(entry.currentRootId, entry.currentPath ?? "", { keepStatus: true });
+    }
+  } finally {
+    state.restoringHistory = false;
+    updateNavigationButtons();
+  }
+}
+
+function renderCurrentLibrarySurface(options = {}) {
+  resetThumbnailWork();
+  updateBusyIndicator();
+  if (state.atRootOverview) {
+    renderRootOverview(options);
+    return;
+  }
+
+  if (!state.currentView) {
+    openRootOverview(options);
+    return;
+  }
+
+  if (state.currentView.folder_id === null) {
+    refreshCurrentFolder({ keepStatus: true, forceReload: true }).catch(showError);
+    return;
+  }
+
+  if (state.folderLoading) {
+    renderPendingFolderView(state.currentView, options);
+  } else {
+    renderFolderView(state.currentView, options);
+  }
+}
+
+async function refreshSearchSurface() {
+  if (!isFilterMode()) {
+    return;
+  }
+
+  prepareSearchSurface();
+  if (state.metadataMode === APP_MODES.PERSONS) {
+    state.searchPerson = null;
+    await loadSearchPeopleSurface();
+    return;
+  }
+
+  if (!searchHasFilters()) {
+    state.searchRequestId += 1;
+    state.searchLoading = false;
+    state.searchResults = [];
+    state.searchDisplayedFolders = [];
+    updateBusyIndicator();
+    setStatus("Choose search filters");
+    renderEmptyState("Choose search filters", { keepBreadcrumbs: true });
+    return;
+  }
+
+  await runMetadataSearch();
+}
+
+function prepareSearchSurface() {
+  if (!state.searchActive) {
+    rememberCurrentScrollPosition();
+  }
+
+  state.searchActive = true;
+  state.activeFolderRequestId = null;
+  state.folderLoading = false;
+  state.visibleValidationActive = false;
+  state.validatedVisibleKeys.clear();
+  clearValidationPatchTimer();
+  clearVisibleValidationTimer();
+  resetStreamRenderQueue();
+  resetThumbnailWork();
+  updateBusyIndicator();
+  titleNode.textContent =
+    state.metadataMode === APP_MODES.PERSONS ? "Persons" : "Search";
+  updateNavigationButtons();
+  breadcrumbsNode.replaceChildren();
+}
+
+function searchHasFilters() {
+  return Boolean(
+    state.searchPerson ||
+      state.searchIncludeTags.length > 0 ||
+      state.searchExcludeTags.length > 0 ||
+      normalizeRating(state.searchMinimumRating),
+  );
+}
+
+async function runMetadataSearch() {
+  if (!invoke) {
+    state.searchResults = [];
+    renderSearchResults();
+    return;
+  }
+
+  const requestId = ++state.searchRequestId;
+  state.searchLoading = true;
+  updateBusyIndicator();
+  setStatus("Searching metadata...");
+  renderEmptyState("Searching...", { keepBreadcrumbs: true });
+
+  try {
+    const results = await invoke("metadata_search", { query: searchQueryPayload() });
+    if (requestId !== state.searchRequestId || state.metadataMode !== APP_MODES.SEARCH) {
+      return;
+    }
+    state.searchResults = normalizeSearchFolders(results);
+    renderSearchResults();
+  } finally {
+    if (requestId === state.searchRequestId) {
+      state.searchLoading = false;
+      updateBusyIndicator();
+    }
+  }
+}
+
+function searchQueryPayload(options = {}) {
+  const personName =
+    Object.prototype.hasOwnProperty.call(options, "person")
+      ? options.person
+      : state.searchPerson?.name ?? null;
+  return {
+    person: personName,
+    include_tags: {
+      names: state.searchIncludeTags.map((tag) => tag.name),
+      combine: normalizeCombineMode(state.searchIncludeCombine),
+    },
+    exclude_tags: {
+      names: state.searchExcludeTags.map((tag) => tag.name),
+      combine: normalizeCombineMode(state.searchExcludeCombine),
+    },
+    minimum_rating: normalizeRating(state.searchMinimumRating),
+  };
+}
+
+function personsQueryPayload() {
+  return searchQueryPayload({ person: null });
+}
+
+function personsFilterKey() {
+  return JSON.stringify(personsQueryPayload());
+}
+
+function normalizeSearchFolders(folders) {
+  return Array.isArray(folders)
+    ? folders
+        .filter((folder) => folder?.root_id && Number.isFinite(Number(folder?.id)))
+        .map((folder) => ({
+          root_id: String(folder.root_id),
+          id: Number(folder.id),
+          relative_path: String(folder.relative_path ?? ""),
+          name: String(folder.name || folder.relative_path || rootDisplayName(folder.root_id)),
+          parent_relative_path:
+            folder.parent_relative_path === null ||
+            folder.parent_relative_path === undefined
+              ? null
+              : String(folder.parent_relative_path),
+          thumbnail_image_id: Number.isFinite(Number(folder.thumbnail_image_id))
+            ? Number(folder.thumbnail_image_id)
+            : null,
+          direct_keywords: Array.isArray(folder.direct_keywords)
+            ? folder.direct_keywords.map(String)
+            : [],
+          inherited_keywords: Array.isArray(folder.inherited_keywords)
+            ? folder.inherited_keywords.map(String)
+            : [],
+          direct_people: Array.isArray(folder.direct_people)
+            ? folder.direct_people.map(String)
+            : [],
+          inherited_people: Array.isArray(folder.inherited_people)
+            ? folder.inherited_people.map(String)
+            : [],
+          direct_rating: normalizeRating(folder.direct_rating),
+          inherited_rating: normalizeRating(folder.inherited_rating),
+          image_count: Number(folder.image_count ?? 0),
+          child_folder_count: Number(folder.child_folder_count ?? 0),
+        }))
+    : [];
+}
+
+function renderSearchResults(options = {}) {
+  prepareSearchSurface();
+  const folders = searchDisplayFolders();
+  state.searchDisplayedFolders = folders;
+  const total = state.searchResults.length;
+  renderMetadataBar();
+
+  if (folders.length === 0) {
+    setStatus(total === 0 ? "No matching folders" : "No final folders in results");
+    renderEmptyState("No matching folders", { keepBreadcrumbs: true });
+    restoreSearchScroll(options.restoreScroll);
+    return;
+  }
+
+  const label = state.searchHierarchy ? "hierarchy results" : "final folders";
+  setStatus(`${folders.length} ${label} from ${total} matching folders`);
+  gridNode.replaceChildren(...folders.map(renderSearchFolderCard));
+  restoreSearchScroll(options.restoreScroll);
+}
+
+function restoreSearchScroll(scroll) {
+  restoreGridScroll(scroll);
+}
+
+function restoreCurrentLibraryScrollPosition() {
+  const key = state.atRootOverview
+    ? viewKey(null, "")
+    : state.currentRootId
+      ? viewKey(state.currentRootId, state.currentPath)
+      : null;
+  if (!key) {
+    return;
+  }
+
+  restoreGridScroll(state.viewScrollPositions.get(key));
+}
+
+function restoreGridScroll(scroll) {
+  if (!scroll) {
+    return;
+  }
+
+  const left = Number(scroll.left) || 0;
+  const top = Number(scroll.top) || 0;
+  gridNode.scrollLeft = left;
+  gridNode.scrollTop = top;
+  requestAnimationFrame(() => {
+    gridNode.scrollLeft = left;
+    gridNode.scrollTop = top;
+  });
+}
+
+function searchDisplayFolders() {
+  const results = sortedSearchFolders(state.searchResults);
+  if (state.searchHierarchy) {
+    return topmostSearchFolders(results);
+  }
+
+  const finalFolders = results.filter((folder) => Number(folder.image_count) > 0);
+  return finalFolders.length > 0 ? finalFolders : results;
+}
+
+function sortedSearchFolders(folders) {
+  return [...folders].sort((left, right) =>
+    rootDisplayName(left.root_id)
+      .toLowerCase()
+      .localeCompare(rootDisplayName(right.root_id).toLowerCase())
+      || left.relative_path
+        .toLowerCase()
+        .localeCompare(right.relative_path.toLowerCase())
+      || left.id - right.id,
+  );
+}
+
+function topmostSearchFolders(folders) {
+  const displayed = [];
+  for (const folder of folders) {
+    const covered = displayed.some(
+      (candidate) =>
+        candidate.root_id === folder.root_id &&
+        pathContainsPath(candidate.relative_path, folder.relative_path),
+    );
+    if (!covered) {
+      displayed.push(folder);
+    }
+  }
+  return displayed;
+}
+
+function renderSearchFolderCard(folder) {
+  const card = document.createElement("article");
+  card.className = "tile folder-tile search-result-tile";
+  card.tabIndex = 0;
+  card.title = fullFolderPath(folder);
+  card.dataset.rootId = folder.root_id;
+  card.dataset.folderPath = folder.relative_path;
+  card.dataset.itemKey = `search:${folder.root_id}:${folder.relative_path}`;
+  card.dataset.summarySignature = folderSummarySignature(folder);
+  card.innerHTML = `
+    <div class="thumb">
+      <span>${escapeHtml(initials(folder.name))}</span>
+      ${renderFolderRatingBadge(folder)}
+    </div>
+    <div class="tile-body">
+      <h3>${escapeHtml(folder.name || rootDisplayName(folder.root_id))}</h3>
+      <p>${escapeHtml(searchFolderSubtitle(folder))}</p>
+      ${renderTags(folder)}
+    </div>
+  `;
+
+  const thumb = card.querySelector(".thumb");
+  sizeTile(card);
+  thumb.title = fullFolderPath(folder);
+  if (folder.thumbnail_image_id) {
+    requestThumbnailWhenVisible(
+      folder.root_id,
+      folder.thumbnail_image_id,
+      thumb,
+      THUMBNAIL_PIXEL_SIZE,
+    );
+  }
+
+  card.addEventListener("click", () => openFolderFromSearchResult(folder));
+  card.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      openFolderFromSearchResult(folder);
+    }
+  });
+  return card;
+}
+
+function openFolderFromSearchResult(folder) {
+  openFolder(folder.root_id, folder.relative_path).catch(showError);
+}
+
+function searchFolderSubtitle(folder) {
+  const path = folder.relative_path ? ` / ${folder.relative_path}` : "";
+  return `${rootDisplayName(folder.root_id)}${path} - ${folder.image_count} images - ${folder.child_folder_count} folders`;
+}
+
+async function loadSearchPeopleSurface() {
+  prepareSearchSurface();
+  if (!invoke) {
+    state.searchPersonResults = [];
+    renderSearchPeople();
+    return;
+  }
+
+  const filterKey = personsFilterKey();
+  if (state.searchPeopleLoaded && state.searchPeopleFilterKey === filterKey) {
+    renderSearchPeople();
+    return;
+  }
+
+  const requestId = ++state.searchRequestId;
+  state.searchLoading = true;
+  updateBusyIndicator();
+  setStatus("Loading persons...");
+  renderEmptyState("Loading persons...", { keepBreadcrumbs: true });
+
+  try {
+    const people = await invoke("metadata_filtered_person_thumbnails", {
+      query: personsQueryPayload(),
+    });
+    if (requestId !== state.searchRequestId || state.metadataMode !== APP_MODES.PERSONS) {
+      return;
+    }
+    state.searchPersonResults = normalizeSearchPeople(people);
+    state.searchPeopleLoaded = true;
+    state.searchPeopleFilterKey = filterKey;
+    renderSearchPeople();
+  } finally {
+    if (requestId === state.searchRequestId) {
+      state.searchLoading = false;
+      updateBusyIndicator();
+    }
+  }
+}
+
+function normalizeSearchPeople(people) {
+  return Array.isArray(people)
+    ? people
+        .filter((person) => person?.name)
+        .map((person) => ({
+          id: Number(person.id ?? 0),
+          name: String(person.name),
+          root_id: person.root_id ? String(person.root_id) : null,
+          thumbnail_image_id: Number.isFinite(Number(person.thumbnail_image_id))
+            ? Number(person.thumbnail_image_id)
+            : null,
+          folder_count: Number(person.folder_count ?? 0),
+        }))
+        .sort((left, right) =>
+          left.name.localeCompare(right.name, undefined, { sensitivity: "base" }),
+        )
+    : [];
+}
+
+function renderSearchPeople(options = {}) {
+  prepareSearchSurface();
+  const people = state.searchPersonResults;
+  if (people.length === 0) {
+    const message = personFiltersActive() ? "No matching persons" : "No persons in metadata";
+    setStatus(message);
+    renderEmptyState(message, { keepBreadcrumbs: true });
+    restoreSearchScroll(options.restoreScroll);
+    return;
+  }
+
+  setStatus(`${people.length} ${personFiltersActive() ? "matching " : ""}persons`);
+  gridNode.replaceChildren(...people.map(renderSearchPersonCard));
+  restoreSearchScroll(options.restoreScroll);
+}
+
+function renderSearchPersonCard(person) {
+  const card = document.createElement("article");
+  card.className = "tile person-result-tile";
+  card.tabIndex = 0;
+  card.title = person.name;
+  card.innerHTML = `
+    <div class="thumb person-result-thumb">
+      <span>${escapeHtml(initials(person.name))}</span>
+    </div>
+    <div class="tile-body">
+      <h3>${escapeHtml(person.name)}</h3>
+      <p>${person.folder_count} folders</p>
+    </div>
+  `;
+
+  const thumb = card.querySelector(".thumb");
+  sizeTile(card);
+  if (person.root_id && person.thumbnail_image_id) {
+    requestThumbnailWhenVisible(
+      person.root_id,
+      person.thumbnail_image_id,
+      thumb,
+      THUMBNAIL_PIXEL_SIZE,
+    );
+  }
+
+  card.addEventListener("click", () => {
+    setSearchPerson(person.name, { switchToSearch: true }).catch(showError);
+  });
+  card.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      setSearchPerson(person.name, { switchToSearch: true }).catch(showError);
+    }
+  });
+  return card;
+}
+
+function personFiltersActive() {
+  return Boolean(
+    state.searchIncludeTags.length > 0 ||
+      state.searchExcludeTags.length > 0 ||
+      normalizeRating(state.searchMinimumRating),
+  );
+}
+
 function renderFolderView(view, options = {}) {
   const root = currentRoot();
   const title = view.relative_path || root.display_name;
@@ -1521,8 +2891,7 @@ function renderFolderView(view, options = {}) {
       `${view.folders.length} folders, ${view.images.length} images in this folder`,
     );
   }
-  upButton.disabled = false;
-  scanButton.disabled = state.activeScans.has(view.root_id);
+  updateNavigationButtons();
   renderBreadcrumbs(view);
 
   const nodes = [
@@ -1546,8 +2915,7 @@ function patchFolderViewInPlace(view, options = {}) {
       `${view.folders.length} folders, ${view.images.length} images in this folder`,
     );
   }
-  upButton.disabled = false;
-  scanButton.disabled = state.activeScans.has(view.root_id);
+  updateNavigationButtons();
   renderBreadcrumbs(view);
   state.currentView = cloneFolderView(view);
 
@@ -1614,8 +2982,7 @@ function renderPendingFolderView(view, options = {}) {
     const scanning = state.activeScans.has(view.root_id);
     setStatus(scanning ? "Loading indexed folders while scan continues..." : "Loading folder...");
   }
-  upButton.disabled = false;
-  scanButton.disabled = state.activeScans.has(view.root_id);
+  updateNavigationButtons();
   renderMetadataBar();
   renderBreadcrumbs(view);
   gridNode.replaceChildren();
@@ -1631,8 +2998,7 @@ function startStreamedFolderView(header) {
   };
   state.currentPath = header.relative_path;
   titleNode.textContent = header.relative_path || header.root_display_name;
-  upButton.disabled = false;
-  scanButton.disabled = state.activeScans.has(header.root_id);
+  updateNavigationButtons();
   renderMetadataBar();
   loadCurrentFolderMetadata().catch(showError);
   renderBreadcrumbs(state.currentView);
@@ -2128,6 +3494,10 @@ function trimMapToSize(map, maxEntries) {
 }
 
 function rememberCurrentScrollPosition() {
+  if (state.searchActive) {
+    return;
+  }
+
   if (state.atRootOverview) {
     state.viewScrollPositions.set(viewKey(null, ""), {
       left: gridNode.scrollLeft,
@@ -2196,6 +3566,7 @@ function renderBreadcrumbs(view) {
       button.textContent = crumb.label;
       button.disabled = index === crumbs.length - 1;
       button.addEventListener("click", () => {
+        switchSearchNavigationToEditMode();
         if (crumb.rootOverview) {
           openRootOverview();
         } else {
@@ -2331,8 +3702,70 @@ async function setCurrentFolderCover(image) {
     folderId: state.currentView.folder_id,
     imageId: image.id,
   });
-  invalidateFolderViewCache(image.root_id, parentPathFor(state.currentPath));
+  await refreshAfterFolderCoverChange(image.root_id, state.currentPath);
   setStatus(`Cover set to ${image.file_name}`);
+}
+
+async function setParentFolderCoverFromFolder(folder) {
+  const imageId = Number(folder?.thumbnail_image_id);
+  const parentRelativePath = folderParentRelativePath(folder);
+  if (!Number.isFinite(imageId) || parentRelativePath === null) {
+    return;
+  }
+
+  await invoke("set_folder_thumbnail_by_path", {
+    rootId: folder.root_id,
+    relativePath: parentRelativePath,
+    imageId,
+  });
+  await refreshAfterFolderCoverChange(folder.root_id, parentRelativePath);
+  const parentName = parentRelativePath || rootDisplayName(folder.root_id);
+  setStatus(`${folder.name} set as cover for ${parentName}`);
+}
+
+async function refreshAfterFolderCoverChange(rootId, relativePath) {
+  const searchScroll = state.searchActive
+    ? { left: gridNode.scrollLeft, top: gridNode.scrollTop }
+    : null;
+  const containingPath = parentPathFor(relativePath);
+
+  if (containingPath === null) {
+    await refreshOverview();
+  } else {
+    invalidateFolderViewCache(rootId, containingPath);
+    if (
+      !state.searchActive &&
+      state.currentRootId === rootId &&
+      state.currentPath === containingPath
+    ) {
+      await refreshCurrentFolder({ keepStatus: true, forceReload: true, quiet: true });
+    }
+  }
+
+  if (state.searchActive) {
+    invalidateSearchCaches();
+    await refreshSearchSurface();
+    restoreSearchScroll(searchScroll);
+  }
+}
+
+function folderParentRelativePath(folder) {
+  if (!folder) {
+    return null;
+  }
+
+  if (folder.parent_relative_path !== null && folder.parent_relative_path !== undefined) {
+    return String(folder.parent_relative_path);
+  }
+
+  return parentPathFor(folder.relative_path);
+}
+
+function canSetParentCoverFromFolder(folder) {
+  return (
+    folderParentRelativePath(folder) !== null &&
+    Number.isFinite(Number(folder?.thumbnail_image_id))
+  );
 }
 
 function handleDocumentContextMenu(event) {
@@ -2358,7 +3791,7 @@ function handleDocumentContextMenu(event) {
 
   const folderTile = event.target.closest(".folder-tile");
   if (folderTile) {
-    const folder = folderByPath(folderTile.dataset.folderPath);
+    const folder = folderFromTile(folderTile);
     if (!folder) {
       hideThumbContextMenu();
       return;
@@ -2367,19 +3800,21 @@ function handleDocumentContextMenu(event) {
     state.contextMenuFolder = folder;
     state.contextMenuImage = null;
     state.contextMenuRoot = null;
-    showContextMenu(
-      [
-        { action: "play-folder-slideshow", label: "Play slideshow" },
-        {
-          action: "play-folder-slideshow-random",
-          label: "Play slideshow randomized",
-        },
-        { action: "show-explorer", label: "Show in Explorer" },
-        { action: "recycle", label: "Move to recycle bin" },
-      ],
-      event.clientX,
-      event.clientY,
-    );
+    const items = [
+      { action: "play-folder-slideshow", label: "Play slideshow" },
+      {
+        action: "play-folder-slideshow-random",
+        label: "Play slideshow randomized",
+      },
+      { action: "show-explorer", label: "Show in Explorer" },
+    ];
+    if (canSetParentCoverFromFolder(folder)) {
+      items.unshift({ action: "set-parent-cover", label: "Set as parent cover" });
+    }
+    if (folder.relative_path) {
+      items.push({ action: "recycle", label: "Move to recycle bin" });
+    }
+    showContextMenu(items, event.clientX, event.clientY);
     return;
   }
 
@@ -2411,6 +3846,24 @@ function handleDocumentClick(event) {
   if (state.tagDropdownOpen && shouldCloseTagDropdownForClick(event.target)) {
     closeTagDropdown();
   }
+  if (
+    state.searchPersonDropdownOpen &&
+    shouldCloseSearchPersonDropdownForClick(event.target)
+  ) {
+    closeSearchPersonDropdown();
+  }
+  if (
+    state.searchTagDropdownTarget &&
+    shouldCloseSearchTagDropdownForClick(event.target)
+  ) {
+    closeSearchTagDropdown();
+  }
+  if (
+    state.searchSlideshowMenuOpen &&
+    shouldCloseSearchSlideshowMenuForClick(event.target)
+  ) {
+    closeSearchSlideshowMenu();
+  }
 }
 
 function shouldClosePersonDropdownForClick(target) {
@@ -2428,6 +3881,36 @@ function shouldCloseTagDropdownForClick(target) {
     return false;
   }
   if (target.closest("button[data-action='toggle-tag-dropdown']")) {
+    return false;
+  }
+  return true;
+}
+
+function shouldCloseSearchPersonDropdownForClick(target) {
+  if (target.closest(".search-person-dropdown")) {
+    return false;
+  }
+  if (target.closest("button[data-action='toggle-search-person-dropdown']")) {
+    return false;
+  }
+  return true;
+}
+
+function shouldCloseSearchTagDropdownForClick(target) {
+  if (target.closest(".search-tag-dropdown")) {
+    return false;
+  }
+  if (target.closest("button[data-action='toggle-search-tag-dropdown']")) {
+    return false;
+  }
+  return true;
+}
+
+function shouldCloseSearchSlideshowMenuForClick(target) {
+  if (target.closest(".search-slideshow-menu")) {
+    return false;
+  }
+  if (target.closest("button[data-action='toggle-search-slideshow-menu']")) {
     return false;
   }
   return true;
@@ -2453,6 +3936,8 @@ async function handleThumbContextAction(event) {
       await playFolderSlideshow(folder, { randomized: false });
     } else if (action === "play-folder-slideshow-random" && folder) {
       await playFolderSlideshow(folder, { randomized: true });
+    } else if (action === "set-parent-cover" && folder) {
+      await setParentFolderCoverFromFolder(folder);
     } else if (action === "set-cover" && image) {
       await setCurrentFolderCover(image);
     } else if (action === "rotate-right" && image) {
@@ -2570,6 +4055,10 @@ async function moveImageToRecycleBin(image) {
 
 async function moveFolderToRecycleBin(folder) {
   const folderName = folder.name || folder.relative_path || "folder";
+  const wasSearchActive = state.searchActive;
+  const searchScroll = wasSearchActive
+    ? { left: gridNode.scrollLeft, top: gridNode.scrollTop }
+    : null;
   setStatus(`Moving ${folderName} to recycle bin...`);
   await invoke("move_folder_to_recycle_bin", {
     rootId: folder.root_id,
@@ -2579,6 +4068,13 @@ async function moveFolderToRecycleBin(folder) {
   state.imageDimensionCache.clear();
   invalidateThumbnailDataCache(folder.root_id);
   invalidateFolderViewCache(folder.root_id);
+  removeFolderFromCachedSearch(folder);
+
+  if (wasSearchActive) {
+    renderSearchResults({ restoreScroll: searchScroll });
+    setStatus(`Moved ${folderName} to recycle bin`);
+    return;
+  }
 
   if (
     state.currentRootId === folder.root_id &&
@@ -2595,6 +4091,20 @@ async function moveFolderToRecycleBin(folder) {
   setStatus(`Moved ${folderName} to recycle bin`);
 }
 
+function removeFolderFromCachedSearch(folder) {
+  state.searchResults = state.searchResults.filter(
+    (candidate) =>
+      candidate.root_id !== folder.root_id ||
+      !pathContainsPath(folder.relative_path, candidate.relative_path),
+  );
+  state.searchDisplayedFolders = state.searchDisplayedFolders.filter(
+    (candidate) =>
+      candidate.root_id !== folder.root_id ||
+      !pathContainsPath(folder.relative_path, candidate.relative_path),
+  );
+  state.searchPeopleLoaded = false;
+}
+
 async function playFolderSlideshow(folder, options = {}) {
   if (!invoke) {
     return;
@@ -2607,6 +4117,53 @@ async function playFolderSlideshow(folder, options = {}) {
   });
   if (!images || images.length === 0) {
     setStatus(`${folder.name} has no images`);
+    return;
+  }
+
+  startPlaylistSlideshow(images, options);
+}
+
+function searchSlideshowAvailable() {
+  return state.metadataMode === APP_MODES.SEARCH && searchDisplayFolders().length > 0;
+}
+
+async function playSearchResultsSlideshow(options = {}) {
+  if (!invoke) {
+    return;
+  }
+
+  const folders = searchDisplayFolders();
+  if (folders.length === 0) {
+    setStatus("No search results to play");
+    return;
+  }
+
+  const requestId = state.searchRequestId;
+  const images = [];
+  const seenImages = new Set();
+  setStatus(`Loading slideshow from ${folders.length} search results...`);
+
+  for (const folder of folders) {
+    const folderImages = await invoke("recursive_folder_images", {
+      rootId: folder.root_id,
+      relativePath: folder.relative_path,
+    });
+    if (requestId !== state.searchRequestId || state.metadataMode !== APP_MODES.SEARCH) {
+      return;
+    }
+
+    for (const image of folderImages ?? []) {
+      const key = `${image.root_id}:${image.id}`;
+      if (seenImages.has(key)) {
+        continue;
+      }
+      seenImages.add(key);
+      images.push(image);
+    }
+  }
+
+  if (images.length === 0) {
+    setStatus("Search results have no images");
     return;
   }
 
@@ -2644,14 +4201,41 @@ function imageIndexById(imageId) {
   return state.currentView?.images.findIndex((image) => image.id === imageId) ?? -1;
 }
 
-function folderByPath(relativePath) {
+function folderFromTile(tile) {
+  const rootId = tile.dataset.rootId;
+  const relativePath = tile.dataset.folderPath ?? "";
+  if (state.searchActive) {
+    return searchFolderByPath(rootId, relativePath);
+  }
+  return folderByPath(rootId, relativePath);
+}
+
+function folderByPath(rootId, relativePath) {
   return (
-    state.currentView?.folders.find((folder) => folder.relative_path === relativePath) ?? null
+    state.currentView?.folders.find(
+      (folder) => folder.root_id === rootId && folder.relative_path === relativePath,
+    ) ?? null
+  );
+}
+
+function searchFolderByPath(rootId, relativePath) {
+  return (
+    state.searchDisplayedFolders.find(
+      (folder) => folder.root_id === rootId && folder.relative_path === relativePath,
+    ) ??
+    state.searchResults.find(
+      (folder) => folder.root_id === rootId && folder.relative_path === relativePath,
+    ) ??
+    null
   );
 }
 
 function rootById(rootId) {
   return state.roots.find((root) => root.id === rootId) ?? null;
+}
+
+function rootDisplayName(rootId) {
+  return rootById(rootId)?.display_name ?? "Root";
 }
 
 function fullFolderPath(folder) {
@@ -3319,6 +4903,10 @@ function busyMessage() {
 
   if (state.visibleValidationActive) {
     return "Checking visible folders";
+  }
+
+  if (state.searchLoading) {
+    return state.metadataMode === APP_MODES.PERSONS ? "Loading persons" : "Searching";
   }
 
   if (state.activeScans.size === 0) {

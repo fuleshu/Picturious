@@ -1,6 +1,7 @@
 use crate::models::{
     FolderMetadata, FolderSummary, FolderView, FolderViewHeader, ImageMetadata, ImageSummary,
-    MetadataTag, ScanProgress, ScanReport,
+    MetadataCombineMode, MetadataPersonSummary, MetadataSearchQuery, MetadataTag, ScanProgress,
+    ScanReport,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
@@ -570,6 +571,12 @@ impl RootDatabase {
         Ok(())
     }
 
+    pub fn set_folder_thumbnail_by_path(&self, relative_path: &str, image_id: i64) -> Result<()> {
+        let normalized_relative_path = normalize_relative_path(relative_path);
+        let folder_id = self.folder_id(&normalized_relative_path)?;
+        self.set_folder_thumbnail(folder_id, image_id)
+    }
+
     pub fn folder_metadata(&self, root_id: &str, folder_id: i64) -> Result<FolderMetadata> {
         let relative_path = self.folder_relative_path(folder_id)?;
         let rating = self.folder_rating(folder_id)?;
@@ -631,6 +638,54 @@ impl RootDatabase {
             .query_map([], metadata_tag_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(keywords)
+    }
+
+    pub fn search_folders(
+        &self,
+        root_id: &str,
+        query: &MetadataSearchQuery,
+    ) -> Result<Vec<FolderSummary>> {
+        let query = NormalizedSearchQuery::from_query(query);
+        let mut folders = Vec::new();
+
+        for row in self.candidate_search_folder_rows(&query)? {
+            let summary = self.folder_summary(
+                root_id,
+                ROOT_RELATIVE_PATH,
+                row.id,
+                row.relative_path,
+                row.parent_relative_path,
+                row.selected_thumbnail_image_id,
+                row.image_count,
+                row.child_folder_count,
+            )?;
+            if folder_matches_search(&summary, &query) {
+                folders.push(summary);
+            }
+        }
+
+        Ok(folders)
+    }
+
+    pub fn person_summaries(&self, root_id: &str) -> Result<Vec<MetadataPersonSummary>> {
+        let folder_counts = self.effective_person_final_folder_counts()?;
+        self.people()?
+            .into_iter()
+            .map(|person| {
+                let thumbnail_image_id = self.person_thumbnail_image_id(person.id)?;
+                let folder_count = folder_counts
+                    .get(&normalize_search_name(&person.name))
+                    .copied()
+                    .unwrap_or(0);
+                Ok(MetadataPersonSummary {
+                    id: person.id,
+                    name: person.name,
+                    root_id: Some(root_id.to_owned()),
+                    thumbnail_image_id,
+                    folder_count,
+                })
+            })
+            .collect()
     }
 
     pub fn add_folder_person(
@@ -905,6 +960,12 @@ impl RootDatabase {
                 FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE CASCADE
             );
 
+            CREATE INDEX IF NOT EXISTS idx_folder_people_person
+                ON folder_people(person_id);
+
+            CREATE INDEX IF NOT EXISTS idx_folder_keywords_keyword
+                ON folder_keywords(keyword_id);
+
             CREATE TABLE IF NOT EXISTS ratings (
                 id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL UNIQUE
@@ -916,6 +977,9 @@ impl RootDatabase {
                 FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE CASCADE,
                 FOREIGN KEY(rating_id) REFERENCES ratings(id) ON DELETE RESTRICT
             );
+
+            CREATE INDEX IF NOT EXISTS idx_folder_ratings_rating
+                ON folder_ratings(rating_id);
 
             CREATE TABLE IF NOT EXISTS image_keywords (
                 image_id INTEGER NOT NULL,
@@ -1276,6 +1340,311 @@ impl RootDatabase {
             Ok(())
         })?;
         Ok(folder_rows)
+    }
+
+    fn candidate_search_folder_rows(
+        &self,
+        query: &NormalizedSearchQuery,
+    ) -> Result<Vec<FolderRow>> {
+        if let Some(person) = query.person.as_deref() {
+            return self.search_folder_rows_for_person(person);
+        }
+
+        if !query.include_tags.is_empty() {
+            return self
+                .search_folder_rows_for_include_tags(&query.include_tags, &query.include_combine);
+        }
+
+        if let Some(minimum_rating) = query.minimum_rating {
+            return self.search_folder_rows_for_minimum_rating(minimum_rating);
+        }
+
+        self.search_folder_rows()
+    }
+
+    fn search_folder_rows(&self) -> Result<Vec<FolderRow>> {
+        let mut statement = self.connection.prepare(
+            "
+            SELECT
+                id,
+                relative_path,
+                parent_relative_path,
+                selected_thumbnail_image_id,
+                content_hash IS NOT NULL AND validated_at_unix_ms > 0 AS validated,
+                (SELECT COUNT(*) FROM images WHERE folder_id = folders.id) AS image_count,
+                (SELECT COUNT(*) FROM folders AS child
+                    WHERE child.parent_relative_path = folders.relative_path) AS child_folder_count
+            FROM folders
+            ORDER BY relative_path COLLATE NOCASE
+            ",
+        )?;
+
+        let rows = statement
+            .query_map([], |row| {
+                Ok(FolderRow {
+                    id: row.get::<_, i64>(0)?,
+                    relative_path: row.get::<_, String>(1)?,
+                    parent_relative_path: row.get::<_, Option<String>>(2)?,
+                    selected_thumbnail_image_id: row.get::<_, Option<i64>>(3)?,
+                    validated: row.get::<_, i64>(4)? != 0,
+                    image_count: row.get::<_, i64>(5)?.max(0) as u32,
+                    child_folder_count: row.get::<_, i64>(6)?.max(0) as u32,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn search_folder_rows_for_person(&self, person_name: &str) -> Result<Vec<FolderRow>> {
+        let assigned_paths = self.person_assigned_folder_paths(person_name)?;
+        self.search_folder_rows_for_assigned_paths(assigned_paths)
+    }
+
+    fn search_folder_rows_for_include_tags(
+        &self,
+        tag_names: &[String],
+        combine: &MetadataCombineMode,
+    ) -> Result<Vec<FolderRow>> {
+        let mut assigned_paths = Vec::new();
+        let tag_names = match combine {
+            MetadataCombineMode::And => tag_names.iter().take(1).collect::<Vec<_>>(),
+            MetadataCombineMode::Or => tag_names.iter().collect::<Vec<_>>(),
+        };
+
+        for tag_name in tag_names {
+            assigned_paths.extend(self.keyword_assigned_folder_paths(tag_name)?);
+        }
+
+        self.search_folder_rows_for_assigned_paths(assigned_paths)
+    }
+
+    fn search_folder_rows_for_minimum_rating(&self, minimum_rating: u8) -> Result<Vec<FolderRow>> {
+        let assigned_paths = self.rating_assigned_folder_paths(minimum_rating)?;
+        self.search_folder_rows_for_assigned_paths(assigned_paths)
+    }
+
+    fn search_folder_rows_for_assigned_paths(
+        &self,
+        assigned_paths: Vec<String>,
+    ) -> Result<Vec<FolderRow>> {
+        let mut rows_by_id = HashMap::new();
+        for relative_path in assigned_paths {
+            for row in self.subtree_folder_rows(&relative_path)? {
+                rows_by_id.entry(row.id).or_insert(row);
+            }
+        }
+
+        let mut rows = rows_by_id.into_values().collect::<Vec<_>>();
+        rows.sort_by(|left, right| {
+            left.relative_path
+                .to_lowercase()
+                .cmp(&right.relative_path.to_lowercase())
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(rows)
+    }
+
+    fn keyword_assigned_folder_paths(&self, keyword_name: &str) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "
+            SELECT folders.relative_path
+            FROM folders
+            INNER JOIN folder_keywords ON folder_keywords.folder_id = folders.id
+            INNER JOIN keywords ON keywords.id = folder_keywords.keyword_id
+            WHERE keywords.name = ?1 COLLATE NOCASE
+            ORDER BY folders.relative_path COLLATE NOCASE
+            ",
+        )?;
+        let paths = statement
+            .query_map(params![keyword_name], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(paths)
+    }
+
+    fn rating_assigned_folder_paths(&self, minimum_rating: u8) -> Result<Vec<String>> {
+        let minimum_rating_id = rating_id_for_value(minimum_rating)?;
+        let mut statement = self.connection.prepare(
+            "
+            SELECT folders.relative_path
+            FROM folders
+            INNER JOIN folder_ratings ON folder_ratings.folder_id = folders.id
+            WHERE folder_ratings.rating_id >= ?1
+            ORDER BY folders.relative_path COLLATE NOCASE
+            ",
+        )?;
+        let paths = statement
+            .query_map(params![minimum_rating_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(paths)
+    }
+
+    fn person_assigned_folder_paths(&self, person_name: &str) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "
+            SELECT folders.relative_path
+            FROM folders
+            INNER JOIN folder_people ON folder_people.folder_id = folders.id
+            INNER JOIN people ON people.id = folder_people.person_id
+            WHERE people.name = ?1 COLLATE NOCASE
+            ORDER BY folders.relative_path COLLATE NOCASE
+            ",
+        )?;
+        let paths = statement
+            .query_map(params![person_name], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(paths)
+    }
+
+    fn subtree_folder_rows(&self, relative_path: &str) -> Result<Vec<FolderRow>> {
+        let normalized_relative_path = normalize_relative_path(relative_path);
+        if normalized_relative_path.is_empty() {
+            return self.search_folder_rows();
+        }
+
+        let lower_bound = format!("{normalized_relative_path}/");
+        let upper_bound = format!("{lower_bound}\u{10ffff}");
+        let mut statement = self.connection.prepare(
+            "
+            SELECT
+                id,
+                relative_path,
+                parent_relative_path,
+                selected_thumbnail_image_id,
+                content_hash IS NOT NULL AND validated_at_unix_ms > 0 AS validated,
+                (SELECT COUNT(*) FROM images WHERE folder_id = folders.id) AS image_count,
+                (SELECT COUNT(*) FROM folders AS child
+                    WHERE child.parent_relative_path = folders.relative_path) AS child_folder_count
+            FROM folders
+            WHERE relative_path = ?1
+                OR (relative_path >= ?2 AND relative_path < ?3)
+            ORDER BY relative_path COLLATE NOCASE
+            ",
+        )?;
+
+        let rows = statement
+            .query_map(
+                params![normalized_relative_path, lower_bound, upper_bound],
+                |row| {
+                    Ok(FolderRow {
+                        id: row.get::<_, i64>(0)?,
+                        relative_path: row.get::<_, String>(1)?,
+                        parent_relative_path: row.get::<_, Option<String>>(2)?,
+                        selected_thumbnail_image_id: row.get::<_, Option<i64>>(3)?,
+                        validated: row.get::<_, i64>(4)? != 0,
+                        image_count: row.get::<_, i64>(5)?.max(0) as u32,
+                        child_folder_count: row.get::<_, i64>(6)?.max(0) as u32,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn final_folder_ids_in_subtree(&self, relative_path: &str) -> Result<Vec<i64>> {
+        let normalized_relative_path = normalize_relative_path(relative_path);
+        let (where_clause, params): (&str, Vec<String>) = if normalized_relative_path.is_empty() {
+            ("", Vec::new())
+        } else {
+            let lower_bound = format!("{normalized_relative_path}/");
+            let upper_bound = format!("{lower_bound}\u{10ffff}");
+            (
+                "AND (folders.relative_path = ?1 OR (folders.relative_path >= ?2 AND folders.relative_path < ?3))",
+                vec![normalized_relative_path, lower_bound, upper_bound],
+            )
+        };
+        let sql = format!(
+            "
+            SELECT folders.id
+            FROM folders
+            WHERE EXISTS(
+                SELECT 1
+                FROM images
+                WHERE images.folder_id = folders.id
+            )
+            {where_clause}
+            "
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let ids = match params.as_slice() {
+            [] => statement
+                .query_map([], |row| row.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            [relative_path, lower_bound, upper_bound] => statement
+                .query_map(params![relative_path, lower_bound, upper_bound], |row| {
+                    row.get::<_, i64>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            _ => Vec::new(),
+        };
+        Ok(ids)
+    }
+
+    fn person_thumbnail_image_id(&self, person_id: i64) -> Result<Option<i64>> {
+        let thumbnail_folder = self
+            .connection
+            .query_row(
+                "
+                SELECT folders.id, folders.relative_path, folders.selected_thumbnail_image_id
+                FROM folders
+                INNER JOIN folder_people ON folder_people.folder_id = folders.id
+                WHERE folder_people.person_id = ?1
+                ORDER BY folders.relative_path COLLATE NOCASE
+                LIMIT 1
+                ",
+                params![person_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("could not read person thumbnail folder")?;
+
+        Ok(thumbnail_folder
+            .map(|(folder_id, relative_path, selected_thumbnail_image_id)| {
+                self.thumbnail_image_id(folder_id, &relative_path, selected_thumbnail_image_id)
+            })
+            .transpose()?
+            .flatten())
+    }
+
+    fn effective_person_final_folder_counts(&self) -> Result<HashMap<String, u32>> {
+        let mut statement = self.connection.prepare(
+            "
+            SELECT people.name, folders.relative_path
+            FROM people
+            INNER JOIN folder_people ON folder_people.person_id = people.id
+            INNER JOIN folders ON folders.id = folder_people.folder_id
+            ORDER BY people.name COLLATE NOCASE, folders.relative_path COLLATE NOCASE
+            ",
+        )?;
+        let assignments = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut folder_ids_by_person = HashMap::<String, HashSet<i64>>::new();
+        for (person_name, relative_path) in assignments {
+            let person_key = normalize_search_name(&person_name);
+            if person_key.is_empty() {
+                continue;
+            }
+
+            let folder_ids = self.final_folder_ids_in_subtree(&relative_path)?;
+            folder_ids_by_person
+                .entry(person_key)
+                .or_default()
+                .extend(folder_ids);
+        }
+
+        Ok(folder_ids_by_person
+            .into_iter()
+            .map(|(person, folders)| (person, folders.len().min(u32::MAX as usize) as u32))
+            .collect())
     }
 
     fn for_each_direct_child_folder_row<F>(
@@ -1970,6 +2339,106 @@ fn fnv_update_byte(hash: &mut u64, byte: u8) {
     *hash = hash.wrapping_mul(FNV_PRIME);
 }
 
+struct NormalizedSearchQuery {
+    person: Option<String>,
+    include_tags: Vec<String>,
+    include_combine: MetadataCombineMode,
+    exclude_tags: Vec<String>,
+    exclude_combine: MetadataCombineMode,
+    minimum_rating: Option<u8>,
+}
+
+impl NormalizedSearchQuery {
+    fn from_query(query: &MetadataSearchQuery) -> Self {
+        Self {
+            person: query
+                .person
+                .as_deref()
+                .map(normalize_search_name)
+                .filter(|name| !name.is_empty()),
+            include_tags: normalized_search_names(&query.include_tags.names),
+            include_combine: query.include_tags.combine.clone(),
+            exclude_tags: normalized_search_names(&query.exclude_tags.names),
+            exclude_combine: query.exclude_tags.combine.clone(),
+            minimum_rating: query
+                .minimum_rating
+                .filter(|rating| (1..=5).contains(rating)),
+        }
+    }
+}
+
+fn folder_matches_search(folder: &FolderSummary, query: &NormalizedSearchQuery) -> bool {
+    let people = effective_name_set(&folder.direct_people, &folder.inherited_people);
+    if let Some(person) = query.person.as_ref() {
+        if !people.contains(person) {
+            return false;
+        }
+    }
+
+    let tags = effective_name_set(&folder.direct_keywords, &folder.inherited_keywords);
+    if !query.include_tags.is_empty()
+        && !name_filter_matches(&tags, &query.include_tags, &query.include_combine)
+    {
+        return false;
+    }
+    if !query.exclude_tags.is_empty()
+        && name_filter_matches(&tags, &query.exclude_tags, &query.exclude_combine)
+    {
+        return false;
+    }
+
+    if let Some(minimum_rating) = query.minimum_rating {
+        let rating = folder.direct_rating.or(folder.inherited_rating);
+        if !rating.is_some_and(|rating| rating >= minimum_rating) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn effective_name_set(direct_names: &[String], inherited_names: &[String]) -> HashSet<String> {
+    direct_names
+        .iter()
+        .chain(inherited_names.iter())
+        .map(|name| normalize_search_name(name))
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+fn name_filter_matches(
+    candidates: &HashSet<String>,
+    filter_names: &[String],
+    combine: &MetadataCombineMode,
+) -> bool {
+    if filter_names.is_empty() {
+        return false;
+    }
+
+    match combine {
+        MetadataCombineMode::And => filter_names.iter().all(|name| candidates.contains(name)),
+        MetadataCombineMode::Or => filter_names.iter().any(|name| candidates.contains(name)),
+    }
+}
+
+fn normalized_search_names(names: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for name in names {
+        let name = normalize_search_name(name);
+        if !name.is_empty() && !normalized.contains(&name) {
+            normalized.push(name);
+        }
+    }
+    normalized
+}
+
+fn normalize_search_name(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 fn names_for_folder(connection: &Connection, sql: &str, folder_id: i64) -> Result<Vec<String>> {
     let mut statement = connection.prepare(sql)?;
     let names = statement
@@ -2204,6 +2673,7 @@ pub fn validate_root_path(path: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::MetadataNameFilter;
 
     #[test]
     fn image_metadata_people_and_rating_round_trip() -> Result<()> {
@@ -2285,6 +2755,185 @@ mod tests {
         assert_eq!(child_summary.inherited_keywords, vec!["portrait"]);
         assert_eq!(child_summary.direct_rating, None);
         assert_eq!(child_summary.inherited_rating, Some(5));
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn folder_thumbnail_can_be_set_by_relative_path() -> Result<()> {
+        let root = temp_root_path("folder_thumbnail_can_be_set_by_relative_path");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("Parent").join("Child"))?;
+        fs::write(
+            root.join("Parent").join("parent.jpg"),
+            b"parent image bytes",
+        )?;
+        fs::write(
+            root.join("Parent").join("Child").join("child.jpg"),
+            b"child image bytes",
+        )?;
+
+        let mut db = RootDatabase::open(&root)?;
+        let root_id = db.root_id()?;
+        db.scan(&root_id)?;
+        let child_image_id = db
+            .images_for_folder(&root_id, "Parent/Child")?
+            .first()
+            .map(|image| image.id)
+            .context("child image was not indexed")?;
+
+        db.set_folder_thumbnail_by_path("Parent", child_image_id)?;
+        let root_view = db.folder_view(&root_id, "Root", "")?;
+        let parent_summary = root_view
+            .folders
+            .iter()
+            .find(|folder| folder.relative_path == "Parent")
+            .context("parent folder was not visible")?;
+        assert_eq!(parent_summary.thumbnail_image_id, Some(child_image_id));
+
+        db.set_folder_thumbnail_by_path("", child_image_id)?;
+        assert_eq!(db.root_thumbnail_image_id()?, Some(child_image_id));
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_search_uses_inherited_filters_and_exclude_modes() -> Result<()> {
+        let root = temp_root_path("metadata_search_uses_inherited_filters_and_exclude_modes");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("Ada").join("Keep"))?;
+        fs::create_dir_all(root.join("Ada").join("Reject"))?;
+        fs::create_dir_all(root.join("Bea").join("Keep"))?;
+        fs::write(
+            root.join("Ada").join("Keep").join("portrait.jpg"),
+            b"image bytes",
+        )?;
+        fs::write(
+            root.join("Ada").join("Reject").join("portrait.jpg"),
+            b"image bytes",
+        )?;
+        fs::write(
+            root.join("Bea").join("Keep").join("portrait.jpg"),
+            b"image bytes",
+        )?;
+
+        let mut db = RootDatabase::open(&root)?;
+        let root_id = db.root_id()?;
+        db.scan(&root_id)?;
+
+        let ada_id = db.folder_id("Ada")?;
+        let ada_keep_id = db.folder_id("Ada/Keep")?;
+        let ada_reject_id = db.folder_id("Ada/Reject")?;
+        let bea_id = db.folder_id("Bea")?;
+        db.add_folder_person(&root_id, ada_id, "Ada Lovelace")?;
+        db.add_folder_keyword(&root_id, ada_id, "portrait")?;
+        db.set_folder_rating(&root_id, ada_id, Some(5))?;
+        db.add_folder_keyword(&root_id, ada_keep_id, "blurry")?;
+        db.add_folder_keyword(&root_id, ada_reject_id, "blurry")?;
+        db.add_folder_keyword(&root_id, ada_reject_id, "private")?;
+        db.add_folder_person(&root_id, bea_id, "Bea")?;
+        db.add_folder_keyword(&root_id, bea_id, "portrait")?;
+        db.set_folder_rating(&root_id, bea_id, Some(2))?;
+
+        let tag_query = MetadataSearchQuery {
+            include_tags: MetadataNameFilter {
+                names: vec!["portrait".to_owned()],
+                combine: MetadataCombineMode::And,
+            },
+            ..Default::default()
+        };
+        let paths = db
+            .search_folders(&root_id, &tag_query)?
+            .into_iter()
+            .map(|folder| folder.relative_path)
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"Ada".to_owned()));
+        assert!(paths.contains(&"Ada/Keep".to_owned()));
+        assert!(paths.contains(&"Ada/Reject".to_owned()));
+        assert!(paths.contains(&"Bea".to_owned()));
+        assert!(paths.contains(&"Bea/Keep".to_owned()));
+
+        let tag_query = MetadataSearchQuery {
+            include_tags: MetadataNameFilter {
+                names: vec!["portrait".to_owned(), "blurry".to_owned()],
+                combine: MetadataCombineMode::And,
+            },
+            ..Default::default()
+        };
+        let paths = db
+            .search_folders(&root_id, &tag_query)?
+            .into_iter()
+            .map(|folder| folder.relative_path)
+            .collect::<Vec<_>>();
+        assert!(!paths.contains(&"Ada".to_owned()));
+        assert!(paths.contains(&"Ada/Keep".to_owned()));
+        assert!(paths.contains(&"Ada/Reject".to_owned()));
+        assert!(!paths.contains(&"Bea".to_owned()));
+        assert!(!paths.contains(&"Bea/Keep".to_owned()));
+
+        let rating_query = MetadataSearchQuery {
+            minimum_rating: Some(5),
+            ..Default::default()
+        };
+        let paths = db
+            .search_folders(&root_id, &rating_query)?
+            .into_iter()
+            .map(|folder| folder.relative_path)
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"Ada".to_owned()));
+        assert!(paths.contains(&"Ada/Keep".to_owned()));
+        assert!(paths.contains(&"Ada/Reject".to_owned()));
+        assert!(!paths.contains(&"Bea".to_owned()));
+        assert!(!paths.contains(&"Bea/Keep".to_owned()));
+
+        let query = MetadataSearchQuery {
+            person: Some("Ada Lovelace".to_owned()),
+            include_tags: MetadataNameFilter {
+                names: vec!["portrait".to_owned()],
+                combine: MetadataCombineMode::And,
+            },
+            exclude_tags: MetadataNameFilter {
+                names: vec!["blurry".to_owned(), "private".to_owned()],
+                combine: MetadataCombineMode::And,
+            },
+            minimum_rating: Some(4),
+        };
+
+        let paths = db
+            .search_folders(&root_id, &query)?
+            .into_iter()
+            .map(|folder| folder.relative_path)
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"Ada".to_owned()));
+        assert!(paths.contains(&"Ada/Keep".to_owned()));
+        assert!(!paths.contains(&"Ada/Reject".to_owned()));
+        assert!(!paths.contains(&"Bea".to_owned()));
+
+        let query = MetadataSearchQuery {
+            exclude_tags: MetadataNameFilter {
+                names: vec!["blurry".to_owned()],
+                combine: MetadataCombineMode::Or,
+            },
+            ..query
+        };
+        let paths = db
+            .search_folders(&root_id, &query)?
+            .into_iter()
+            .map(|folder| folder.relative_path)
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"Ada".to_owned()));
+        assert!(!paths.contains(&"Ada/Keep".to_owned()));
+        assert!(!paths.contains(&"Ada/Reject".to_owned()));
+
+        let people = db.person_summaries(&root_id)?;
+        let ada = people
+            .iter()
+            .find(|person| person.name == "Ada Lovelace")
+            .context("Ada person summary was missing")?;
+        assert_eq!(ada.folder_count, 2);
+        assert!(ada.thumbnail_image_id.is_some());
 
         let _ = fs::remove_dir_all(&root);
         Ok(())

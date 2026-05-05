@@ -4,8 +4,9 @@ use anyhow::Context;
 use picturious_core::{
     FolderMetadata, FolderSummary, FolderView, FolderViewHeader, FolderViewTarget,
     GeneratedThumbnail, ImageMetadata, ImageSummary, LibraryManager, LibraryOverview, LibraryRoot,
-    MetadataTag, RootDatabase, RotationDirection as CoreRotationDirection, ScanReport, ScanTarget,
-    ThumbnailCache, ThumbnailResponse, generate_thumbnail, rotate_image as rotate_image_file,
+    MetadataPersonSummary, MetadataSearchQuery, MetadataTag, RootDatabase,
+    RotationDirection as CoreRotationDirection, ScanReport, ScanTarget, ThumbnailCache,
+    ThumbnailResponse, generate_thumbnail, rotate_image as rotate_image_file,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -652,6 +653,21 @@ fn set_folder_thumbnail(
 }
 
 #[tauri::command]
+fn set_folder_thumbnail_by_path(
+    root_id: String,
+    relative_path: String,
+    image_id: i64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .library
+        .lock()
+        .map_err(|_| "library state is locked".to_owned())?
+        .set_folder_thumbnail_by_path(&root_id, &relative_path, image_id)
+        .map_err(error_message)
+}
+
+#[tauri::command]
 async fn image_metadata(
     root_id: String,
     image_id: i64,
@@ -708,6 +724,56 @@ async fn metadata_tags(state: State<'_, AppState>) -> Result<Vec<MetadataTag>, S
             .lock()
             .map_err(|_| "library state is locked".to_owned())?
             .all_keywords()
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn metadata_person_thumbnails(
+    state: State<'_, AppState>,
+) -> Result<Vec<MetadataPersonSummary>, String> {
+    let library = state.library.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .all_people_with_thumbnails()
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn metadata_filtered_person_thumbnails(
+    query: MetadataSearchQuery,
+    state: State<'_, AppState>,
+) -> Result<Vec<MetadataPersonSummary>, String> {
+    let library = state.library.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .filtered_people_with_thumbnails(&query)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn metadata_search(
+    query: MetadataSearchQuery,
+    state: State<'_, AppState>,
+) -> Result<Vec<FolderSummary>, String> {
+    let library = state.library.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .search_metadata(&query)
             .map_err(error_message)
     })
     .await
@@ -930,10 +996,14 @@ fn main() {
             move_image_to_recycle_bin,
             move_folder_to_recycle_bin,
             set_folder_thumbnail,
+            set_folder_thumbnail_by_path,
             image_metadata,
             image_people,
             metadata_people,
             metadata_tags,
+            metadata_person_thumbnails,
+            metadata_filtered_person_thumbnails,
+            metadata_search,
             folder_metadata,
             add_folder_tag,
             remove_folder_tag,
