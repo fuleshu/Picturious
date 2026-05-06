@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use anyhow::{Context, bail};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use picturious_core::{
     FolderMetadata, FolderSummary, FolderView, FolderViewHeader, FolderViewTarget,
     GeneratedThumbnail, ImageMetadata, ImageSummary, LibraryManager, LibraryOverview, LibraryRoot,
@@ -12,6 +14,7 @@ use picturious_core::{
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -22,7 +25,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{
     AppHandle, Emitter, Manager, Monitor, PhysicalPosition, PhysicalSize, Position, Size, State,
-    WebviewWindow, Window, WindowEvent,
+    WebviewWindow, Window, WindowEvent, ipc::Response,
 };
 
 const KLUTZGAMES_HOMEPAGE: &str = "https://www.klutzgames.com";
@@ -695,6 +698,28 @@ async fn thumbnail(
     .await
     .map_err(|error| error.to_string())??;
 
+    if is_supported_splat_path(&path) {
+        let library = state.library.clone();
+        let root_id_for_thumbnail = root_id.clone();
+        let stored_thumbnail = tauri::async_runtime::spawn_blocking(move || {
+            library
+                .lock()
+                .map_err(|_| "library state is locked".to_owned())?
+                .splat_thumbnail(&root_id_for_thumbnail, image_id)
+                .map_err(error_message)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+
+        return Ok(ThumbnailResponse {
+            image_id,
+            data_url: stored_thumbnail
+                .map(|thumbnail| image_data_url(&thumbnail.mime_type, &thumbnail.data))
+                .unwrap_or_else(splat_placeholder_data_url),
+            from_cache: false,
+        });
+    }
+
     if let Some(response) = thumbnails
         .lock()
         .map_err(|_| "thumbnail cache is locked".to_owned())?
@@ -742,6 +767,91 @@ fn image_file_path(
         .to_string_lossy()
         .trim_start_matches(r"\\?\")
         .to_owned())
+}
+
+#[tauri::command]
+async fn splat_file_bytes(
+    root_id: String,
+    image_id: i64,
+    state: State<'_, AppState>,
+) -> Result<Response, String> {
+    let (path, _) = image_path_for(&state.library, &root_id, image_id)?;
+    if !is_supported_splat_path(&path) {
+        return Err("file is not a supported 3DGS file".to_owned());
+    }
+
+    let read_path = path.clone();
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        fs::read(&read_path)
+            .map_err(|error| format!("could not read {}: {error}", read_path.display()))
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+
+    Ok(Response::new(bytes))
+}
+
+#[tauri::command]
+fn splat_camera_state(
+    root_id: String,
+    image_id: i64,
+    state: State<'_, AppState>,
+) -> Result<Option<serde_json::Value>, String> {
+    let (path, _) = image_path_for(&state.library, &root_id, image_id)?;
+    if !is_supported_splat_path(&path) {
+        return Err("camera restore is only available for 3DGS files".to_owned());
+    }
+
+    let thumbnail = state
+        .library
+        .lock()
+        .map_err(|_| "library state is locked".to_owned())?
+        .splat_thumbnail(&root_id, image_id)
+        .map_err(error_message)?;
+
+    thumbnail
+        .and_then(|thumbnail| thumbnail.camera_json)
+        .map(|camera_json| {
+            serde_json::from_str(&camera_json)
+                .map_err(|error| format!("could not parse saved 3DGS camera state: {error}"))
+        })
+        .transpose()
+}
+
+#[tauri::command]
+fn save_splat_thumbnail(
+    root_id: String,
+    image_id: i64,
+    data_url: String,
+    camera_state: Option<serde_json::Value>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let (path, _) = image_path_for(&state.library, &root_id, image_id)?;
+    if !is_supported_splat_path(&path) {
+        return Err("thumbnail capture is only available for 3DGS files".to_owned());
+    }
+
+    let (mime_type, bytes) = decode_image_data_url(&data_url)?;
+    let camera_json = camera_state
+        .map(|state| {
+            serde_json::to_string(&state)
+                .map_err(|error| format!("could not serialize 3DGS camera state: {error}"))
+        })
+        .transpose()?;
+    state
+        .library
+        .lock()
+        .map_err(|_| "library state is locked".to_owned())?
+        .save_splat_thumbnail(
+            &root_id,
+            image_id,
+            &mime_type,
+            &bytes,
+            camera_json.as_deref(),
+        )
+        .map_err(error_message)?;
+
+    Ok("database".to_owned())
 }
 
 #[tauri::command]
@@ -1397,6 +1507,9 @@ fn main() {
             validate_folder_view,
             thumbnail,
             image_file_path,
+            splat_file_bytes,
+            splat_camera_state,
+            save_splat_thumbnail,
             set_viewer_fullscreen,
             rotate_image,
             convert_image_png_to_jpg,
@@ -2586,6 +2699,165 @@ fn window_rect_visible(window: &WindowSettings, monitors: &[Monitor]) -> bool {
         let intersection_height = window_bottom.min(monitor_bottom) - window_top.max(monitor_top);
         intersection_width >= 80 && intersection_height >= 80
     })
+}
+
+fn is_supported_splat_path(path: &Path) -> bool {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if file_name.ends_with(".compressed.ply")
+        || file_name.ends_with(".meta.json")
+        || file_name.ends_with(".lod-meta.json")
+    {
+        return true;
+    }
+
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            ["spz", "sog", "ply", "splat", "ksplat", "zip", "rad"]
+                .iter()
+                .any(|supported| extension.eq_ignore_ascii_case(supported))
+        })
+        .unwrap_or(false)
+}
+
+fn decode_image_data_url(data_url: &str) -> Result<(String, Vec<u8>), String> {
+    let (header, encoded) = data_url
+        .split_once(',')
+        .ok_or_else(|| "thumbnail image data is not a data URL".to_owned())?;
+    let header = header.to_ascii_lowercase();
+    let mime_type = if header.starts_with("data:image/jpeg;base64") {
+        "image/jpeg"
+    } else if header.starts_with("data:image/png;base64") {
+        "image/png"
+    } else {
+        return Err("thumbnail image data must be JPEG or PNG".to_owned());
+    };
+
+    let bytes = STANDARD
+        .decode(encoded)
+        .map_err(|error| format!("could not decode thumbnail image data: {error}"))?;
+    Ok((mime_type.to_owned(), bytes))
+}
+
+fn image_data_url(mime_type: &str, bytes: &[u8]) -> String {
+    format!("data:{mime_type};base64,{}", STANDARD.encode(bytes))
+}
+
+fn splat_placeholder_data_url() -> String {
+    let mut dots = String::new();
+    append_splat_face_dots(
+        &mut dots,
+        [
+            (130.0, 162.0),
+            (256.0, 235.0),
+            (256.0, 382.0),
+            (130.0, 310.0),
+        ],
+        "#23645d",
+        3.7,
+        0.58,
+    );
+    append_splat_face_dots(
+        &mut dots,
+        [
+            (256.0, 235.0),
+            (382.0, 162.0),
+            (382.0, 310.0),
+            (256.0, 382.0),
+        ],
+        "#2f7b72",
+        3.7,
+        0.62,
+    );
+    append_splat_face_dots(
+        &mut dots,
+        [
+            (256.0, 90.0),
+            (382.0, 162.0),
+            (256.0, 235.0),
+            (130.0, 162.0),
+        ],
+        "#d8a35d",
+        3.9,
+        0.74,
+    );
+
+    let svg = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+<defs>
+<linearGradient id="top" x1="160" y1="100" x2="340" y2="220" gradientUnits="userSpaceOnUse">
+<stop offset="0" stop-color="#f3e4c5"/>
+<stop offset="1" stop-color="#d7a15b"/>
+</linearGradient>
+<linearGradient id="left" x1="126" y1="172" x2="270" y2="382" gradientUnits="userSpaceOnUse">
+<stop offset="0" stop-color="#d7e9e4"/>
+<stop offset="1" stop-color="#8ebdb2"/>
+</linearGradient>
+<linearGradient id="right" x1="250" y1="190" x2="390" y2="350" gradientUnits="userSpaceOnUse">
+<stop offset="0" stop-color="#c7ddd8"/>
+<stop offset="1" stop-color="#4f9187"/>
+</linearGradient>
+<filter id="shadow" x="72" y="58" width="368" height="360" filterUnits="userSpaceOnUse">
+<feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#172321" flood-opacity="0.18"/>
+</filter>
+</defs>
+<rect width="512" height="512" rx="48" fill="#f6f7f4"/>
+<rect x="42" y="42" width="428" height="428" rx="34" fill="#ffffff" stroke="#d5dcd9" stroke-width="8"/>
+<rect x="64" y="64" width="384" height="384" rx="24" fill="#eef2f0" stroke="#e3e8e5" stroke-width="2"/>
+<g filter="url(#shadow)">
+<polygon points="256,90 382,162 256,235 130,162" fill="url(#top)" opacity="0.72"/>
+<polygon points="130,162 256,235 256,382 130,310" fill="url(#left)" opacity="0.82"/>
+<polygon points="256,235 382,162 382,310 256,382" fill="url(#right)" opacity="0.86"/>
+</g>
+<g>{dots}</g>
+<g fill="none" stroke-linecap="round" stroke-linejoin="round">
+<path d="M256 90 382 162 382 310 256 382 130 310 130 162 256 90Z" stroke="#205e57" stroke-width="10"/>
+<path d="M130 162 256 235 382 162" stroke="#2b7068" stroke-width="8"/>
+<path d="M256 235V382" stroke="#2b7068" stroke-width="8"/>
+<path d="M256 90 256 235" stroke="#e1b26d" stroke-width="5" opacity="0.55"/>
+</g>
+<g fill="#f0c276" opacity="0.95">
+<circle cx="256" cy="90" r="7"/>
+<circle cx="130" cy="162" r="6"/>
+<circle cx="382" cy="162" r="6"/>
+</g>
+</svg>"##
+    );
+    format!("data:image/svg+xml;base64,{}", STANDARD.encode(svg))
+}
+
+fn append_splat_face_dots(
+    output: &mut String,
+    corners: [(f64, f64); 4],
+    color: &str,
+    radius: f64,
+    opacity: f64,
+) {
+    const DOTS_PER_AXIS: usize = 8;
+    for row in 0..DOTS_PER_AXIS {
+        for column in 0..DOTS_PER_AXIS {
+            let u = (column as f64 + 0.5) / DOTS_PER_AXIS as f64;
+            let v = (row as f64 + 0.5) / DOTS_PER_AXIS as f64;
+            let x = (1.0 - u) * (1.0 - v) * corners[0].0
+                + u * (1.0 - v) * corners[1].0
+                + u * v * corners[2].0
+                + (1.0 - u) * v * corners[3].0;
+            let y = (1.0 - u) * (1.0 - v) * corners[0].1
+                + u * (1.0 - v) * corners[1].1
+                + u * v * corners[2].1
+                + (1.0 - u) * v * corners[3].1;
+            let edge_fade = 0.82 + 0.18 * (1.0 - (u - 0.5).abs() * 1.4).max(0.0);
+            let _ = write!(
+                output,
+                r#"<circle cx="{x:.1}" cy="{y:.1}" r="{radius:.1}" fill="{color}" opacity="{:.2}"/>"#,
+                opacity * edge_fade
+            );
+        }
+    }
 }
 
 fn image_path_for(

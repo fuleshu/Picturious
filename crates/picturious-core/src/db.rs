@@ -14,10 +14,11 @@ use uuid::Uuid;
 const DB_DIR: &str = ".picturious";
 const DB_FILE: &str = "root.sqlite";
 const ROOT_RELATIVE_PATH: &str = "";
-const SCHEMA_VERSION: &str = "4";
+const SCHEMA_VERSION: &str = "6";
 const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "avif",
 ];
+const SUPPORTED_SPLAT_EXTENSIONS: &[&str] = &["spz", "sog", "ply", "splat", "ksplat", "zip", "rad"];
 
 pub fn root_database_path(root_path: &Path) -> PathBuf {
     root_path.join(DB_DIR).join(DB_FILE)
@@ -57,6 +58,12 @@ struct ExistingImage {
     relative_path: String,
     file_size: u64,
     modified_unix_ms: i64,
+}
+
+pub struct StoredSplatThumbnail {
+    pub mime_type: String,
+    pub data: Vec<u8>,
+    pub camera_json: Option<String>,
 }
 
 struct FolderRow {
@@ -458,6 +465,118 @@ impl RootDatabase {
             path_from_relative(&self.root_path, &relative_path),
             modified_unix_ms,
         ))
+    }
+
+    pub fn splat_thumbnail(&self, image_id: i64) -> Result<Option<StoredSplatThumbnail>> {
+        let thumbnail = self
+            .connection
+            .query_row(
+                "
+                SELECT images.modified_unix_ms,
+                       splat_thumbnails.source_modified_unix_ms,
+                       splat_thumbnails.mime_type,
+                       splat_thumbnails.data,
+                       splat_thumbnails.camera_json
+                FROM images
+                LEFT JOIN splat_thumbnails ON splat_thumbnails.image_id = images.id
+                WHERE images.id = ?1
+                ",
+                params![image_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .with_context(|| format!("could not read splat thumbnail for image {image_id}"))?;
+
+        let Some((
+            image_modified_unix_ms,
+            thumbnail_modified_unix_ms,
+            mime_type,
+            data,
+            camera_json,
+        )) = thumbnail
+        else {
+            bail!("image not found: {image_id}");
+        };
+
+        let Some(thumbnail_modified_unix_ms) = thumbnail_modified_unix_ms else {
+            return Ok(None);
+        };
+
+        if thumbnail_modified_unix_ms != image_modified_unix_ms {
+            self.connection.execute(
+                "DELETE FROM splat_thumbnails WHERE image_id = ?1",
+                params![image_id],
+            )?;
+            return Ok(None);
+        }
+
+        match (mime_type, data) {
+            (Some(mime_type), Some(data)) => Ok(Some(StoredSplatThumbnail {
+                mime_type,
+                data,
+                camera_json,
+            })),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn save_splat_thumbnail(
+        &self,
+        image_id: i64,
+        mime_type: &str,
+        data: &[u8],
+        camera_json: Option<&str>,
+    ) -> Result<()> {
+        let modified_unix_ms = self
+            .connection
+            .query_row(
+                "SELECT modified_unix_ms FROM images WHERE id = ?1",
+                params![image_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .with_context(|| format!("image not found: {image_id}"))?;
+
+        if !matches!(mime_type, "image/jpeg" | "image/png") {
+            bail!("unsupported splat thumbnail type: {mime_type}");
+        }
+
+        self.connection.execute(
+            "
+            INSERT INTO splat_thumbnails(
+                image_id,
+                source_modified_unix_ms,
+                mime_type,
+                data,
+                camera_json,
+                captured_at_unix_ms
+            )
+            VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(image_id) DO UPDATE SET
+                source_modified_unix_ms = excluded.source_modified_unix_ms,
+                mime_type = excluded.mime_type,
+                data = excluded.data,
+                camera_json = excluded.camera_json,
+                captured_at_unix_ms = excluded.captured_at_unix_ms
+            ",
+            params![
+                image_id,
+                modified_unix_ms,
+                mime_type,
+                data,
+                camera_json,
+                unix_time_ms(SystemTime::now())
+            ],
+        )?;
+
+        Ok(())
     }
 
     pub fn folder_path(&self, relative_path: &str) -> Result<PathBuf> {
@@ -1009,10 +1128,21 @@ impl RootDatabase {
 
             CREATE INDEX IF NOT EXISTS idx_image_keywords_keyword
                 ON image_keywords(keyword_id);
+
+            CREATE TABLE IF NOT EXISTS splat_thumbnails (
+                image_id INTEGER PRIMARY KEY,
+                source_modified_unix_ms INTEGER NOT NULL,
+                mime_type TEXT NOT NULL,
+                data BLOB NOT NULL,
+                camera_json TEXT,
+                captured_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE
+            );
             ",
         )?;
 
         self.ensure_scan_columns()?;
+        self.ensure_splat_thumbnail_columns()?;
         self.ensure_ratings()?;
         self.migrate_image_metadata_to_folders()?;
 
@@ -1285,6 +1415,11 @@ impl RootDatabase {
             "validated_at_unix_ms",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        Ok(())
+    }
+
+    fn ensure_splat_thumbnail_columns(&self) -> Result<()> {
+        self.ensure_column("splat_thumbnails", "camera_json", "TEXT")?;
         Ok(())
     }
 
@@ -2234,7 +2369,10 @@ fn read_directory_snapshot(root_path: &Path, folder_path: &Path) -> Result<Direc
                     continue;
                 }
 
-                if !file_type.is_file() || !is_supported_image(&path) {
+                if !file_type.is_file()
+                    || is_picturious_sidecar_thumbnail(&path)
+                    || !is_supported_media(&path)
+                {
                     continue;
                 }
 
@@ -2616,6 +2754,10 @@ fn display_name_for_visible_child(parent_relative_path: &str, relative_path: &st
     }
 }
 
+fn is_supported_media(path: &Path) -> bool {
+    is_supported_image(path) || is_supported_splat(path)
+}
+
 fn is_supported_image(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -2624,6 +2766,36 @@ fn is_supported_image(path: &Path) -> bool {
                 .iter()
                 .any(|supported| extension.eq_ignore_ascii_case(supported))
         })
+        .unwrap_or(false)
+}
+
+fn is_supported_splat(path: &Path) -> bool {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if file_name.ends_with(".compressed.ply")
+        || file_name.ends_with(".meta.json")
+        || file_name.ends_with(".lod-meta.json")
+    {
+        return true;
+    }
+
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            SUPPORTED_SPLAT_EXTENSIONS
+                .iter()
+                .any(|supported| extension.eq_ignore_ascii_case(supported))
+        })
+        .unwrap_or(false)
+}
+
+fn is_picturious_sidecar_thumbnail(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_ascii_lowercase().ends_with(".picturious-thumb.jpg"))
         .unwrap_or(false)
 }
 
@@ -2705,6 +2877,107 @@ mod tests {
         let person_id = metadata.people[0].id;
         let metadata = db.remove_image_person(&root_id, image_id, person_id)?;
         assert!(metadata.people.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn scan_indexes_splats_and_ignores_sidecar_thumbnails() -> Result<()> {
+        let root = temp_root_path("scan_indexes_splats_and_ignores_sidecar_thumbnails");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        fs::write(root.join("scene.spz"), b"splat bytes")?;
+        fs::write(
+            root.join("scene.spz.picturious-thumb.jpg"),
+            b"thumbnail bytes",
+        )?;
+
+        let mut db = RootDatabase::open(&root)?;
+        let root_id = db.root_id()?;
+        db.scan(&root_id)?;
+
+        let images = db.images_for_folder(&root_id, "")?;
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].file_name, "scene.spz");
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn splat_thumbnail_round_trips_and_cascades_on_delete() -> Result<()> {
+        let root = temp_root_path("splat_thumbnail_round_trips_and_cascades_on_delete");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        fs::write(root.join("scene.spz"), b"splat bytes")?;
+
+        let mut db = RootDatabase::open(&root)?;
+        let root_id = db.root_id()?;
+        db.scan(&root_id)?;
+        let image_id = db
+            .images_for_folder(&root_id, "")?
+            .first()
+            .map(|image| image.id)
+            .context("splat was not indexed")?;
+
+        db.save_splat_thumbnail(
+            image_id,
+            "image/jpeg",
+            b"jpeg bytes",
+            Some(r#"{"version":1,"position":[1,2,3],"focus":[4,5,6]}"#),
+        )?;
+        let thumbnail = db
+            .splat_thumbnail(image_id)?
+            .context("saved splat thumbnail was missing")?;
+        assert_eq!(thumbnail.mime_type, "image/jpeg");
+        assert_eq!(thumbnail.data, b"jpeg bytes");
+        assert_eq!(
+            thumbnail.camera_json.as_deref(),
+            Some(r#"{"version":1,"position":[1,2,3],"focus":[4,5,6]}"#)
+        );
+
+        db.delete_image(image_id)?;
+        let count =
+            db.connection
+                .query_row("SELECT COUNT(*) FROM splat_thumbnails", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+        assert_eq!(count, 0);
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn splat_thumbnail_is_removed_when_source_timestamp_changes() -> Result<()> {
+        let root = temp_root_path("splat_thumbnail_is_removed_when_source_timestamp_changes");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        fs::write(root.join("scene.spz"), b"splat bytes")?;
+
+        let mut db = RootDatabase::open(&root)?;
+        let root_id = db.root_id()?;
+        db.scan(&root_id)?;
+        let image_id = db
+            .images_for_folder(&root_id, "")?
+            .first()
+            .map(|image| image.id)
+            .context("splat was not indexed")?;
+
+        db.save_splat_thumbnail(image_id, "image/jpeg", b"jpeg bytes", None)?;
+        db.connection.execute(
+            "UPDATE images SET modified_unix_ms = modified_unix_ms + 1 WHERE id = ?1",
+            params![image_id],
+        )?;
+
+        assert!(db.splat_thumbnail(image_id)?.is_none());
+        let count =
+            db.connection
+                .query_row("SELECT COUNT(*) FROM splat_thumbnails", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+        assert_eq!(count, 0);
 
         let _ = fs::remove_dir_all(&root);
         Ok(())

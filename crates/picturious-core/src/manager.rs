@@ -1,6 +1,6 @@
 use crate::db::{
-    RootDatabase, clean_path_string, root_database_exists, root_database_path, root_display_name,
-    validate_root_path,
+    RootDatabase, StoredSplatThumbnail, clean_path_string, root_database_exists,
+    root_database_path, root_display_name, validate_root_path,
 };
 use crate::models::{
     FolderMetadata, FolderSummary, FolderView, ImageMetadata, ImageSummary, LibraryOverview,
@@ -175,6 +175,29 @@ impl LibraryManager {
         let known_root = self.known_root(root_id)?;
         let db = self.open_connected_database(known_root)?;
         db.image_path(image_id)
+    }
+
+    pub fn splat_thumbnail(
+        &self,
+        root_id: &str,
+        image_id: i64,
+    ) -> Result<Option<StoredSplatThumbnail>> {
+        let known_root = self.known_root(root_id)?;
+        let db = self.open_connected_database(known_root)?;
+        db.splat_thumbnail(image_id)
+    }
+
+    pub fn save_splat_thumbnail(
+        &self,
+        root_id: &str,
+        image_id: i64,
+        mime_type: &str,
+        data: &[u8],
+        camera_json: Option<&str>,
+    ) -> Result<()> {
+        let known_root = self.known_root(root_id)?;
+        let db = self.open_connected_database(known_root)?;
+        db.save_splat_thumbnail(image_id, mime_type, data, camera_json)
     }
 
     pub fn folder_path(&self, root_id: &str, relative_path: &str) -> Result<PathBuf> {
