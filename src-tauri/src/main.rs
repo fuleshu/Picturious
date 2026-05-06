@@ -698,24 +698,29 @@ async fn thumbnail(
     .await
     .map_err(|error| error.to_string())??;
 
-    if is_supported_splat_path(&path) {
+    if is_supported_3d_asset_path(&path) {
         let library = state.library.clone();
         let root_id_for_thumbnail = root_id.clone();
         let stored_thumbnail = tauri::async_runtime::spawn_blocking(move || {
             library
                 .lock()
                 .map_err(|_| "library state is locked".to_owned())?
-                .splat_thumbnail(&root_id_for_thumbnail, image_id)
+                .asset_thumbnail(&root_id_for_thumbnail, image_id)
                 .map_err(error_message)
         })
         .await
         .map_err(|error| error.to_string())??;
+        let placeholder: fn() -> String = if is_supported_splat_path(&path) {
+            splat_placeholder_data_url
+        } else {
+            model_placeholder_data_url
+        };
 
         return Ok(ThumbnailResponse {
             image_id,
             data_url: stored_thumbnail
                 .map(|thumbnail| image_data_url(&thumbnail.mime_type, &thumbnail.data))
-                .unwrap_or_else(splat_placeholder_data_url),
+                .unwrap_or_else(placeholder),
             from_cache: false,
         });
     }
@@ -792,6 +797,28 @@ async fn splat_file_bytes(
 }
 
 #[tauri::command]
+async fn asset_file_bytes(
+    root_id: String,
+    image_id: i64,
+    state: State<'_, AppState>,
+) -> Result<Response, String> {
+    let (path, _) = image_path_for(&state.library, &root_id, image_id)?;
+    if !is_supported_3d_asset_path(&path) {
+        return Err("file is not a supported 3D asset".to_owned());
+    }
+
+    let read_path = path.clone();
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        fs::read(&read_path)
+            .map_err(|error| format!("could not read {}: {error}", read_path.display()))
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+
+    Ok(Response::new(bytes))
+}
+
+#[tauri::command]
 fn splat_camera_state(
     root_id: String,
     image_id: i64,
@@ -814,6 +841,33 @@ fn splat_camera_state(
         .map(|camera_json| {
             serde_json::from_str(&camera_json)
                 .map_err(|error| format!("could not parse saved 3DGS camera state: {error}"))
+        })
+        .transpose()
+}
+
+#[tauri::command]
+fn asset_camera_state(
+    root_id: String,
+    image_id: i64,
+    state: State<'_, AppState>,
+) -> Result<Option<serde_json::Value>, String> {
+    let (path, _) = image_path_for(&state.library, &root_id, image_id)?;
+    if !is_supported_3d_asset_path(&path) {
+        return Err("camera restore is only available for 3D assets".to_owned());
+    }
+
+    let thumbnail = state
+        .library
+        .lock()
+        .map_err(|_| "library state is locked".to_owned())?
+        .asset_thumbnail(&root_id, image_id)
+        .map_err(error_message)?;
+
+    thumbnail
+        .and_then(|thumbnail| thumbnail.camera_json)
+        .map(|camera_json| {
+            serde_json::from_str(&camera_json)
+                .map_err(|error| format!("could not parse saved 3D camera state: {error}"))
         })
         .transpose()
 }
@@ -843,6 +897,42 @@ fn save_splat_thumbnail(
         .lock()
         .map_err(|_| "library state is locked".to_owned())?
         .save_splat_thumbnail(
+            &root_id,
+            image_id,
+            &mime_type,
+            &bytes,
+            camera_json.as_deref(),
+        )
+        .map_err(error_message)?;
+
+    Ok("database".to_owned())
+}
+
+#[tauri::command]
+fn save_asset_thumbnail(
+    root_id: String,
+    image_id: i64,
+    data_url: String,
+    camera_state: Option<serde_json::Value>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let (path, _) = image_path_for(&state.library, &root_id, image_id)?;
+    if !is_supported_3d_asset_path(&path) {
+        return Err("thumbnail capture is only available for 3D assets".to_owned());
+    }
+
+    let (mime_type, bytes) = decode_image_data_url(&data_url)?;
+    let camera_json = camera_state
+        .map(|state| {
+            serde_json::to_string(&state)
+                .map_err(|error| format!("could not serialize 3D camera state: {error}"))
+        })
+        .transpose()?;
+    state
+        .library
+        .lock()
+        .map_err(|_| "library state is locked".to_owned())?
+        .save_asset_thumbnail(
             &root_id,
             image_id,
             &mime_type,
@@ -1508,8 +1598,11 @@ fn main() {
             thumbnail,
             image_file_path,
             splat_file_bytes,
+            asset_file_bytes,
             splat_camera_state,
+            asset_camera_state,
             save_splat_thumbnail,
+            save_asset_thumbnail,
             set_viewer_fullscreen,
             rotate_image,
             convert_image_png_to_jpg,
@@ -2717,11 +2810,22 @@ fn is_supported_splat_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .map(|extension| {
-            ["spz", "sog", "ply", "splat", "ksplat", "zip", "rad"]
+            ["spz", "sog", "ply", "splat", "ksplat", "rad"]
                 .iter()
                 .any(|supported| extension.eq_ignore_ascii_case(supported))
         })
         .unwrap_or(false)
+}
+
+fn is_supported_model_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("glb"))
+        .unwrap_or(false)
+}
+
+fn is_supported_3d_asset_path(path: &Path) -> bool {
+    is_supported_splat_path(path) || is_supported_model_path(path)
 }
 
 fn decode_image_data_url(data_url: &str) -> Result<(String, Vec<u8>), String> {
@@ -2827,6 +2931,54 @@ fn splat_placeholder_data_url() -> String {
 </g>
 </svg>"##
     );
+    format!("data:image/svg+xml;base64,{}", STANDARD.encode(svg))
+}
+
+fn model_placeholder_data_url() -> String {
+    let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+<defs>
+<linearGradient id="bg" x1="42" y1="42" x2="470" y2="470" gradientUnits="userSpaceOnUse">
+<stop offset="0" stop-color="#f8f6ef"/>
+<stop offset="1" stop-color="#e3ebe6"/>
+</linearGradient>
+<linearGradient id="top" x1="152" y1="104" x2="360" y2="232" gradientUnits="userSpaceOnUse">
+<stop offset="0" stop-color="#f1d9a6"/>
+<stop offset="1" stop-color="#c99b58"/>
+</linearGradient>
+<linearGradient id="left" x1="126" y1="176" x2="260" y2="380" gradientUnits="userSpaceOnUse">
+<stop offset="0" stop-color="#b8d2cc"/>
+<stop offset="1" stop-color="#5f9b90"/>
+</linearGradient>
+<linearGradient id="right" x1="252" y1="182" x2="388" y2="356" gradientUnits="userSpaceOnUse">
+<stop offset="0" stop-color="#8fbab1"/>
+<stop offset="1" stop-color="#2f7068"/>
+</linearGradient>
+<filter id="shadow" x="72" y="68" width="368" height="360" filterUnits="userSpaceOnUse">
+<feDropShadow dx="0" dy="14" stdDeviation="15" flood-color="#1d2523" flood-opacity="0.18"/>
+</filter>
+</defs>
+<rect width="512" height="512" rx="48" fill="url(#bg)"/>
+<rect x="42" y="42" width="428" height="428" rx="34" fill="#ffffff" stroke="#d5dcd7" stroke-width="8"/>
+<rect x="66" y="66" width="380" height="380" rx="24" fill="#f0f4f1" stroke="#e5e9e5" stroke-width="2"/>
+<g filter="url(#shadow)">
+<polygon points="256,95 382,168 256,240 130,168" fill="url(#top)"/>
+<polygon points="130,168 256,240 256,382 130,310" fill="url(#left)"/>
+<polygon points="256,240 382,168 382,310 256,382" fill="url(#right)"/>
+</g>
+<g fill="none" stroke-linecap="round" stroke-linejoin="round">
+<path d="M256 95 382 168 382 310 256 382 130 310 130 168 256 95Z" stroke="#244f4a" stroke-width="10"/>
+<path d="M130 168 256 240 382 168" stroke="#2f675f" stroke-width="8"/>
+<path d="M256 240V382" stroke="#2f675f" stroke-width="8"/>
+<path d="M174 194 300 121M211 216 337 144M172 332 172 192M214 356 214 216M300 356 300 216M342 332 342 192" stroke="#ffffff" stroke-width="4" opacity="0.34"/>
+</g>
+<g fill="#244f4a" opacity="0.95">
+<circle cx="256" cy="95" r="6"/>
+<circle cx="130" cy="168" r="5"/>
+<circle cx="382" cy="168" r="5"/>
+<circle cx="256" cy="240" r="5"/>
+<circle cx="256" cy="382" r="6"/>
+</g>
+</svg>"##;
     format!("data:image/svg+xml;base64,{}", STANDARD.encode(svg))
 }
 

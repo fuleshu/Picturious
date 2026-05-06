@@ -18,7 +18,8 @@ const SCHEMA_VERSION: &str = "6";
 const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "avif",
 ];
-const SUPPORTED_SPLAT_EXTENSIONS: &[&str] = &["spz", "sog", "ply", "splat", "ksplat", "zip", "rad"];
+const SUPPORTED_SPLAT_EXTENSIONS: &[&str] = &["spz", "sog", "ply", "splat", "ksplat", "rad"];
+const SUPPORTED_MODEL_EXTENSIONS: &[&str] = &["glb"];
 
 pub fn root_database_path(root_path: &Path) -> PathBuf {
     root_path.join(DB_DIR).join(DB_FILE)
@@ -468,6 +469,10 @@ impl RootDatabase {
     }
 
     pub fn splat_thumbnail(&self, image_id: i64) -> Result<Option<StoredSplatThumbnail>> {
+        self.asset_thumbnail(image_id)
+    }
+
+    pub fn asset_thumbnail(&self, image_id: i64) -> Result<Option<StoredSplatThumbnail>> {
         let thumbnail = self
             .connection
             .query_row(
@@ -493,7 +498,7 @@ impl RootDatabase {
                 },
             )
             .optional()
-            .with_context(|| format!("could not read splat thumbnail for image {image_id}"))?;
+            .with_context(|| format!("could not read asset thumbnail for image {image_id}"))?;
 
         let Some((
             image_modified_unix_ms,
@@ -535,6 +540,16 @@ impl RootDatabase {
         data: &[u8],
         camera_json: Option<&str>,
     ) -> Result<()> {
+        self.save_asset_thumbnail(image_id, mime_type, data, camera_json)
+    }
+
+    pub fn save_asset_thumbnail(
+        &self,
+        image_id: i64,
+        mime_type: &str,
+        data: &[u8],
+        camera_json: Option<&str>,
+    ) -> Result<()> {
         let modified_unix_ms = self
             .connection
             .query_row(
@@ -545,7 +560,7 @@ impl RootDatabase {
             .with_context(|| format!("image not found: {image_id}"))?;
 
         if !matches!(mime_type, "image/jpeg" | "image/png") {
-            bail!("unsupported splat thumbnail type: {mime_type}");
+            bail!("unsupported asset thumbnail type: {mime_type}");
         }
 
         self.connection.execute(
@@ -2755,7 +2770,7 @@ fn display_name_for_visible_child(parent_relative_path: &str, relative_path: &st
 }
 
 fn is_supported_media(path: &Path) -> bool {
-    is_supported_image(path) || is_supported_splat(path)
+    is_supported_image(path) || is_supported_splat(path) || is_supported_model(path)
 }
 
 fn is_supported_image(path: &Path) -> bool {
@@ -2786,6 +2801,17 @@ fn is_supported_splat(path: &Path) -> bool {
         .and_then(|extension| extension.to_str())
         .map(|extension| {
             SUPPORTED_SPLAT_EXTENSIONS
+                .iter()
+                .any(|supported| extension.eq_ignore_ascii_case(supported))
+        })
+        .unwrap_or(false)
+}
+
+fn is_supported_model(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            SUPPORTED_MODEL_EXTENSIONS
                 .iter()
                 .any(|supported| extension.eq_ignore_ascii_case(supported))
         })
@@ -2900,6 +2926,42 @@ mod tests {
         let images = db.images_for_folder(&root_id, "")?;
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].file_name, "scene.spz");
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn scan_indexes_glb_models() -> Result<()> {
+        let root = temp_root_path("scan_indexes_glb_models");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        fs::write(root.join("statue.glb"), b"glb bytes")?;
+
+        let mut db = RootDatabase::open(&root)?;
+        let root_id = db.root_id()?;
+        db.scan(&root_id)?;
+
+        let images = db.images_for_folder(&root_id, "")?;
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].file_name, "statue.glb");
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn scan_ignores_zip_archives() -> Result<()> {
+        let root = temp_root_path("scan_ignores_zip_archives");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        fs::write(root.join("archive.zip"), b"zip bytes")?;
+
+        let mut db = RootDatabase::open(&root)?;
+        let root_id = db.root_id()?;
+        db.scan(&root_id)?;
+
+        assert!(db.images_for_folder(&root_id, "")?.is_empty());
 
         let _ = fs::remove_dir_all(&root);
         Ok(())

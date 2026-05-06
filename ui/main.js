@@ -9,6 +9,17 @@ const VIEWER_CURSOR_HIDE_DELAY_MS = 3000;
 const MAX_FOLDER_VIEW_CACHE_ENTRIES = 80;
 const MAX_THUMBNAIL_DATA_CACHE_ENTRIES = 700;
 const RAW_PLY_DIRECT_LOAD_LIMIT_BYTES = 2_000_000_000;
+const SUPPORTED_IMAGE_EXTENSIONS = [
+  ".jpg",
+  ".jpeg",
+  ".png",
+  ".webp",
+  ".gif",
+  ".bmp",
+  ".tif",
+  ".tiff",
+  ".avif",
+];
 const SUPPORTED_SPLAT_EXTENSIONS = [
   ".spz",
   ".sog",
@@ -18,9 +29,9 @@ const SUPPORTED_SPLAT_EXTENSIONS = [
   ".lod-meta.json",
   ".splat",
   ".ksplat",
-  ".zip",
   ".rad",
 ];
+const SUPPORTED_MODEL_EXTENSIONS = [".glb"];
 const RATING_OPTIONS = [1, 2, 3, 4, 5];
 const APP_MODES = {
   FOLDER: "folder",
@@ -320,16 +331,16 @@ document.addEventListener("keydown", (event) => {
 
   if (event.key === "Escape") {
     closeViewer();
-  } else if (currentViewerIsSplat() && event.key.toLowerCase() === "t") {
+  } else if (currentViewerIsThreeD() && event.key.toLowerCase() === "t") {
     event.preventDefault();
-    saveCurrentSplatThumbnail().catch(showError);
+    saveCurrentAssetThumbnail().catch(showError);
   } else if (currentViewerIsSplat() && event.key.toLowerCase() === "o") {
     event.preventDefault();
     cycleCurrentSplatOrientation();
-  } else if (currentViewerIsSplat() && event.key.toLowerCase() === "r") {
+  } else if (currentViewerIsThreeD() && event.key.toLowerCase() === "r") {
     event.preventDefault();
     resetCurrentSplatView();
-  } else if (currentViewerIsSplat() && event.key.toLowerCase() === "f") {
+  } else if (currentViewerIsThreeD() && event.key.toLowerCase() === "f") {
     event.preventDefault();
     frameCurrentSplatView();
   } else if (event.key === "ArrowLeft") {
@@ -3943,15 +3954,18 @@ function renderFolderCard(folder) {
 
 function renderImageCard(image) {
   const splat = isSplatItem(image);
+  const model = isModelItem(image);
+  const mediaClass = splat ? " splat-tile" : model ? " model-tile" : "";
+  const thumbClass = splat ? " splat-thumb" : model ? " model-thumb" : "";
   const card = document.createElement("article");
-  card.className = splat ? "tile image-tile splat-tile" : "tile image-tile";
+  card.className = `tile image-tile${mediaClass}`;
   card.tabIndex = 0;
   card.title = fullImagePath(image);
   card.dataset.imageId = String(image.id);
   card.dataset.itemKey = imageItemKey(image);
   card.dataset.summarySignature = imageSummarySignature(image);
   card.innerHTML = `
-    <div class="thumb image-thumb${splat ? " splat-thumb" : ""}" data-image-id="${image.id}">
+    <div class="thumb image-thumb${thumbClass}" data-image-id="${image.id}">
       <span>${escapeHtml(initials(image.file_name))}</span>
     </div>
     <div class="tile-body image-body">
@@ -4311,7 +4325,7 @@ async function handleThumbContextAction(event) {
 
 function imageContextMenuItems() {
   const items = [{ action: "set-cover", label: "Set as cover" }];
-  if (!isSplatItem(state.contextMenuImage)) {
+  if (!isThreeDItem(state.contextMenuImage)) {
     items.push(
       { action: "rotate-right", label: "Rotate right" },
       { action: "rotate-left", label: "Rotate left" },
@@ -4683,12 +4697,13 @@ async function playFolderSlideshow(folder, options = {}) {
     rootId: folder.root_id,
     relativePath: folder.relative_path,
   });
-  if (!images || images.length === 0) {
+  const slideshowImages = imageSlideshowItems(images);
+  if (slideshowImages.length === 0) {
     setStatus(`${folder.name} has no images`);
     return;
   }
 
-  startPlaylistSlideshow(images, options);
+  startPlaylistSlideshow(slideshowImages, options);
 }
 
 function searchSlideshowAvailable() {
@@ -4721,6 +4736,9 @@ async function playSearchResultsSlideshow(options = {}) {
     }
 
     for (const image of folderImages ?? []) {
+      if (!isImageItem(image)) {
+        continue;
+      }
       const key = `${image.root_id}:${image.id}`;
       if (seenImages.has(key)) {
         continue;
@@ -4739,7 +4757,13 @@ async function playSearchResultsSlideshow(options = {}) {
 }
 
 function startPlaylistSlideshow(images, options = {}) {
-  state.slideshowPlaylist = options.randomized ? shuffleImages(images) : [...images];
+  const playlist = imageSlideshowItems(images);
+  if (playlist.length === 0) {
+    setStatus("No images available for slideshow");
+    return;
+  }
+
+  state.slideshowPlaylist = options.randomized ? shuffleImages(playlist) : [...playlist];
   state.viewerIndex = 0;
   state.slideshowActive = true;
   state.slideshowEnded = false;
@@ -4833,6 +4857,23 @@ function isPngFileName(fileName) {
   return String(fileName || "").toLowerCase().endsWith(".png");
 }
 
+function isImageItem(image) {
+  return isImageFileName(image?.file_name) || isImageFileName(image?.relative_path);
+}
+
+function isImageFileName(fileName) {
+  const lower = String(fileName || "").toLowerCase();
+  return SUPPORTED_IMAGE_EXTENSIONS.some((extension) => lower.endsWith(extension));
+}
+
+function imageSlideshowItems(images) {
+  return (images ?? []).filter(isImageItem);
+}
+
+function sameImage(left, right) {
+  return left?.id === right?.id && left?.root_id === right?.root_id;
+}
+
 function isRawPlyFileName(fileName) {
   const lower = String(fileName || "").toLowerCase();
   return lower.endsWith(".ply") && !lower.endsWith(".compressed.ply");
@@ -4845,6 +4886,23 @@ function isSplatItem(image) {
 function isSplatFileName(fileName) {
   const lower = String(fileName || "").toLowerCase();
   return SUPPORTED_SPLAT_EXTENSIONS.some((extension) => lower.endsWith(extension));
+}
+
+function isModelItem(image) {
+  return isModelFileName(image?.file_name) || isModelFileName(image?.relative_path);
+}
+
+function isModelFileName(fileName) {
+  const lower = String(fileName || "").toLowerCase();
+  return SUPPORTED_MODEL_EXTENSIONS.some((extension) => lower.endsWith(extension));
+}
+
+function isThreeDItem(image) {
+  return isSplatItem(image) || isModelItem(image);
+}
+
+function threeDLabelFor(image) {
+  return isModelItem(image) ? "GLB" : "3DGS";
 }
 
 function resetThumbnailWork() {
@@ -5064,8 +5122,8 @@ async function renderViewerImage() {
 
   const generation = ++state.viewerGeneration;
   viewerImage.alt = image.file_name;
-  if (isSplatItem(image)) {
-    await renderViewerSplat(image, generation);
+  if (isThreeDItem(image)) {
+    await renderViewerThreeDAsset(image, generation);
     return;
   }
 
@@ -5096,7 +5154,7 @@ async function renderViewerImage() {
   }
 }
 
-async function renderViewerSplat(image, generation) {
+async function renderViewerThreeDAsset(image, generation) {
   stopSlideshow();
   viewerImage.removeAttribute("src");
   viewerImage.classList.add("hidden");
@@ -5106,11 +5164,12 @@ async function renderViewerSplat(image, generation) {
     splatStatusNode.hidden = false;
     return;
   }
-  splatStatusNode.textContent = "Reading 3DGS file...";
+  const assetLabel = threeDLabelFor(image);
+  splatStatusNode.textContent = `Reading ${assetLabel} file...`;
   splatStatusNode.hidden = false;
 
   try {
-    const source = await splatSourceFor(image);
+    const source = await threeDSourceFor(image);
     if (generation !== state.viewerGeneration) {
       return;
     }
@@ -5123,7 +5182,7 @@ async function renderViewerSplat(image, generation) {
     if (generation !== state.viewerGeneration) {
       return;
     }
-    const cameraState = await splatCameraStateFor(image);
+    const cameraState = await assetCameraStateFor(image);
     if (generation !== state.viewerGeneration) {
       return;
     }
@@ -5134,10 +5193,11 @@ async function renderViewerSplat(image, generation) {
       fileName: image.file_name,
       byteLength: source.byteLength,
       cameraState,
+      kind: isModelItem(image) ? "model" : "splat",
     });
   } catch (error) {
     if (generation === state.viewerGeneration) {
-      splatStatusNode.textContent = `Could not load 3DGS: ${errorMessage(error)}`;
+      splatStatusNode.textContent = `Could not load ${assetLabel}: ${errorMessage(error)}`;
       splatStatusNode.hidden = false;
       showError(error);
     }
@@ -5170,12 +5230,16 @@ function currentViewerIsSplat() {
   return isSplatItem(currentViewerImage());
 }
 
-async function saveCurrentSplatThumbnail() {
+function currentViewerIsThreeD() {
+  return isThreeDItem(currentViewerImage());
+}
+
+async function saveCurrentAssetThumbnail() {
   if (state.splatThumbnailSaving) {
     return;
   }
   const image = currentViewerImage();
-  if (!image || !currentViewerIsSplat() || !state.splatViewer) {
+  if (!image || !currentViewerIsThreeD() || !state.splatViewer) {
     return;
   }
 
@@ -5187,13 +5251,13 @@ async function saveCurrentSplatThumbnail() {
 
   state.splatThumbnailSaving = true;
   try {
-    await invoke("save_splat_thumbnail", {
+    await invoke("save_asset_thumbnail", {
       rootId: image.root_id,
       imageId: image.id,
       dataUrl,
       cameraState,
     });
-    invalidateSplatThumbnail(image, dataUrl);
+    invalidateAssetThumbnail(image, dataUrl);
     showToast("Thumbnail captured");
     setStatus(`Captured thumbnail for ${image.file_name}`);
   } finally {
@@ -5212,22 +5276,22 @@ function cycleCurrentSplatOrientation() {
 }
 
 function resetCurrentSplatView() {
-  if (!currentViewerIsSplat() || !state.splatViewer) {
+  if (!currentViewerIsThreeD() || !state.splatViewer) {
     return;
   }
   state.splatViewer.resetView();
-  setStatus("3DGS view reset");
+  setStatus(`${threeDLabelFor(currentViewerImage())} view reset`);
 }
 
 function frameCurrentSplatView() {
-  if (!currentViewerIsSplat() || !state.splatViewer) {
+  if (!currentViewerIsThreeD() || !state.splatViewer) {
     return;
   }
   state.splatViewer.frameView();
-  setStatus("3DGS view framed");
+  setStatus(`${threeDLabelFor(currentViewerImage())} view framed`);
 }
 
-function invalidateSplatThumbnail(image, dataUrl) {
+function invalidateAssetThumbnail(image, dataUrl) {
   for (const key of [...state.thumbnailDataCache.keys()]) {
     if (key.startsWith(`${image.root_id}:${image.id}:`)) {
       state.thumbnailDataCache.delete(key);
@@ -5241,25 +5305,25 @@ function invalidateSplatThumbnail(image, dataUrl) {
   }
 }
 
-async function splatCameraStateFor(image) {
-  if (!invoke || !isSplatItem(image)) {
+async function assetCameraStateFor(image) {
+  if (!invoke || !isThreeDItem(image)) {
     return null;
   }
 
   try {
-    return await invoke("splat_camera_state", {
+    return await invoke("asset_camera_state", {
       rootId: image.root_id,
       imageId: image.id,
     });
   } catch (error) {
-    console.warn("Could not restore 3DGS camera state", error);
+    console.warn("Could not restore 3D camera state", error);
     return null;
   }
 }
 
-async function splatSourceFor(image) {
+async function threeDSourceFor(image) {
   if (!invoke) {
-    throw new Error("Run with Tauri to load 3DGS files.");
+    throw new Error("Run with Tauri to load 3D files.");
   }
 
   if (convertFileSrc) {
@@ -5274,7 +5338,7 @@ async function splatSourceFor(image) {
     };
   }
 
-  const fileBytes = await splatFileBytesFor(image);
+  const fileBytes = await assetFileBytesFor(image);
   return {
     fileBytes,
     fileName: image.file_name,
@@ -5286,11 +5350,11 @@ function isOversizedRawPly(image) {
   return isRawPlyFileName(image?.file_name || image?.relative_path) && (image?.file_size || 0) >= RAW_PLY_DIRECT_LOAD_LIMIT_BYTES;
 }
 
-async function splatFileBytesFor(image) {
+async function assetFileBytesFor(image) {
   if (!invoke) {
-    throw new Error("Run with Tauri to load 3DGS files.");
+    throw new Error("Run with Tauri to load 3D files.");
   }
-  const response = await invoke("splat_file_bytes", {
+  const response = await invoke("asset_file_bytes", {
     rootId: image.root_id,
     imageId: image.id,
   });
@@ -5310,7 +5374,7 @@ function normalizeByteResponse(response) {
   if (Array.isArray(response)) {
     return new Uint8Array(response);
   }
-  throw new Error(`Unexpected 3DGS byte response: ${typeof response}`);
+  throw new Error(`Unexpected 3D byte response: ${typeof response}`);
 }
 
 function formatBytes(bytes) {
@@ -5407,6 +5471,9 @@ function preloadNeighborImages(generation) {
   for (const offset of [-1, 1]) {
     const index = (state.viewerIndex + offset + images.length) % images.length;
     const image = images[index];
+    if (!isImageItem(image)) {
+      continue;
+    }
     imageSourceFor(image)
       .then((source) => {
         if (generation !== state.viewerGeneration) {
@@ -5428,11 +5495,19 @@ function toggleSlideshow() {
 }
 
 function startSlideshow() {
+  const currentImage = currentViewerImage();
   if (!state.slideshowPlaylist) {
-    state.slideshowPlaylist = [...(state.currentView?.images ?? [])];
+    state.slideshowPlaylist = imageSlideshowItems(state.currentView?.images ?? []);
+    const currentIndex = currentImage
+      ? state.slideshowPlaylist.findIndex((image) => sameImage(image, currentImage))
+      : -1;
+    state.viewerIndex = currentIndex >= 0 ? currentIndex : 0;
+  } else {
+    state.slideshowPlaylist = imageSlideshowItems(state.slideshowPlaylist);
   }
 
   if (state.slideshowPlaylist.length === 0) {
+    setStatus("No images available for slideshow");
     return;
   }
 
@@ -5528,7 +5603,14 @@ function randomizeCurrentSlideshow() {
     return;
   }
 
-  state.slideshowPlaylist = shuffleImages(images);
+  const playlist = imageSlideshowItems(images);
+  if (playlist.length === 0) {
+    stopSlideshow({ ended: true });
+    setStatus("No images available for slideshow");
+    return;
+  }
+
+  state.slideshowPlaylist = shuffleImages(playlist);
   state.viewerIndex = 0;
   state.slideshowEnded = false;
   state.slideshowSkipAttempts = 0;
@@ -5546,7 +5628,7 @@ function handleViewerWheel(event) {
   }
 
   showViewerCursorTemporarily();
-  if (currentViewerIsSplat()) {
+  if (currentViewerIsThreeD()) {
     return;
   }
   event.preventDefault();
