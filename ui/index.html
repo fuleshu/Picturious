@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Picturious</title>
-    <link rel="stylesheet" href="./styles.css?v=layout-31" />
+    <link rel="stylesheet" href="./styles.css?v=layout-32" />
   </head>
   <body>
     <main class="workspace">
@@ -277,7 +277,7 @@
           </div>
           <div>
             <dt>Version</dt>
-            <dd>0.3.0</dd>
+            <dd>0.3.1</dd>
           </div>
           <div>
             <dt>Homepage</dt>
@@ -311,6 +311,22 @@
       </section>
     </dialog>
 
+    <dialog id="metadata-edit-dialog" class="metadata-edit-dialog" aria-labelledby="metadata-edit-title">
+      <form id="metadata-edit-form" class="metadata-edit-panel">
+        <header class="metadata-edit-header">
+          <h2 id="metadata-edit-title">Edit Metadata</h2>
+        </header>
+        <label class="metadata-edit-row">
+          <span id="metadata-edit-label">Name</span>
+          <input id="metadata-edit-input" type="text" autocomplete="off" />
+        </label>
+        <footer class="metadata-edit-actions">
+          <button id="metadata-edit-cancel-button" type="button">Cancel</button>
+          <button id="metadata-edit-update-button" class="metadata-edit-primary-button" type="submit">Update</button>
+        </footer>
+      </form>
+    </dialog>
+
     <dialog id="movie-progress-dialog" class="movie-progress-dialog">
       <section class="movie-progress-panel">
         <header class="movie-progress-header">
@@ -327,6 +343,6 @@
       </section>
     </dialog>
 
-    <script src="./main.js?v=layout-28"></script>
+    <script src="./main.js?v=layout-29"></script>
   </body>
 </html>

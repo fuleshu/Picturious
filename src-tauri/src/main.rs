@@ -20,7 +20,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{
@@ -1337,6 +1337,70 @@ async fn metadata_tags(state: State<'_, AppState>) -> Result<Vec<MetadataTag>, S
 }
 
 #[tauri::command]
+async fn rename_metadata_person(
+    old_name: String,
+    new_name: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let library = state.library.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .rename_person_everywhere(&old_name, &new_name)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn delete_metadata_person(name: String, state: State<'_, AppState>) -> Result<(), String> {
+    let library = state.library.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .delete_person_everywhere(&name)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn rename_metadata_tag(
+    old_name: String,
+    new_name: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let library = state.library.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .rename_keyword_everywhere(&old_name, &new_name)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn delete_metadata_tag(name: String, state: State<'_, AppState>) -> Result<(), String> {
+    let library = state.library.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .delete_keyword_everywhere(&name)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 async fn metadata_person_thumbnails(
     state: State<'_, AppState>,
 ) -> Result<Vec<MetadataPersonSummary>, String> {
@@ -1622,6 +1686,10 @@ fn main() {
             image_people,
             metadata_people,
             metadata_tags,
+            rename_metadata_person,
+            delete_metadata_person,
+            rename_metadata_tag,
+            delete_metadata_tag,
             metadata_person_thumbnails,
             metadata_filtered_person_thumbnails,
             metadata_search,
@@ -2852,6 +2920,13 @@ fn image_data_url(mime_type: &str, bytes: &[u8]) -> String {
 }
 
 fn splat_placeholder_data_url() -> String {
+    static PLACEHOLDER: OnceLock<String> = OnceLock::new();
+    PLACEHOLDER
+        .get_or_init(build_splat_placeholder_data_url)
+        .clone()
+}
+
+fn build_splat_placeholder_data_url() -> String {
     let mut dots = String::new();
     append_splat_face_dots(
         &mut dots,
@@ -2935,6 +3010,13 @@ fn splat_placeholder_data_url() -> String {
 }
 
 fn model_placeholder_data_url() -> String {
+    static PLACEHOLDER: OnceLock<String> = OnceLock::new();
+    PLACEHOLDER
+        .get_or_init(build_model_placeholder_data_url)
+        .clone()
+}
+
+fn build_model_placeholder_data_url() -> String {
     let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
 <defs>
 <linearGradient id="bg" x1="42" y1="42" x2="470" y2="470" gradientUnits="userSpaceOnUse">

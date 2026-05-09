@@ -15,6 +15,7 @@ const DB_DIR: &str = ".picturious";
 const DB_FILE: &str = "root.sqlite";
 const ROOT_RELATIVE_PATH: &str = "";
 const SCHEMA_VERSION: &str = "6";
+const FOLDER_VIEW_BATCH_SIZE: usize = 64;
 const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "avif",
 ];
@@ -294,10 +295,8 @@ impl RootDatabase {
     where
         F: FnMut(Vec<FolderSummary>, Vec<ImageSummary>) -> Result<()>,
     {
-        const BATCH_SIZE: usize = 1;
-
         let normalized_relative_path = normalize_relative_path(relative_path);
-        let mut folder_batch = Vec::with_capacity(BATCH_SIZE);
+        let mut folder_batch = Vec::with_capacity(FOLDER_VIEW_BATCH_SIZE);
         self.for_each_direct_child_folder_row(&normalized_relative_path, |row| {
             for visible_row in self.visible_folder_rows_from(row, 1)? {
                 folder_batch.push(self.folder_summary(
@@ -305,12 +304,12 @@ impl RootDatabase {
                     &normalized_relative_path,
                     visible_row.id,
                     visible_row.relative_path,
-                    visible_row.parent_relative_path,
+                    Some(normalized_relative_path.clone()),
                     visible_row.selected_thumbnail_image_id,
                     visible_row.image_count,
                     visible_row.child_folder_count,
                 )?);
-                if folder_batch.len() >= BATCH_SIZE {
+                if folder_batch.len() >= FOLDER_VIEW_BATCH_SIZE {
                     on_batch(std::mem::take(&mut folder_batch), Vec::new())?;
                 }
             }
@@ -320,10 +319,10 @@ impl RootDatabase {
             on_batch(std::mem::take(&mut folder_batch), Vec::new())?;
         }
 
-        let mut image_batch = Vec::with_capacity(BATCH_SIZE);
+        let mut image_batch = Vec::with_capacity(FOLDER_VIEW_BATCH_SIZE);
         self.for_each_image_for_folder(root_id, &normalized_relative_path, |image| {
             image_batch.push(image);
-            if image_batch.len() >= BATCH_SIZE {
+            if image_batch.len() >= FOLDER_VIEW_BATCH_SIZE {
                 on_batch(Vec::new(), std::mem::take(&mut image_batch))?;
             }
             Ok(())
@@ -774,6 +773,36 @@ impl RootDatabase {
         Ok(keywords)
     }
 
+    pub fn rename_person(&mut self, old_name: &str, new_name: &str) -> Result<()> {
+        rename_metadata_item(
+            &mut self.connection,
+            "people",
+            "person_id",
+            &["folder_people", "image_people"],
+            old_name,
+            new_name,
+        )
+    }
+
+    pub fn delete_person(&self, name: &str) -> Result<()> {
+        delete_metadata_item(&self.connection, "people", name)
+    }
+
+    pub fn rename_keyword(&mut self, old_name: &str, new_name: &str) -> Result<()> {
+        rename_metadata_item(
+            &mut self.connection,
+            "keywords",
+            "keyword_id",
+            &["folder_keywords", "image_keywords"],
+            old_name,
+            new_name,
+        )
+    }
+
+    pub fn delete_keyword(&self, name: &str) -> Result<()> {
+        delete_metadata_item(&self.connection, "keywords", name)
+    }
+
     pub fn search_folders(
         &self,
         root_id: &str,
@@ -1052,6 +1081,9 @@ impl RootDatabase {
             CREATE INDEX IF NOT EXISTS idx_folders_parent
                 ON folders(parent_relative_path);
 
+            CREATE INDEX IF NOT EXISTS idx_folders_parent_relative_path_nocase
+                ON folders(parent_relative_path, relative_path COLLATE NOCASE);
+
             CREATE TABLE IF NOT EXISTS images (
                 id INTEGER PRIMARY KEY,
                 folder_id INTEGER NOT NULL,
@@ -1067,6 +1099,9 @@ impl RootDatabase {
 
             CREATE INDEX IF NOT EXISTS idx_images_folder
                 ON images(folder_id);
+
+            CREATE INDEX IF NOT EXISTS idx_images_folder_file_name_nocase
+                ON images(folder_id, file_name COLLATE NOCASE);
 
             CREATE TABLE IF NOT EXISTS keywords (
                 id INTEGER PRIMARY KEY,
@@ -1474,7 +1509,7 @@ impl RootDatabase {
                     parent_relative_path,
                     row.id,
                     row.relative_path,
-                    row.parent_relative_path,
+                    Some(parent_relative_path.to_owned()),
                     row.selected_thumbnail_image_id,
                     row.image_count,
                     row.child_folder_count,
@@ -2607,6 +2642,95 @@ fn metadata_tag_from_row(row: &Row<'_>) -> rusqlite::Result<MetadataTag> {
     })
 }
 
+fn rename_metadata_item(
+    connection: &mut Connection,
+    metadata_table: &str,
+    reference_column: &str,
+    reference_tables: &[&str],
+    old_name: &str,
+    new_name: &str,
+) -> Result<()> {
+    let old_name = normalize_metadata_name(old_name)?;
+    let new_name = normalize_metadata_name(new_name)?;
+    let tx = connection.transaction()?;
+    let Some(old_id) = metadata_id_by_name(&tx, metadata_table, &old_name)? else {
+        tx.commit()?;
+        return Ok(());
+    };
+
+    if metadata_names_equal(&old_name, &new_name) {
+        tx.execute(
+            &format!("UPDATE {metadata_table} SET name = ?1 WHERE id = ?2"),
+            params![new_name, old_id],
+        )?;
+        tx.commit()?;
+        return Ok(());
+    }
+
+    if let Some(new_id) = metadata_id_by_name(&tx, metadata_table, &new_name)? {
+        for reference_table in reference_tables {
+            merge_metadata_references(&tx, reference_table, reference_column, old_id, new_id)?;
+        }
+        tx.execute(
+            &format!("DELETE FROM {metadata_table} WHERE id = ?1"),
+            params![old_id],
+        )?;
+    } else {
+        tx.execute(
+            &format!("UPDATE {metadata_table} SET name = ?1 WHERE id = ?2"),
+            params![new_name, old_id],
+        )?;
+    }
+
+    tx.commit()?;
+    Ok(())
+}
+
+fn delete_metadata_item(connection: &Connection, metadata_table: &str, name: &str) -> Result<()> {
+    let name = normalize_metadata_name(name)?;
+    connection.execute(
+        &format!("DELETE FROM {metadata_table} WHERE name = ?1 COLLATE NOCASE"),
+        params![name],
+    )?;
+    Ok(())
+}
+
+fn metadata_id_by_name(
+    tx: &Transaction<'_>,
+    metadata_table: &str,
+    name: &str,
+) -> Result<Option<i64>> {
+    tx.query_row(
+        &format!("SELECT id FROM {metadata_table} WHERE name = ?1 COLLATE NOCASE"),
+        params![name],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .context("could not read metadata item")
+}
+
+fn merge_metadata_references(
+    tx: &Transaction<'_>,
+    reference_table: &str,
+    reference_column: &str,
+    old_id: i64,
+    new_id: i64,
+) -> Result<()> {
+    let owner_column = if reference_table.starts_with("folder_") {
+        "folder_id"
+    } else {
+        "image_id"
+    };
+    tx.execute(
+        &format!(
+            "INSERT OR IGNORE INTO {reference_table}({owner_column}, {reference_column})
+             SELECT {owner_column}, ?1 FROM {reference_table} WHERE {reference_column} = ?2"
+        ),
+        params![new_id, old_id],
+    )?;
+    Ok(())
+}
+
 fn normalize_metadata_name(name: &str) -> Result<String> {
     let normalized = name.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
@@ -2616,6 +2740,10 @@ fn normalize_metadata_name(name: &str) -> Result<String> {
         bail!("metadata name is too long");
     }
     Ok(normalized)
+}
+
+fn metadata_names_equal(left: &str, right: &str) -> bool {
+    left.to_lowercase() == right.to_lowercase()
 }
 
 fn rating_id_for_value(value: u8) -> Result<i64> {
@@ -3096,6 +3224,62 @@ mod tests {
     }
 
     #[test]
+    fn metadata_catalog_rename_merges_and_delete_removes_references() -> Result<()> {
+        let root = temp_root_path("metadata_catalog_rename_merges_and_delete_removes_references");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("Ada"))?;
+        fs::create_dir_all(root.join("Bea"))?;
+        fs::write(root.join("Ada").join("portrait.jpg"), b"image bytes")?;
+        fs::write(root.join("Bea").join("portrait.jpg"), b"image bytes")?;
+
+        let mut db = RootDatabase::open(&root)?;
+        let root_id = db.root_id()?;
+        db.scan(&root_id)?;
+        let ada_id = db.folder_id("Ada")?;
+        let bea_id = db.folder_id("Bea")?;
+
+        db.add_folder_person(&root_id, ada_id, "Ada")?;
+        db.add_folder_person(&root_id, bea_id, "Bea")?;
+        db.rename_person("Ada", "Bea")?;
+        assert_eq!(
+            db.people()?
+                .into_iter()
+                .map(|person| person.name)
+                .collect::<Vec<_>>(),
+            vec!["Bea"]
+        );
+        assert_eq!(db.folder_metadata(&root_id, ada_id)?.people[0].name, "Bea");
+        assert_eq!(db.folder_metadata(&root_id, bea_id)?.people[0].name, "Bea");
+
+        db.add_folder_keyword(&root_id, ada_id, "private")?;
+        db.add_folder_keyword(&root_id, bea_id, "favorite")?;
+        db.rename_keyword("private", "favorite")?;
+        assert_eq!(
+            db.keywords()?
+                .into_iter()
+                .map(|keyword| keyword.name)
+                .collect::<Vec<_>>(),
+            vec!["favorite"]
+        );
+        assert_eq!(
+            db.folder_metadata(&root_id, ada_id)?.tags[0].name,
+            "favorite"
+        );
+        assert_eq!(
+            db.folder_metadata(&root_id, bea_id)?.tags[0].name,
+            "favorite"
+        );
+
+        db.delete_keyword("favorite")?;
+        assert!(db.keywords()?.is_empty());
+        assert!(db.folder_metadata(&root_id, ada_id)?.tags.is_empty());
+        assert!(db.folder_metadata(&root_id, bea_id)?.tags.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
     fn folder_thumbnail_can_be_set_by_relative_path() -> Result<()> {
         let root = temp_root_path("folder_thumbnail_can_be_set_by_relative_path");
         let _ = fs::remove_dir_all(&root);
@@ -3129,6 +3313,42 @@ mod tests {
 
         db.set_folder_thumbnail_by_path("", child_image_id)?;
         assert_eq!(db.root_thumbnail_image_id()?, Some(child_image_id));
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn flattened_folder_summary_uses_visible_parent_for_parent_cover() -> Result<()> {
+        let root = temp_root_path("flattened_folder_summary_uses_visible_parent_for_parent_cover");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("Outer").join("Inner"))?;
+        fs::write(
+            root.join("Outer").join("Inner").join("child.jpg"),
+            b"child image bytes",
+        )?;
+
+        let mut db = RootDatabase::open(&root)?;
+        let root_id = db.root_id()?;
+        db.scan(&root_id)?;
+
+        let root_view = db.folder_view(&root_id, "Root", "")?;
+        assert_eq!(root_view.folders.len(), 1);
+        let inner_summary = &root_view.folders[0];
+        assert_eq!(inner_summary.relative_path, "Outer/Inner");
+        assert_eq!(inner_summary.parent_relative_path.as_deref(), Some(""));
+
+        let image_id = inner_summary
+            .thumbnail_image_id
+            .context("inner folder thumbnail was not available")?;
+        db.set_folder_thumbnail_by_path(
+            inner_summary
+                .parent_relative_path
+                .as_deref()
+                .context("visible parent path was not available")?,
+            image_id,
+        )?;
+        assert_eq!(db.root_thumbnail_image_id()?, Some(image_id));
 
         let _ = fs::remove_dir_all(&root);
         Ok(())

@@ -76,6 +76,12 @@ const warningMessage = document.querySelector("#warning-message");
 const warningDetail = document.querySelector("#warning-detail");
 const warningOkButton = document.querySelector("#warning-ok-button");
 const warningCancelButton = document.querySelector("#warning-cancel-button");
+const metadataEditDialog = document.querySelector("#metadata-edit-dialog");
+const metadataEditForm = document.querySelector("#metadata-edit-form");
+const metadataEditTitle = document.querySelector("#metadata-edit-title");
+const metadataEditLabel = document.querySelector("#metadata-edit-label");
+const metadataEditInput = document.querySelector("#metadata-edit-input");
+const metadataEditCancelButton = document.querySelector("#metadata-edit-cancel-button");
 const upscaleFullscreenInput = document.querySelector("#upscale-fullscreen");
 const slideshowLoopInput = document.querySelector("#slideshow-loop");
 const slideshowSpeedInput = document.querySelector("#slideshow-speed");
@@ -168,6 +174,8 @@ const state = {
   personSearch: "",
   tagDropdownOpen: false,
   tagSearch: "",
+  metadataItemMenu: null,
+  metadataEditDialogResolve: null,
   slideshowTimer: null,
   slideshowActive: false,
   slideshowEnded: false,
@@ -241,6 +249,15 @@ warningDialog.addEventListener("cancel", (event) => {
   event.preventDefault();
   resolveWarningDialog(false);
 });
+metadataEditForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  resolveMetadataEditDialog(metadataEditInput.value);
+});
+metadataEditCancelButton.addEventListener("click", () => resolveMetadataEditDialog(null));
+metadataEditDialog.addEventListener("cancel", (event) => {
+  event.preventDefault();
+  resolveMetadataEditDialog(null);
+});
 metadataBar.addEventListener("click", (event) => {
   handleMetadataBarClick(event).catch(showError);
 });
@@ -248,6 +265,15 @@ metadataBar.addEventListener("input", handleMetadataBarInput);
 metadataBar.addEventListener("keydown", (event) => {
   handleMetadataBarKeydown(event).catch(showError);
 });
+metadataBar.addEventListener(
+  "scroll",
+  (event) => {
+    if (event.target.closest?.(".person-options, .tag-options")) {
+      clearMetadataItemMenu();
+    }
+  },
+  true,
+);
 upscaleFullscreenInput.addEventListener("change", handleSettingsInput);
 slideshowLoopInput.addEventListener("change", handleSettingsInput);
 slideshowSpeedInput.addEventListener("input", handleSlideshowSpeedInput);
@@ -278,7 +304,10 @@ document.addEventListener("fullscreenchange", handleBrowserFullscreenChange);
 document.addEventListener("contextmenu", handleDocumentContextMenu);
 document.addEventListener("click", handleDocumentClick);
 window.addEventListener("blur", hideThumbContextMenu);
-window.addEventListener("resize", hideThumbContextMenu);
+window.addEventListener("resize", () => {
+  hideThumbContextMenu();
+  clearMetadataItemMenu();
+});
 gridNode.addEventListener("scroll", () => scheduleVisibleFolderValidation(250), {
   passive: true,
 });
@@ -1057,6 +1086,7 @@ function clearMetadataSelection() {
   state.personSearch = "";
   state.tagDropdownOpen = false;
   state.tagSearch = "";
+  clearMetadataItemMenu();
   renderMetadataBar();
 }
 
@@ -1487,21 +1517,19 @@ function updatePersonDropdownOptions() {
   ]);
   const query = state.personSearch.trim().toLowerCase();
   const options = state.peopleOptions
-    .filter((person) => !assignedNames.has(normalizedMetadataName(person.name)))
     .filter((person) => !query || person.name.toLowerCase().includes(query))
     .sort((left, right) =>
       left.name.localeCompare(right.name, undefined, { sensitivity: "base" }),
     );
 
   optionsNode.replaceChildren(
-    ...options.map((person) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "person-option";
-      button.dataset.personName = person.name;
-      button.textContent = person.name;
-      return button;
-    }),
+    ...options.map((person) =>
+      renderMetadataOptionRow(
+        "person",
+        person.name,
+        assignedNames.has(normalizedMetadataName(person.name)),
+      ),
+    ),
   );
 }
 
@@ -1518,22 +1546,84 @@ function updateTagDropdownOptions() {
   ]);
   const query = state.tagSearch.trim().toLowerCase();
   const options = state.tagOptions
-    .filter((tag) => !assignedNames.has(normalizedMetadataName(tag.name)))
     .filter((tag) => !query || tag.name.toLowerCase().includes(query))
     .sort((left, right) =>
       left.name.localeCompare(right.name, undefined, { sensitivity: "base" }),
     );
 
   optionsNode.replaceChildren(
-    ...options.map((tag) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "tag-option";
-      button.dataset.tagName = tag.name;
-      button.textContent = tag.name;
-      return button;
-    }),
+    ...options.map((tag) =>
+      renderMetadataOptionRow(
+        "tag",
+        tag.name,
+        assignedNames.has(normalizedMetadataName(tag.name)),
+      ),
+    ),
   );
+}
+
+function renderMetadataOptionRow(kind, name, assigned) {
+  const row = document.createElement("div");
+  row.className = "metadata-option-row";
+  row.dataset.metadataKind = kind;
+  row.dataset.metadataName = name;
+
+  const mainButton = document.createElement("button");
+  mainButton.type = "button";
+  mainButton.className = `${kind === "person" ? "person-option" : "tag-option"} metadata-option-main`;
+  mainButton.dataset[kind === "person" ? "personName" : "tagName"] = name;
+  mainButton.textContent = name;
+  mainButton.disabled = assigned;
+  if (assigned) {
+    mainButton.title = "Already assigned";
+  }
+
+  const menuButton = document.createElement("button");
+  menuButton.type = "button";
+  menuButton.className = "metadata-option-menu-button";
+  menuButton.dataset.action = "toggle-metadata-item-menu";
+  menuButton.dataset.metadataKind = kind;
+  menuButton.dataset.metadataName = name;
+  menuButton.title = `${metadataKindLabel(kind)} actions`;
+  menuButton.setAttribute("aria-label", `${metadataKindLabel(kind)} actions`);
+  menuButton.innerHTML = iconSvg("moreHorizontal");
+
+  row.append(mainButton, menuButton);
+  return row;
+}
+
+function renderMetadataItemMenu(kind, name) {
+  const menu = document.createElement("div");
+  menu.className = "metadata-item-menu";
+  menu.setAttribute("role", "menu");
+
+  const editButton = document.createElement("button");
+  editButton.type = "button";
+  editButton.dataset.action = "edit-metadata-item";
+  editButton.dataset.metadataKind = kind;
+  editButton.dataset.metadataName = name;
+  editButton.textContent = "Edit";
+
+  const deleteButton = document.createElement("button");
+  deleteButton.type = "button";
+  deleteButton.dataset.action = "delete-metadata-item";
+  deleteButton.dataset.metadataKind = kind;
+  deleteButton.dataset.metadataName = name;
+  deleteButton.textContent = "Delete";
+
+  menu.append(editButton, deleteButton);
+  return menu;
+}
+
+function metadataItemMenuMatches(kind, name) {
+  return (
+    state.metadataItemMenu?.kind === kind &&
+    normalizedMetadataName(state.metadataItemMenu.name) === normalizedMetadataName(name)
+  );
+}
+
+function metadataKindLabel(kind) {
+  return kind === "person" ? "Person" : "Tag";
 }
 
 function updateSearchPersonDropdownOptions() {
@@ -1601,6 +1691,7 @@ async function openPersonDropdown() {
   state.personSearch = "";
   state.tagDropdownOpen = false;
   state.tagSearch = "";
+  clearMetadataItemMenu();
   if (!state.peopleOptionsLoaded) {
     state.peopleOptions = [];
   }
@@ -1618,6 +1709,7 @@ async function openTagDropdown() {
   state.tagSearch = "";
   state.personDropdownOpen = false;
   state.personSearch = "";
+  clearMetadataItemMenu();
   if (!state.tagOptionsLoaded) {
     state.tagOptions = [];
   }
@@ -1631,6 +1723,7 @@ function closePersonDropdown() {
   }
   state.personDropdownOpen = false;
   state.personSearch = "";
+  clearMetadataItemMenu();
   renderMetadataBar();
 }
 
@@ -1640,15 +1733,17 @@ function closeTagDropdown() {
   }
   state.tagDropdownOpen = false;
   state.tagSearch = "";
+  clearMetadataItemMenu();
   renderMetadataBar();
 }
 
 function closeMetadataDropdowns() {
-  const wasOpen = state.personDropdownOpen || state.tagDropdownOpen;
+  const wasOpen = state.personDropdownOpen || state.tagDropdownOpen || state.metadataItemMenu;
   state.personDropdownOpen = false;
   state.personSearch = "";
   state.tagDropdownOpen = false;
   state.tagSearch = "";
+  clearMetadataItemMenu();
   if (wasOpen) {
     renderMetadataBar();
   }
@@ -1832,6 +1927,7 @@ function iconSvg(name) {
     play: `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M8 5.2v13.6L18.7 12Z"></path></svg>`,
     reset: `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5.5 8.5A7.3 7.3 0 0 1 18 6.9"></path><path d="M18 4.2v3.4h-3.4"></path><path d="M18.5 15.5A7.3 7.3 0 0 1 6 17.1"></path><path d="M6 19.8v-3.4h3.4"></path></svg>`,
     refresh: `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M20 11a8 8 0 0 0-14.2-4.9"></path><path d="M5 3.8v4h4"></path><path d="M4 13a8 8 0 0 0 14.2 4.9"></path><path d="M19 20.2v-4h-4"></path></svg>`,
+    moreHorizontal: `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="6" cy="12" r="1.4"></circle><circle cx="12" cy="12" r="1.4"></circle><circle cx="18" cy="12" r="1.4"></circle></svg>`,
   };
   return icons[name] ?? "";
 }
@@ -1896,6 +1992,28 @@ async function handleMetadataBarClick(event) {
       } else {
         await openTagDropdown();
       }
+      return;
+    }
+    if (action === "toggle-metadata-item-menu") {
+      toggleMetadataItemMenu(
+        actionButton.dataset.metadataKind,
+        actionButton.dataset.metadataName,
+        actionButton,
+      );
+      return;
+    }
+    if (action === "edit-metadata-item") {
+      await editMetadataItem(
+        actionButton.dataset.metadataKind,
+        actionButton.dataset.metadataName,
+      );
+      return;
+    }
+    if (action === "delete-metadata-item") {
+      await deleteMetadataItem(
+        actionButton.dataset.metadataKind,
+        actionButton.dataset.metadataName,
+      );
       return;
     }
     if (action === "remove-person") {
@@ -2346,6 +2464,180 @@ async function removeCurrentFolderTag(tagId) {
   invalidateFolderViewCache(target.rootId);
   invalidateSearchCaches();
   await patchCurrentFolderFromDb({ keepStatus: true });
+}
+
+function toggleMetadataItemMenu(kind, name, anchor) {
+  kind = normalizeMetadataKind(kind);
+  const cleanName = String(name || "").trim();
+  if (!kind || !cleanName) {
+    return;
+  }
+
+  if (metadataItemMenuMatches(kind, cleanName)) {
+    clearMetadataItemMenu();
+    return;
+  }
+
+  state.metadataItemMenu = { kind, name: cleanName };
+  showMetadataItemMenuOverlay(kind, cleanName, anchor);
+}
+
+function showMetadataItemMenuOverlay(kind, name, anchor) {
+  removeMetadataItemMenuOverlay();
+  const menu = renderMetadataItemMenu(kind, name);
+  metadataBar.append(menu);
+
+  const anchorRect = anchor.getBoundingClientRect();
+  const menuRect = menu.getBoundingClientRect();
+  const gap = 4;
+  const margin = 8;
+  const left = Math.min(
+    window.innerWidth - menuRect.width - margin,
+    Math.max(margin, anchorRect.right - menuRect.width),
+  );
+  let top = anchorRect.bottom + gap;
+  if (top + menuRect.height + margin > window.innerHeight) {
+    top = anchorRect.top - menuRect.height - gap;
+  }
+
+  menu.style.left = `${Math.max(margin, left)}px`;
+  menu.style.top = `${Math.max(margin, top)}px`;
+}
+
+function clearMetadataItemMenu() {
+  state.metadataItemMenu = null;
+  removeMetadataItemMenuOverlay();
+}
+
+function removeMetadataItemMenuOverlay() {
+  metadataBar.querySelector(".metadata-item-menu")?.remove();
+}
+
+async function editMetadataItem(kind, name) {
+  kind = normalizeMetadataKind(kind);
+  const oldName = String(name || "").trim();
+  if (!invoke || !kind || !oldName) {
+    return;
+  }
+
+  const newName = await promptMetadataEdit(kind, oldName);
+  const cleanName = String(newName || "").trim();
+  if (!cleanName || cleanName === oldName) {
+    clearMetadataItemMenu();
+    return;
+  }
+
+  const label = metadataKindLabel(kind).toLowerCase();
+  setStatus(`Updating ${label}...`);
+  await invoke(kind === "person" ? "rename_metadata_person" : "rename_metadata_tag", {
+    oldName,
+    newName: cleanName,
+  });
+  renameMetadataReferencesInState(kind, oldName, cleanName);
+  await refreshAfterMetadataCatalogChange(kind);
+  setStatus(`${metadataKindLabel(kind)} updated`);
+}
+
+async function deleteMetadataItem(kind, name) {
+  kind = normalizeMetadataKind(kind);
+  const cleanName = String(name || "").trim();
+  if (!invoke || !kind || !cleanName) {
+    return;
+  }
+
+  const label = metadataKindLabel(kind).toLowerCase();
+  const confirmed = await confirmWarning(
+    `Delete ${label} "${cleanName}"?`,
+    `This removes the ${label} and all references from every connected root database.`,
+  );
+  if (!confirmed) {
+    clearMetadataItemMenu();
+    return;
+  }
+
+  setStatus(`Deleting ${label}...`);
+  await invoke(kind === "person" ? "delete_metadata_person" : "delete_metadata_tag", {
+    name: cleanName,
+  });
+  deleteMetadataReferencesInState(kind, cleanName);
+  await refreshAfterMetadataCatalogChange(kind);
+  setStatus(`${metadataKindLabel(kind)} deleted`);
+}
+
+async function refreshAfterMetadataCatalogChange(kind) {
+  clearMetadataItemMenu();
+  state.personDropdownOpen = false;
+  state.personSearch = "";
+  state.tagDropdownOpen = false;
+  state.tagSearch = "";
+  if (kind === "person") {
+    state.peopleOptions = [];
+    state.peopleOptionsLoaded = false;
+  } else {
+    state.tagOptions = [];
+    state.tagOptionsLoaded = false;
+  }
+  invalidateFolderViewCache();
+  invalidateSearchCaches();
+  if (state.currentRootId && !state.atRootOverview) {
+    await patchCurrentFolderFromDb({ keepStatus: true });
+  } else {
+    renderMetadataBar();
+  }
+}
+
+function renameMetadataReferencesInState(kind, oldName, newName) {
+  if (kind === "person") {
+    if (metadataNamesMatch(state.searchPerson?.name, oldName)) {
+      state.searchPerson = { name: newName };
+    }
+    return;
+  }
+
+  state.searchIncludeTags = renameSearchTags(state.searchIncludeTags, oldName, newName);
+  state.searchExcludeTags = renameSearchTags(state.searchExcludeTags, oldName, newName);
+}
+
+function deleteMetadataReferencesInState(kind, name) {
+  if (kind === "person") {
+    if (metadataNamesMatch(state.searchPerson?.name, name)) {
+      state.searchPerson = null;
+    }
+    return;
+  }
+
+  state.searchIncludeTags = state.searchIncludeTags.filter(
+    (tag) => !metadataNamesMatch(tag.name, name),
+  );
+  state.searchExcludeTags = state.searchExcludeTags.filter(
+    (tag) => !metadataNamesMatch(tag.name, name),
+  );
+}
+
+function renameSearchTags(tags, oldName, newName) {
+  const seen = new Set();
+  const renamed = [];
+  for (const tag of tags) {
+    const name = metadataNamesMatch(tag.name, oldName) ? newName : tag.name;
+    const key = normalizedMetadataName(name);
+    if (!key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    renamed.push({ ...tag, name });
+  }
+  return renamed;
+}
+
+function metadataNamesMatch(left, right) {
+  return normalizedMetadataName(left) === normalizedMetadataName(right);
+}
+
+function normalizeMetadataKind(kind) {
+  if (kind === "person" || kind === "tag") {
+    return kind;
+  }
+  return null;
 }
 
 function applyCurrentFolderMetadata(metadata, target) {
@@ -4208,6 +4500,9 @@ function handleDocumentClick(event) {
 }
 
 function shouldClosePersonDropdownForClick(target) {
+  if (target.closest(".metadata-item-menu")) {
+    return false;
+  }
   if (target.closest(".person-dropdown")) {
     return false;
   }
@@ -4218,6 +4513,9 @@ function shouldClosePersonDropdownForClick(target) {
 }
 
 function shouldCloseTagDropdownForClick(target) {
+  if (target.closest(".metadata-item-menu")) {
+    return false;
+  }
   if (target.closest(".tag-dropdown")) {
     return false;
   }
@@ -4408,7 +4706,7 @@ async function convertImagePngToJpg(image) {
   invalidateFolderViewCache(image.root_id, state.currentPath);
   invalidateFolderViewCache(image.root_id, parentPathFor(state.currentPath));
   await refreshCurrentFolder({ keepStatus: true, forceReload: true });
-  setStatus(`Created JPG from ${image.file_name}`);
+  setStatus(`Converted ${image.file_name} to JPG`);
 }
 
 async function convertFolderPngsToJpg(folder) {
@@ -4431,7 +4729,7 @@ async function convertFolderPngsToJpg(folder) {
   if (converted === 0) {
     setStatus(`No PNG images found in ${folderName}`);
   } else {
-    setStatus(`Created ${converted} JPG ${converted === 1 ? "file" : "files"} in ${folderName}`);
+    setStatus(`Converted ${converted} PNG ${converted === 1 ? "file" : "files"} to JPG in ${folderName}`);
   }
 }
 
@@ -4618,6 +4916,41 @@ function resolveWarningDialog(confirmed) {
     warningDialog.close();
   }
   resolve(Boolean(confirmed));
+}
+
+function promptMetadataEdit(kind, name) {
+  if (state.metadataEditDialogResolve) {
+    return Promise.resolve(null);
+  }
+
+  const label = metadataKindLabel(kind);
+  metadataEditTitle.textContent = `Edit ${label}`;
+  metadataEditLabel.textContent = `${label} name`;
+  metadataEditInput.value = name;
+  if (!metadataEditDialog.open) {
+    metadataEditDialog.showModal();
+  }
+  requestAnimationFrame(() => {
+    metadataEditInput.focus({ preventScroll: true });
+    metadataEditInput.select();
+  });
+
+  return new Promise((resolve) => {
+    state.metadataEditDialogResolve = resolve;
+  });
+}
+
+function resolveMetadataEditDialog(value) {
+  const resolve = state.metadataEditDialogResolve;
+  if (!resolve) {
+    return;
+  }
+
+  state.metadataEditDialogResolve = null;
+  if (metadataEditDialog.open) {
+    metadataEditDialog.close();
+  }
+  resolve(value);
 }
 
 async function moveImageToRecycleBin(image) {

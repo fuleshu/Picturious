@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use image::codecs::jpeg::JpegEncoder;
 use image::{ExtendedColorType, ImageReader, Rgb, RgbImage};
 use std::fs::{self, File};
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use turbojpeg::{Transform, TransformOp};
 
@@ -33,18 +33,28 @@ pub fn convert_png_to_jpg(path: &Path, quality: u8) -> Result<PathBuf> {
         .with_context(|| format!("could not decode {}", path.display()))?;
     let rgb = rgba_over_white_to_rgb(image.to_rgba8());
     let output_path = unique_jpg_path_for(path)?;
-    let file = File::create(&output_path)
-        .with_context(|| format!("could not write {}", output_path.display()))?;
+    let temp_path = temp_jpg_path_for(path)?;
+    let file = File::create(&temp_path)
+        .with_context(|| format!("could not write {}", temp_path.display()))?;
     let mut writer = BufWriter::new(file);
-    let mut encoder = JpegEncoder::new_with_quality(&mut writer, clamp_jpeg_quality(quality));
-    encoder
-        .encode(
-            rgb.as_raw(),
-            rgb.width(),
-            rgb.height(),
-            ExtendedColorType::Rgb8,
-        )
-        .with_context(|| format!("could not encode {}", output_path.display()))?;
+    {
+        let mut encoder = JpegEncoder::new_with_quality(&mut writer, clamp_jpeg_quality(quality));
+        encoder
+            .encode(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                ExtendedColorType::Rgb8,
+            )
+            .with_context(|| format!("could not encode {}", temp_path.display()))?;
+    }
+    writer
+        .flush()
+        .with_context(|| format!("could not flush {}", temp_path.display()))?;
+    drop(writer);
+    replace_file(&temp_path, &output_path)
+        .with_context(|| format!("could not write {}", output_path.display()))?;
+    fs::remove_file(path).with_context(|| format!("could not remove {}", path.display()))?;
 
     Ok(output_path)
 }
@@ -104,12 +114,44 @@ fn copy_temp_over_original(temp_path: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn replace_file(source: &Path, destination: &Path) -> Result<()> {
+    if destination.exists() {
+        fs::remove_file(destination)
+            .with_context(|| format!("could not replace {}", destination.display()))?;
+    }
+
+    match fs::rename(source, destination) {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            fs::copy(source, destination).with_context(|| {
+                format!(
+                    "could not copy {} to {} after rename failed: {rename_error}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+            fs::remove_file(source)
+                .with_context(|| format!("could not remove {}", source.display()))?;
+            Ok(())
+        }
+    }
+}
+
 fn temp_path_for(path: &Path) -> Result<PathBuf> {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .context("image path has no file name")?;
     let temp_name = format!(".picturious-rotate-{}-{file_name}", std::process::id());
+    Ok(path.with_file_name(temp_name))
+}
+
+fn temp_jpg_path_for(path: &Path) -> Result<PathBuf> {
+    let file_name = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .context("image path has no file name")?;
+    let temp_name = format!(".picturious-convert-{}-{file_name}.jpg", std::process::id());
     Ok(path.with_file_name(temp_name))
 }
 
@@ -178,7 +220,7 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn convert_png_to_jpg_preserves_original_and_uses_unique_name() -> Result<()> {
+    fn convert_png_to_jpg_replaces_original_and_uses_unique_name() -> Result<()> {
         let folder =
             std::env::temp_dir().join(format!("picturious-convert-png-to-jpg-{}", Uuid::new_v4()));
         let _ = fs::remove_dir_all(&folder);
@@ -197,8 +239,9 @@ mod tests {
             converted.file_name().and_then(|name| name.to_str()),
             Some("alpha-1.jpg")
         );
-        assert!(source.is_file());
+        assert!(!source.exists());
         assert!(converted.is_file());
+        assert_eq!(fs::read(&existing)?, b"existing jpg");
         assert_eq!(image_dimensions(&converted)?, (2, 1));
 
         let _ = fs::remove_dir_all(&folder);

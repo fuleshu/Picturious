@@ -345,6 +345,46 @@ impl LibraryManager {
             .collect())
     }
 
+    pub fn rename_person_everywhere(&self, old_name: &str, new_name: &str) -> Result<()> {
+        for root in &self.roots {
+            let Ok(mut db) = self.open_connected_database(root) else {
+                continue;
+            };
+            db.rename_person(old_name, new_name)?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_person_everywhere(&self, name: &str) -> Result<()> {
+        for root in &self.roots {
+            let Ok(db) = self.open_connected_database(root) else {
+                continue;
+            };
+            db.delete_person(name)?;
+        }
+        Ok(())
+    }
+
+    pub fn rename_keyword_everywhere(&self, old_name: &str, new_name: &str) -> Result<()> {
+        for root in &self.roots {
+            let Ok(mut db) = self.open_connected_database(root) else {
+                continue;
+            };
+            db.rename_keyword(old_name, new_name)?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_keyword_everywhere(&self, name: &str) -> Result<()> {
+        for root in &self.roots {
+            let Ok(db) = self.open_connected_database(root) else {
+                continue;
+            };
+            db.delete_keyword(name)?;
+        }
+        Ok(())
+    }
+
     pub fn search_metadata(&self, query: &MetadataSearchQuery) -> Result<Vec<FolderSummary>> {
         let mut folders = Vec::new();
         for root in &self.roots {
@@ -696,6 +736,78 @@ mod tests {
                 .map(|tag| tag.name)
                 .collect::<Vec<_>>(),
             vec!["favorite"]
+        );
+
+        let _ = fs::remove_dir_all(&workspace);
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_terms_can_be_edited_across_connected_roots() -> Result<()> {
+        let workspace = temp_path("metadata_terms_can_be_edited_across_connected_roots");
+        let config_dir = workspace.join("config");
+        let root_a = workspace.join("root-a");
+        let root_b = workspace.join("root-b");
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(&root_a)?;
+        fs::create_dir_all(&root_b)?;
+
+        let mut manager = LibraryManager::new(&config_dir)?;
+        let root_a = manager.add_root(root_a.to_string_lossy().as_ref())?;
+        let root_b = manager.add_root(root_b.to_string_lossy().as_ref())?;
+        let root_a_folder_id = manager.folder_view(&root_a.id, "")?.folder_id;
+        let root_b_folder_id = manager.folder_view(&root_b.id, "")?.folder_id;
+
+        manager.add_folder_person(&root_a.id, root_a_folder_id, "Max")?;
+        manager.add_folder_person(&root_b.id, root_b_folder_id, "Max")?;
+        manager.rename_person_everywhere("Max", "Ada")?;
+        assert_eq!(
+            manager
+                .all_people()?
+                .into_iter()
+                .map(|person| person.name)
+                .collect::<Vec<_>>(),
+            vec!["Ada"]
+        );
+        assert_eq!(
+            manager
+                .folder_metadata(&root_a.id, root_a_folder_id)?
+                .people[0]
+                .name,
+            "Ada"
+        );
+        assert_eq!(
+            manager
+                .folder_metadata(&root_b.id, root_b_folder_id)?
+                .people[0]
+                .name,
+            "Ada"
+        );
+
+        manager.add_folder_keyword(&root_a.id, root_a_folder_id, "favorite")?;
+        manager.add_folder_keyword(&root_b.id, root_b_folder_id, "favorite")?;
+        manager.rename_keyword_everywhere("favorite", "keeper")?;
+        assert_eq!(
+            manager
+                .all_keywords()?
+                .into_iter()
+                .map(|tag| tag.name)
+                .collect::<Vec<_>>(),
+            vec!["keeper"]
+        );
+        manager.delete_keyword_everywhere("keeper")?;
+        assert!(manager.all_keywords()?.is_empty());
+        assert!(
+            manager
+                .folder_metadata(&root_a.id, root_a_folder_id)?
+                .tags
+                .is_empty()
+        );
+        assert!(
+            manager
+                .folder_metadata(&root_b.id, root_b_folder_id)?
+                .tags
+                .is_empty()
         );
 
         let _ = fs::remove_dir_all(&workspace);

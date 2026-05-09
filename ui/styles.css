@@ -701,6 +701,76 @@ button:disabled {
   font-size: 13px;
 }
 
+.metadata-option-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 30px;
+  align-items: center;
+  border-radius: 5px;
+}
+
+.metadata-option-main {
+  min-width: 0;
+}
+
+.metadata-option-main:disabled {
+  color: #8a9290;
+  cursor: default;
+}
+
+.metadata-option-menu-button {
+  display: grid;
+  width: 30px;
+  min-height: 30px;
+  place-items: center;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #52595d;
+  padding: 0;
+}
+
+.metadata-option-menu-button:hover,
+.metadata-option-menu-button:focus-visible {
+  background: #edf2f0;
+  color: #202326;
+}
+
+.metadata-option-menu-button svg {
+  display: block;
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
+}
+
+.metadata-item-menu {
+  position: fixed;
+  z-index: 40;
+  display: flex;
+  width: 122px;
+  flex-direction: column;
+  gap: 2px;
+  border: 1px solid #c8cdd0;
+  border-radius: 7px;
+  background: #ffffff;
+  box-shadow: 0 10px 26px rgba(20, 24, 27, 0.16);
+  padding: 4px;
+}
+
+.metadata-item-menu button {
+  min-height: 28px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  padding: 0 8px;
+  text-align: left;
+  font-size: 13px;
+}
+
+.metadata-item-menu button:hover,
+.metadata-item-menu button:focus-visible {
+  background: #e8efec;
+}
+
 .person-option:hover,
 .person-option:focus-visible,
 .tag-option:hover,
@@ -1033,6 +1103,23 @@ button:disabled {
   background: rgba(18, 22, 24, 0.32);
 }
 
+.metadata-edit-dialog {
+  position: fixed;
+  inset: 0;
+  width: min(420px, calc(100vw - 36px));
+  border: 1px solid #c8cdd0;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #202326;
+  margin: auto;
+  padding: 0;
+  box-shadow: 0 24px 70px rgba(20, 24, 27, 0.25);
+}
+
+.metadata-edit-dialog::backdrop {
+  background: rgba(18, 22, 24, 0.32);
+}
+
 .settings-panel {
   display: flex;
   flex-direction: column;
@@ -1229,6 +1316,58 @@ button:disabled {
 }
 
 .warning-primary-button:hover:not(:disabled) {
+  border-color: #174c46;
+  background: #174c46;
+}
+
+.metadata-edit-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px;
+}
+
+.metadata-edit-header h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.metadata-edit-row {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  font-size: 14px;
+}
+
+.metadata-edit-row input {
+  width: 100%;
+  min-height: 34px;
+  border: 1px solid #c8cdd0;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #202326;
+  font: inherit;
+  padding: 6px 8px;
+}
+
+.metadata-edit-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.metadata-edit-actions button {
+  min-width: 78px;
+  padding: 0 14px;
+}
+
+.metadata-edit-primary-button {
+  border-color: #23645d;
+  background: #23645d;
+  color: #ffffff;
+}
+
+.metadata-edit-primary-button:hover:not(:disabled) {
   border-color: #174c46;
   background: #174c46;
 }
