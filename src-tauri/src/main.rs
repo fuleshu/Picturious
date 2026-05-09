@@ -25,10 +25,15 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{
     AppHandle, Emitter, Manager, Monitor, PhysicalPosition, PhysicalSize, Position, Size, State,
-    WebviewWindow, Window, WindowEvent, ipc::Response,
+    WebviewWindow, WindowEvent, ipc::Response,
 };
 
 const KLUTZGAMES_HOMEPAGE: &str = "https://www.klutzgames.com";
+const DEFAULT_WINDOW_WIDTH: u32 = 1280;
+const DEFAULT_WINDOW_HEIGHT: u32 = 820;
+const MIN_RESTORED_WINDOW_WIDTH: u32 = 640;
+const MIN_RESTORED_WINDOW_HEIGHT: u32 = 480;
+const MONITOR_SIZED_WINDOW_TOLERANCE: u32 = 8;
 
 struct AppState {
     library: Arc<Mutex<LibraryManager>>,
@@ -37,6 +42,8 @@ struct AppState {
     active_movie_jobs: Arc<Mutex<HashMap<String, MovieJobControl>>>,
     settings: Arc<Mutex<UiSettings>>,
     settings_path: Arc<PathBuf>,
+    window_state_suppressed_until: Arc<Mutex<Option<Instant>>>,
+    window_closing: Arc<AtomicBool>,
 }
 
 struct ActiveRootGuard {
@@ -112,6 +119,8 @@ struct UiSettings {
     external_viewers: Vec<ExternalViewer>,
     #[serde(default)]
     window: Option<WindowSettings>,
+    #[serde(default)]
+    window_mode: WindowMode,
 }
 
 impl Default for UiSettings {
@@ -135,6 +144,7 @@ impl Default for UiSettings {
             movie_slideshow_seconds: default_movie_slideshow_seconds(),
             external_viewers: Vec::new(),
             window: None,
+            window_mode: WindowMode::Normal,
         }
     }
 }
@@ -226,6 +236,24 @@ struct WindowSettings {
     y: i32,
     width: u32,
     height: u32,
+    #[serde(default, skip_serializing)]
+    maximized: bool,
+    #[serde(default, skip_serializing)]
+    fullscreen: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WindowMode {
+    Normal,
+    Maximized,
+    Fullscreen,
+}
+
+impl Default for WindowMode {
+    fn default() -> Self {
+        Self::Normal
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -945,16 +973,45 @@ fn save_asset_thumbnail(
 }
 
 #[tauri::command]
-fn set_viewer_fullscreen(fullscreen: bool, window: Window) -> Result<(), String> {
+fn set_viewer_fullscreen(
+    fullscreen: bool,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    suppress_window_state_tracking(
+        &state.window_state_suppressed_until,
+        Duration::from_millis(2500),
+    );
     if fullscreen {
+        save_windowed_state_before_fullscreen(
+            &window,
+            &state.settings,
+            state.settings_path.as_ref().as_path(),
+        )
+        .map_err(error_message)?;
         window.set_focus().map_err(|error| error.to_string())?;
-    }
-    window
-        .set_fullscreen(fullscreen)
-        .map_err(|error| error.to_string())?;
-    if fullscreen {
+        window
+            .set_fullscreen(true)
+            .map_err(|error| error.to_string())?;
+        set_saved_window_mode(
+            &state.settings,
+            state.settings_path.as_ref().as_path(),
+            WindowMode::Fullscreen,
+        )
+        .map_err(error_message)?;
         window.set_focus().map_err(|error| error.to_string())?;
+    } else {
+        window
+            .set_fullscreen(false)
+            .map_err(|error| error.to_string())?;
+        restore_saved_fullscreen_window(
+            &window,
+            &state.settings,
+            state.settings_path.as_ref().as_path(),
+        )
+        .map_err(error_message)?;
     }
+
     Ok(())
 }
 
@@ -1634,12 +1691,28 @@ fn main() {
                 active_movie_jobs: Arc::new(Mutex::new(HashMap::new())),
                 settings: settings.clone(),
                 settings_path: settings_path.clone(),
+                window_state_suppressed_until: Arc::new(Mutex::new(None)),
+                window_closing: Arc::new(AtomicBool::new(false)),
             });
             if let Some(window) = app.get_webview_window("main") {
                 if let Ok(settings_snapshot) = settings.lock().map(|settings| settings.clone()) {
+                    if settings_snapshot.window_mode != WindowMode::Normal {
+                        let state = app.state::<AppState>();
+                        suppress_window_state_tracking(
+                            &state.window_state_suppressed_until,
+                            Duration::from_secs(3),
+                        );
+                    }
                     let _ = restore_window_state(&window, &settings_snapshot);
                 }
-                track_window_state(&window, settings, settings_path);
+                let state = app.state::<AppState>();
+                track_window_state(
+                    &window,
+                    settings,
+                    settings_path,
+                    state.window_state_suppressed_until.clone(),
+                    state.window_closing.clone(),
+                );
             }
             Ok(())
         })
@@ -2708,6 +2781,17 @@ fn normalize_movie_custom_resolution(value: &str) -> String {
 }
 
 fn sanitize_ui_settings(settings: &mut UiSettings) {
+    if let Some(window) = settings.window.as_mut() {
+        if settings.window_mode == WindowMode::Normal {
+            if window.fullscreen {
+                settings.window_mode = WindowMode::Fullscreen;
+            } else if window.maximized {
+                settings.window_mode = WindowMode::Maximized;
+            }
+        }
+        window.fullscreen = false;
+        window.maximized = false;
+    }
     settings.thumb_scale = clamp_thumb_scale(settings.thumb_scale);
     settings.slideshow_speed_seconds =
         normalize_slideshow_speed_seconds(settings.slideshow_speed_seconds);
@@ -2773,28 +2857,21 @@ fn write_ui_settings(path: &Path, settings: &UiSettings) -> anyhow::Result<()> {
 }
 
 fn restore_window_state(window: &WebviewWindow, settings: &UiSettings) -> anyhow::Result<()> {
-    let Some(saved) = settings.window.as_ref() else {
-        return Ok(());
-    };
-    let restored = WindowSettings {
-        x: saved.x,
-        y: saved.y,
-        width: saved.width.clamp(640, 10_000),
-        height: saved.height.clamp(480, 10_000),
-    };
-
-    let monitors = window.available_monitors()?;
-    if !window_rect_visible(&restored, &monitors) {
-        return Ok(());
+    let saved = settings
+        .window
+        .clone()
+        .unwrap_or_else(default_window_settings);
+    let _ = restore_saved_windowed_state(window, &saved)?;
+    match settings.window_mode {
+        WindowMode::Normal => {}
+        WindowMode::Maximized => {
+            window.maximize()?;
+        }
+        WindowMode::Fullscreen => {
+            window.set_fullscreen(true)?;
+        }
     }
 
-    window.set_size(Size::Physical(PhysicalSize::new(
-        restored.width,
-        restored.height,
-    )))?;
-    window.set_position(Position::Physical(PhysicalPosition::new(
-        restored.x, restored.y,
-    )))?;
     Ok(())
 }
 
@@ -2802,10 +2879,27 @@ fn track_window_state(
     window: &WebviewWindow,
     settings: Arc<Mutex<UiSettings>>,
     settings_path: Arc<PathBuf>,
+    suppressed_until: Arc<Mutex<Option<Instant>>>,
+    closing: Arc<AtomicBool>,
 ) {
     let tracked_window = window.clone();
     window.on_window_event(move |event| {
+        if matches!(event, WindowEvent::CloseRequested { .. }) {
+            closing.store(true, AtomicOrdering::SeqCst);
+            let _ = save_window_close_state(
+                &tracked_window,
+                &settings,
+                settings_path.as_ref().as_path(),
+            );
+            return;
+        }
+
         if matches!(event, WindowEvent::Moved(_) | WindowEvent::Resized(_)) {
+            if closing.load(AtomicOrdering::SeqCst)
+                || window_state_tracking_is_suppressed(&suppressed_until)
+            {
+                return;
+            }
             let _ = save_current_window_state(
                 &tracked_window,
                 &settings,
@@ -2821,45 +2915,317 @@ fn save_current_window_state(
     settings_path: &Path,
 ) -> anyhow::Result<()> {
     if window.is_fullscreen().unwrap_or(false) {
+        return set_saved_window_mode(settings, settings_path, WindowMode::Fullscreen);
+    }
+
+    if window.is_minimized().unwrap_or(false) {
         return Ok(());
     }
 
-    let position = window.outer_position()?;
-    let size = window.outer_size()?;
-    if size.width < 320 || size.height < 240 {
-        return Ok(());
+    if window.is_maximized().unwrap_or(false) {
+        return set_saved_window_mode(settings, settings_path, WindowMode::Maximized);
     }
+
+    let Some(current) = current_normal_window_state(window)? else {
+        return Ok(());
+    };
 
     let mut settings = settings
         .lock()
         .map_err(|_| anyhow::anyhow!("app settings are locked"))?;
-    settings.window = Some(WindowSettings {
+    settings.window = Some(current);
+    settings.window_mode = WindowMode::Normal;
+    write_ui_settings(settings_path, &settings)
+}
+
+fn save_window_close_state(
+    window: &WebviewWindow,
+    settings: &Arc<Mutex<UiSettings>>,
+    settings_path: &Path,
+) -> anyhow::Result<()> {
+    let saved_mode = settings
+        .lock()
+        .map_err(|_| anyhow::anyhow!("app settings are locked"))?
+        .window_mode;
+
+    if window.is_fullscreen().unwrap_or(false) || saved_mode == WindowMode::Fullscreen {
+        return set_saved_window_mode(settings, settings_path, WindowMode::Fullscreen);
+    }
+
+    if window.is_minimized().unwrap_or(false) {
+        return Ok(());
+    }
+
+    if window.is_maximized().unwrap_or(false) || saved_mode == WindowMode::Maximized {
+        return set_saved_window_mode(settings, settings_path, WindowMode::Maximized);
+    }
+
+    save_current_window_state(window, settings, settings_path)
+}
+
+fn save_windowed_state_before_fullscreen(
+    window: &WebviewWindow,
+    settings: &Arc<Mutex<UiSettings>>,
+    settings_path: &Path,
+) -> anyhow::Result<()> {
+    if window.is_fullscreen().unwrap_or(false) || window.is_minimized().unwrap_or(false) {
+        return Ok(());
+    }
+
+    if window.is_maximized().unwrap_or(false) {
+        return set_saved_window_mode(settings, settings_path, WindowMode::Maximized);
+    }
+
+    let Some(current) = current_normal_window_state(window)? else {
+        return Ok(());
+    };
+    let mut settings = settings
+        .lock()
+        .map_err(|_| anyhow::anyhow!("app settings are locked"))?;
+    settings.window = Some(current);
+    settings.window_mode = WindowMode::Normal;
+    write_ui_settings(settings_path, &settings)
+}
+
+fn restore_saved_fullscreen_window(
+    window: &WebviewWindow,
+    settings: &Arc<Mutex<UiSettings>>,
+    settings_path: &Path,
+) -> anyhow::Result<()> {
+    let saved = settings
+        .lock()
+        .map_err(|_| anyhow::anyhow!("app settings are locked"))?
+        .window
+        .clone()
+        .unwrap_or_else(default_window_settings);
+    let mut restored = restore_saved_windowed_state(window, &saved)?.unwrap_or(saved);
+    restored.fullscreen = false;
+    restored.maximized = false;
+    restore_windowed_state_after_fullscreen_transition(window.clone(), restored.clone());
+    let mut settings = settings
+        .lock()
+        .map_err(|_| anyhow::anyhow!("app settings are locked"))?;
+    settings.window = Some(restored);
+    settings.window_mode = WindowMode::Normal;
+    write_ui_settings(settings_path, &settings)
+}
+
+fn restore_windowed_state_after_fullscreen_transition(
+    window: WebviewWindow,
+    saved: WindowSettings,
+) {
+    thread::spawn(move || {
+        for delay in [50, 150, 350, 700] {
+            thread::sleep(Duration::from_millis(delay));
+            let dispatch_window = window.clone();
+            let restore_window = window.clone();
+            let saved = saved.clone();
+            let _ = dispatch_window.run_on_main_thread(move || {
+                if !restore_window.is_fullscreen().unwrap_or(false) {
+                    let _ = restore_saved_windowed_state(&restore_window, &saved);
+                }
+            });
+        }
+    });
+}
+
+fn set_saved_window_mode(
+    settings: &Arc<Mutex<UiSettings>>,
+    settings_path: &Path,
+    mode: WindowMode,
+) -> anyhow::Result<()> {
+    let mut settings = settings
+        .lock()
+        .map_err(|_| anyhow::anyhow!("app settings are locked"))?;
+    if settings.window.is_none() {
+        settings.window = Some(default_window_settings());
+    }
+    settings.window_mode = mode;
+    write_ui_settings(settings_path, &settings)
+}
+
+fn current_normal_window_state(window: &WebviewWindow) -> anyhow::Result<Option<WindowSettings>> {
+    let position = window.outer_position()?;
+    let size = window.inner_size()?;
+    if size.width < 320 || size.height < 240 {
+        return Ok(None);
+    }
+
+    let current = WindowSettings {
         x: position.x,
         y: position.y,
         width: size.width,
         height: size.height,
-    });
-    write_ui_settings(settings_path, &settings)
+        maximized: false,
+        fullscreen: false,
+    };
+    if current_window_looks_monitor_sized(window)? {
+        return Ok(None);
+    }
+
+    Ok(Some(current))
 }
 
-fn window_rect_visible(window: &WindowSettings, monitors: &[Monitor]) -> bool {
+fn current_window_looks_monitor_sized(window: &WebviewWindow) -> anyhow::Result<bool> {
+    let position = window.outer_position()?;
+    let size = window.inner_size()?;
+    let current = WindowSettings {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+        maximized: false,
+        fullscreen: false,
+    };
+    let monitors = window.available_monitors()?;
+    Ok(window_state_looks_monitor_sized(&current, &monitors))
+}
+
+fn suppress_window_state_tracking(
+    suppressed_until: &Arc<Mutex<Option<Instant>>>,
+    duration: Duration,
+) {
+    if let Ok(mut suppressed_until) = suppressed_until.lock() {
+        *suppressed_until = Some(Instant::now() + duration);
+    }
+}
+
+fn window_state_tracking_is_suppressed(suppressed_until: &Arc<Mutex<Option<Instant>>>) -> bool {
+    let Ok(mut suppressed_until) = suppressed_until.lock() else {
+        return false;
+    };
+    let Some(until) = *suppressed_until else {
+        return false;
+    };
+    if Instant::now() < until {
+        return true;
+    }
+    *suppressed_until = None;
+    false
+}
+
+fn default_window_settings() -> WindowSettings {
+    WindowSettings {
+        x: 0,
+        y: 0,
+        width: DEFAULT_WINDOW_WIDTH,
+        height: DEFAULT_WINDOW_HEIGHT,
+        maximized: false,
+        fullscreen: false,
+    }
+}
+
+fn restore_saved_windowed_state(
+    window: &WebviewWindow,
+    saved: &WindowSettings,
+) -> anyhow::Result<Option<WindowSettings>> {
+    let monitors = window.available_monitors()?;
+    if window.is_maximized().unwrap_or(false) {
+        let _ = window.unmaximize();
+    }
+    let restored = restored_normal_window_state(saved, &monitors);
+    if let Some(restored) = restored.as_ref() {
+        window.set_size(Size::Physical(PhysicalSize::new(
+            restored.width,
+            restored.height,
+        )))?;
+        window.set_position(Position::Physical(PhysicalPosition::new(
+            restored.x, restored.y,
+        )))?;
+    }
+
+    Ok(restored)
+}
+
+fn restored_normal_window_state(
+    saved: &WindowSettings,
+    monitors: &[Monitor],
+) -> Option<WindowSettings> {
+    let monitor = best_window_monitor(saved, monitors)?;
+    let position = monitor.position();
+    let size = monitor.size();
+    let monitor_left = i64::from(position.x);
+    let monitor_top = i64::from(position.y);
+    let monitor_width = size.width.max(MIN_RESTORED_WINDOW_WIDTH);
+    let monitor_height = size.height.max(MIN_RESTORED_WINDOW_HEIGHT);
+    let use_default_bounds = window_state_looks_monitor_sized(saved, monitors);
+    let saved_width = if use_default_bounds {
+        DEFAULT_WINDOW_WIDTH
+    } else {
+        saved.width
+    };
+    let saved_height = if use_default_bounds {
+        DEFAULT_WINDOW_HEIGHT
+    } else {
+        saved.height
+    };
+    let width = saved_width.clamp(MIN_RESTORED_WINDOW_WIDTH, monitor_width);
+    let height = saved_height.clamp(MIN_RESTORED_WINDOW_HEIGHT, monitor_height);
+    let max_x = monitor_left + i64::from(monitor_width.saturating_sub(width));
+    let max_y = monitor_top + i64::from(monitor_height.saturating_sub(height));
+    let x = if use_default_bounds {
+        monitor_left + i64::from(monitor_width.saturating_sub(width)) / 2
+    } else {
+        i64::from(saved.x).clamp(monitor_left, max_x)
+    };
+    let y = if use_default_bounds {
+        monitor_top + i64::from(monitor_height.saturating_sub(height)) / 2
+    } else {
+        i64::from(saved.y).clamp(monitor_top, max_y)
+    };
+
+    Some(WindowSettings {
+        x: x as i32,
+        y: y as i32,
+        width,
+        height,
+        maximized: false,
+        fullscreen: false,
+    })
+}
+
+fn best_window_monitor<'a>(
+    window: &WindowSettings,
+    monitors: &'a [Monitor],
+) -> Option<&'a Monitor> {
+    monitors
+        .iter()
+        .filter_map(|monitor| {
+            let intersection = window_monitor_intersection_area(window, monitor);
+            (intersection > 0).then_some((intersection, monitor))
+        })
+        .max_by_key(|(intersection, _)| *intersection)
+        .map(|(_, monitor)| monitor)
+        .or_else(|| monitors.first())
+}
+
+fn window_state_looks_monitor_sized(window: &WindowSettings, monitors: &[Monitor]) -> bool {
+    best_window_monitor(window, monitors).is_some_and(|monitor| {
+        let size = monitor.size();
+        window.width.saturating_add(MONITOR_SIZED_WINDOW_TOLERANCE) >= size.width
+            && window.height.saturating_add(MONITOR_SIZED_WINDOW_TOLERANCE) >= size.height
+    })
+}
+
+fn window_monitor_intersection_area(window: &WindowSettings, monitor: &Monitor) -> i64 {
     let window_left = i64::from(window.x);
     let window_top = i64::from(window.y);
     let window_right = window_left + i64::from(window.width);
     let window_bottom = window_top + i64::from(window.height);
+    let position = monitor.position();
+    let size = monitor.size();
+    let monitor_left = i64::from(position.x);
+    let monitor_top = i64::from(position.y);
+    let monitor_right = monitor_left + i64::from(size.width);
+    let monitor_bottom = monitor_top + i64::from(size.height);
 
-    monitors.iter().any(|monitor| {
-        let position = monitor.position();
-        let size = monitor.size();
-        let monitor_left = i64::from(position.x);
-        let monitor_top = i64::from(position.y);
-        let monitor_right = monitor_left + i64::from(size.width);
-        let monitor_bottom = monitor_top + i64::from(size.height);
+    let intersection_width = window_right.min(monitor_right) - window_left.max(monitor_left);
+    let intersection_height = window_bottom.min(monitor_bottom) - window_top.max(monitor_top);
+    if intersection_width < 80 || intersection_height < 80 {
+        return 0;
+    }
 
-        let intersection_width = window_right.min(monitor_right) - window_left.max(monitor_left);
-        let intersection_height = window_bottom.min(monitor_bottom) - window_top.max(monitor_top);
-        intersection_width >= 80 && intersection_height >= 80
-    })
+    intersection_width * intersection_height
 }
 
 fn is_supported_splat_path(path: &Path) -> bool {
@@ -3303,4 +3669,55 @@ async fn spawn_thumbnail_job(path: PathBuf, size: u32) -> Result<GeneratedThumbn
     .await
     .map_err(|error| error.to_string())?
     .map_err(error_message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_window_flags_migrate_to_window_mode() {
+        let mut settings: UiSettings = serde_json::from_value(serde_json::json!({
+            "window": {
+                "x": 25,
+                "y": 50,
+                "width": 900,
+                "height": 700,
+                "fullscreen": true
+            }
+        }))
+        .unwrap();
+
+        sanitize_ui_settings(&mut settings);
+
+        assert_eq!(settings.window_mode, WindowMode::Fullscreen);
+        let window = settings.window.unwrap();
+        assert_eq!(
+            (window.x, window.y, window.width, window.height),
+            (25, 50, 900, 700)
+        );
+        assert!(!window.fullscreen);
+        assert!(!window.maximized);
+    }
+
+    #[test]
+    fn window_mode_serializes_separately_from_window_bounds() {
+        let mut settings = UiSettings::default();
+        settings.window = Some(WindowSettings {
+            x: 25,
+            y: 50,
+            width: 900,
+            height: 700,
+            maximized: true,
+            fullscreen: true,
+        });
+        settings.window_mode = WindowMode::Fullscreen;
+
+        let value = serde_json::to_value(&settings).unwrap();
+
+        assert_eq!(value["window_mode"], "fullscreen");
+        assert_eq!(value["window"]["width"], 900);
+        assert!(value["window"].get("fullscreen").is_none());
+        assert!(value["window"].get("maximized").is_none());
+    }
 }
