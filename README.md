@@ -18,7 +18,7 @@ PictureRoot/
     root.sqlite
 ```
 
-The database stores metadata only. Images and generated thumbnails are not stored in SQLite.
+The database stores metadata and user-created 3D asset thumbnails only. Original image, 3DGS, and GLB files stay in the picture root. Regular image thumbnails are generated on demand and cached in memory; captured 3D thumbnails are stored in SQLite because they represent a manually chosen camera view.
 
 Current tables:
 
@@ -27,6 +27,7 @@ Current tables:
 - `images`: indexed image files, optional dimensions, file size, and modified time.
 - `keywords`, `people`, `folder_keywords`, `folder_people`: controlled metadata tables for the folder inheritance model.
 - `ratings`, `folder_ratings`, `image_keywords`, `image_people`, `image_ratings`: controlled metadata tables for ratings and image metadata.
+- `splat_thumbnails`: captured thumbnails and camera state for 3DGS and GLB assets.
 
 Picturious keeps the list of known root paths in the app config directory. At runtime the Rust core opens every connected root database and merges the results in memory, so disconnected external drives simply disappear from the combined library view.
 
@@ -34,9 +35,26 @@ Scans run in the background. The scanner writes one folder at a time, emits prog
 
 Removing a root from the app only removes it from the known-root list. The `.picturious/root.sqlite` file and pictures remain untouched.
 
-Thumbnails are generated lazily for visible content only. Image tiles decode images from the folder currently open. Folder tiles decode one representative image: the selected folder image, otherwise the first direct image, otherwise the representative image from the first child folder. Generated thumbnails are cached in memory with an LRU-style byte limit, and no thumbnail files are written into picture roots.
+Thumbnails are generated lazily for visible content only. Image tiles decode images from the folder currently open. Folder tiles decode one representative image: the selected folder image, otherwise the first direct image, otherwise the representative image from the first child folder. Generated image thumbnails are cached in memory with an LRU-style byte limit, and no thumbnail files are written into picture roots.
 
 JPEG thumbnails use libjpeg-turbo through the `turbojpeg` crate. On Windows, the native libjpeg-turbo build needs NASM for SIMD; a portable NASM can be placed on `PATH` or pointed to with `CMAKE_ASM_NASM_COMPILER`.
+
+## 3D Assets
+
+Picturious indexes and opens 3D Gaussian Splatting assets alongside regular images. Supported 3DGS inputs include `.spz`, `.sog`, `.ply`, `.compressed.ply`, `.splat`, `.ksplat`, `.rad`, `.meta.json`, and `.lod-meta.json`. Picturious also indexes and opens `.glb` models.
+
+The built-in viewer uses the bundled PlayCanvas runtime. Opening a 3DGS or GLB item switches the fullscreen viewer from the image element to a PlayCanvas canvas. GLB files are shown with simple studio lighting, while 3DGS files use the splat loader. Very large raw `.ply` files are guarded by a memory-safe path and may ask to be converted to SPZ, SOG, or compressed PLY for embedded viewing.
+
+3D viewer controls:
+
+- `T`: capture the current view as the asset thumbnail.
+- `F`: frame the current asset in view.
+- `R`: reset the current asset view.
+- `O`: cycle 3DGS orientation presets.
+
+The thumbnail capture workflow is manual by design. Open a 3DGS or GLB asset, move the camera to the desired composition, adjust 3DGS orientation if needed, then press `T`. Picturious captures the PlayCanvas canvas as a JPEG thumbnail and stores it in that root's `.picturious/root.sqlite` database. The grid tile updates immediately, and future thumbnail requests use the stored capture instead of the generic 3D placeholder.
+
+Captured 3D thumbnails also store camera restoration data. The saved state records the camera position, focus point, field of view, asset kind, and the selected 3DGS orientation preset. When the asset is opened again, Picturious loads the stored camera state before falling back to the default framed view. If the source asset's modified timestamp changes, the stored thumbnail and camera state are treated as stale and removed so the next view starts fresh.
 
 ## First Run
 
