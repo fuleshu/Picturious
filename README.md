@@ -39,6 +39,8 @@ Thumbnails are generated lazily for visible content only. Image tiles decode ima
 
 JPEG thumbnails use libjpeg-turbo through the `turbojpeg` crate. On Windows, the native libjpeg-turbo build needs NASM for SIMD; a portable NASM can be placed on `PATH` or pointed to with `CMAKE_ASM_NASM_COMPILER`.
 
+HEIC and HEIF files are indexed as regular images. On Windows, Picturious decodes HEIC thumbnails and embedded previews through Windows Imaging Component, so the Windows HEIF/HEVC image extensions may be required on machines where the codec is not installed. The embedded WebView preview is SDR. HEIC context menus also include a native DirectX HDR viewer helper, `picturious-hdr-viewer`, which opens the source file in a fullscreen Direct3D 11 FP16/scRGB swap chain and bypasses the WebView/JPEG preview path. The helper currently establishes the native HDR presentation path; full Apple gain-map reconstruction is still a separate decoder/shader step.
+
 ## 3D Assets
 
 Picturious indexes and opens 3D Gaussian Splatting assets alongside regular images. Supported 3DGS inputs include `.spz`, `.sog`, `.ply`, `.compressed.ply`, `.splat`, `.ksplat`, `.rad`, `.meta.json`, and `.lod-meta.json`. Picturious also indexes and opens `.glb` models.
@@ -76,6 +78,12 @@ Then run the app:
 
 ```powershell
 cargo tauri dev
+```
+
+For HEIC HDR viewer testing, build the DirectX helper once so the app can find it beside the main executable:
+
+```powershell
+cargo build -p picturious --bin picturious-hdr-viewer
 ```
 
 If the CLI does not find the app from the workspace root, run the same command from `src-tauri`.

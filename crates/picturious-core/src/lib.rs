@@ -1,4 +1,5 @@
 mod db;
+mod heic;
 mod image_ops;
 mod manager;
 mod models;
@@ -12,4 +13,7 @@ pub use models::{
     LibraryOverview, LibraryRoot, MetadataCombineMode, MetadataNameFilter, MetadataPersonSummary,
     MetadataSearchQuery, MetadataTag, ScanProgress, ScanReport, ThumbnailResponse,
 };
-pub use thumbnails::{GeneratedThumbnail, ThumbnailCache, generate_thumbnail};
+pub use thumbnails::{
+    GeneratedThumbnail, ThumbnailCache, generate_image_preview, generate_image_preview_jpeg,
+    generate_thumbnail,
+};

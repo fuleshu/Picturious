@@ -11,16 +11,23 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+
 const DB_DIR: &str = ".picturious";
 const DB_FILE: &str = "root.sqlite";
 const ROOT_RELATIVE_PATH: &str = "";
 const SCHEMA_VERSION: &str = "6";
 const FOLDER_VIEW_BATCH_SIZE: usize = 64;
 const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "avif",
+    "jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "avif", "heic", "heif", "hif",
 ];
 const SUPPORTED_SPLAT_EXTENSIONS: &[&str] = &["spz", "sog", "ply", "splat", "ksplat", "rad"];
 const SUPPORTED_MODEL_EXTENSIONS: &[&str] = &["glb"];
+#[cfg(windows)]
+const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+#[cfg(windows)]
+const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
 
 pub fn root_database_path(root_path: &Path) -> PathBuf {
     root_path.join(DB_DIR).join(DB_FILE)
@@ -81,7 +88,6 @@ struct FolderRow {
 struct FolderValidation {
     relative_path: String,
     changed: bool,
-    should_descend: bool,
     child_relative_paths: Vec<String>,
     image_count: u32,
     skipped_entries: u32,
@@ -209,10 +215,10 @@ impl RootDatabase {
             images_seen = images_seen.saturating_add(validation.image_count);
             skipped_entries = skipped_entries.saturating_add(validation.skipped_entries);
 
-            if validation.should_descend {
-                for child_relative_path in &validation.child_relative_paths {
-                    pending_dirs.push_back(child_relative_path.clone());
-                }
+            // Explicit rescans still walk the subtree. Parent directory timestamps
+            // are not reliable enough to prove that deeper descendants are unchanged.
+            for child_relative_path in &validation.child_relative_paths {
+                pending_dirs.push_back(child_relative_path.clone());
             }
 
             on_progress(ScanProgress {
@@ -349,7 +355,6 @@ impl RootDatabase {
             return Ok(FolderValidation {
                 relative_path: normalized_relative_path,
                 changed,
-                should_descend: false,
                 child_relative_paths: Vec::new(),
                 image_count: 0,
                 skipped_entries: 1,
@@ -359,7 +364,6 @@ impl RootDatabase {
         let snapshot = read_directory_snapshot(&self.root_path, &folder_path)?;
         let validation_started = unix_time_ms(SystemTime::now());
         let parent_path = parent_relative_path(&normalized_relative_path);
-        let previous_hash = self.folder_content_hash(&normalized_relative_path);
         let existing_folder_id = self.folder_id_optional(&normalized_relative_path)?;
         let existing_images = if let Some(folder_id) = existing_folder_id {
             self.direct_image_rows(folder_id)?
@@ -367,8 +371,6 @@ impl RootDatabase {
             Vec::new()
         };
         let existing_children = self.direct_child_relative_paths(&normalized_relative_path)?;
-        let child_hashes_missing =
-            self.direct_child_has_unvalidated_folder(&normalized_relative_path);
         let scanned_child_paths = snapshot
             .child_folders
             .iter()
@@ -380,11 +382,9 @@ impl RootDatabase {
             .map(|image| image.relative_path.clone())
             .collect::<HashSet<_>>();
 
-        let hash_changed = previous_hash.as_deref() != Some(snapshot.content_hash.as_str());
         let changed = !same_image_entries(&existing_images, &snapshot.images)
             || existing_children != scanned_child_paths
             || existing_folder_id.is_none();
-        let should_descend = changed || hash_changed || child_hashes_missing;
 
         let tx = self.connection.transaction()?;
         let folder_id = upsert_folder(
@@ -440,7 +440,6 @@ impl RootDatabase {
         Ok(FolderValidation {
             relative_path: normalized_relative_path,
             changed,
-            should_descend,
             child_relative_paths: snapshot
                 .child_folders
                 .into_iter()
@@ -2119,22 +2118,6 @@ impl RootDatabase {
             .context("could not read folder id")
     }
 
-    fn folder_content_hash(&self, relative_path: &str) -> Option<String> {
-        if self.ensure_scan_columns().is_err() {
-            return None;
-        }
-
-        self.connection
-            .query_row(
-                "SELECT content_hash FROM folders WHERE relative_path = ?1",
-                params![relative_path],
-                |row| row.get(0),
-            )
-            .optional()
-            .ok()
-            .flatten()
-    }
-
     fn direct_child_relative_paths(&self, parent_relative_path: &str) -> Result<HashSet<String>> {
         let mut statement = self
             .connection
@@ -2143,28 +2126,6 @@ impl RootDatabase {
             .query_map(params![parent_relative_path], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows.into_iter().collect())
-    }
-
-    fn direct_child_has_unvalidated_folder(&self, parent_relative_path: &str) -> bool {
-        if self.ensure_scan_columns().is_err() {
-            return true;
-        }
-
-        self.connection
-            .query_row(
-                "
-            SELECT EXISTS(
-                SELECT 1
-                FROM folders
-                WHERE parent_relative_path = ?1
-                    AND (content_hash IS NULL OR validated_at_unix_ms = 0)
-            )
-            ",
-                params![parent_relative_path],
-                |row| row.get::<_, i64>(0),
-            )
-            .map(|has_unvalidated| has_unvalidated != 0)
-            .unwrap_or(true)
     }
 
     fn direct_image_rows(&self, folder_id: i64) -> Result<Vec<ExistingImage>> {
@@ -2402,11 +2363,10 @@ fn read_directory_snapshot(root_path: &Path, folder_path: &Path) -> Result<Direc
                     }
                 };
 
-                if file_name.eq_ignore_ascii_case(DB_DIR) && file_type.is_dir() {
-                    continue;
-                }
-
                 if file_type.is_dir() {
+                    if should_skip_scanned_folder(&entry, &file_name) {
+                        continue;
+                    }
                     let (modified_unix_ms, metadata_ok) = entry_modified_unix_ms(&entry);
                     if !metadata_ok {
                         skipped_entries += 1;
@@ -2465,6 +2425,30 @@ fn read_directory_snapshot(root_path: &Path, folder_path: &Path) -> Result<Direc
         content_hash,
         skipped_entries,
     })
+}
+
+fn should_skip_scanned_folder(entry: &fs::DirEntry, file_name: &str) -> bool {
+    is_ignored_folder_name(file_name) || entry_has_hidden_or_system_attribute(entry)
+}
+
+fn is_ignored_folder_name(file_name: &str) -> bool {
+    file_name.eq_ignore_ascii_case(DB_DIR)
+        || file_name.starts_with('.')
+        || file_name.eq_ignore_ascii_case("$Recycle.Bin")
+        || file_name.eq_ignore_ascii_case("System Volume Information")
+}
+
+#[cfg(windows)]
+fn entry_has_hidden_or_system_attribute(entry: &fs::DirEntry) -> bool {
+    entry.metadata().is_ok_and(|metadata| {
+        let attributes = metadata.file_attributes();
+        attributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0
+    })
+}
+
+#[cfg(not(windows))]
+fn entry_has_hidden_or_system_attribute(_entry: &fs::DirEntry) -> bool {
+    false
 }
 
 fn entry_modified_unix_ms(entry: &fs::DirEntry) -> (i64, bool) {
@@ -3090,6 +3074,144 @@ mod tests {
         db.scan(&root_id)?;
 
         assert!(db.images_for_folder(&root_id, "")?.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn scan_indexes_heic_images() -> Result<()> {
+        let root = temp_root_path("scan_indexes_heic_images");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        fs::write(root.join("iphone.heic"), b"heic bytes")?;
+        fs::write(root.join("render.heif"), b"heif bytes")?;
+
+        let mut db = RootDatabase::open(&root)?;
+        let root_id = db.root_id()?;
+        db.scan(&root_id)?;
+
+        let image_names = db
+            .images_for_folder(&root_id, "")?
+            .into_iter()
+            .map(|image| image.file_name)
+            .collect::<Vec<_>>();
+        assert_eq!(image_names, vec!["iphone.heic", "render.heif"]);
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn scan_ignores_hidden_and_system_folders() -> Result<()> {
+        let root = temp_root_path("scan_ignores_hidden_and_system_folders");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".hidden"))?;
+        fs::create_dir_all(root.join("$Recycle.Bin"))?;
+        fs::create_dir_all(root.join("System Volume Information"))?;
+        fs::create_dir_all(root.join("Visible"))?;
+        fs::write(root.join(".hidden").join("secret.jpg"), b"image bytes")?;
+        fs::write(
+            root.join("$Recycle.Bin").join("recycled.jpg"),
+            b"image bytes",
+        )?;
+        fs::write(
+            root.join("System Volume Information")
+                .join("system-volume.jpg"),
+            b"image bytes",
+        )?;
+        fs::write(root.join("Visible").join("photo.jpg"), b"image bytes")?;
+
+        #[cfg(windows)]
+        let attributed_folder = {
+            use std::process::Command;
+
+            let folder = root.join("HiddenAttribute");
+            fs::create_dir_all(&folder)?;
+            fs::write(folder.join("hidden-attribute.jpg"), b"image bytes")?;
+            let marked = Command::new("attrib")
+                .arg("+h")
+                .arg("+s")
+                .arg(&folder)
+                .status()
+                .is_ok_and(|status| status.success());
+            if marked {
+                Some(folder)
+            } else {
+                fs::remove_dir_all(&folder)?;
+                None
+            }
+        };
+
+        let mut db = RootDatabase::open(&root)?;
+        let root_id = db.root_id()?;
+        db.scan(&root_id)?;
+
+        let root_view = db.folder_view(&root_id, "Root", "")?;
+        let folder_names = root_view
+            .folders
+            .iter()
+            .map(|folder| folder.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(folder_names, vec!["Visible"]);
+        assert!(db.folder_id_optional(".hidden")?.is_none());
+        assert!(db.folder_id_optional("$Recycle.Bin")?.is_none());
+        assert!(
+            db.folder_id_optional("System Volume Information")?
+                .is_none()
+        );
+        #[cfg(windows)]
+        if attributed_folder.is_some() {
+            assert!(db.folder_id_optional("HiddenAttribute")?.is_none());
+        }
+
+        #[cfg(windows)]
+        if let Some(folder) = attributed_folder {
+            use std::process::Command;
+
+            let _ = Command::new("attrib")
+                .arg("-h")
+                .arg("-s")
+                .arg(&folder)
+                .status();
+        }
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn rescan_descends_into_unchanged_parent_folders() -> Result<()> {
+        let root = temp_root_path("rescan_descends_into_unchanged_parent_folders");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("Parent").join("Child"))?;
+        fs::write(
+            root.join("Parent").join("Child").join("old.jpg"),
+            b"image bytes",
+        )?;
+
+        let mut db = RootDatabase::open(&root)?;
+        let root_id = db.root_id()?;
+        db.scan(&root_id)?;
+
+        fs::write(
+            root.join("Parent").join("Child").join("new.jpg"),
+            b"image bytes",
+        )?;
+        let root_snapshot = read_directory_snapshot(&root, &root)?;
+        db.connection.execute(
+            "UPDATE folders SET content_hash = ?1 WHERE relative_path = ''",
+            params![root_snapshot.content_hash],
+        )?;
+
+        db.rescan_with_progress(&root_id, "", |_| {})?;
+
+        let child_view = db.folder_view(&root_id, "Root", "Parent/Child")?;
+        let image_names = child_view
+            .images
+            .iter()
+            .map(|image| image.file_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(image_names, vec!["new.jpg", "old.jpg"]);
 
         let _ = fs::remove_dir_all(&root);
         Ok(())

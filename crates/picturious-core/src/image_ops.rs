@@ -1,3 +1,4 @@
+use crate::heic::{heic_dimensions, is_heic_path};
 use anyhow::{Context, Result, bail};
 use image::codecs::jpeg::JpegEncoder;
 use image::{ExtendedColorType, ImageReader, Rgb, RgbImage};
@@ -60,6 +61,10 @@ pub fn convert_png_to_jpg(path: &Path, quality: u8) -> Result<PathBuf> {
 }
 
 pub fn image_dimensions(path: &Path) -> Result<(u32, u32)> {
+    if is_heic_path(path) {
+        return heic_dimensions(path);
+    }
+
     ImageReader::open(path)
         .with_context(|| format!("could not open {}", path.display()))?
         .with_guessed_format()

@@ -2976,7 +2976,7 @@ dependencies = [
 
 [[package]]
 name = "picturious"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2986,12 +2986,13 @@ dependencies = [
  "serde_json",
  "tauri",
  "tauri-build",
+ "windows",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "picturious-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3001,6 +3002,7 @@ dependencies = [
  "serde_json",
  "turbojpeg",
  "uuid",
+ "windows",
 ]
 
 [[package]]

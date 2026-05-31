@@ -9,6 +9,8 @@ const VIEWER_CURSOR_HIDE_DELAY_MS = 3000;
 const MAX_FOLDER_VIEW_CACHE_ENTRIES = 80;
 const MAX_THUMBNAIL_DATA_CACHE_ENTRIES = 700;
 const RAW_PLY_DIRECT_LOAD_LIMIT_BYTES = 2_000_000_000;
+const HEIC_QUICK_PREVIEW_SIZE = 1280;
+const MAX_VIEWER_PREVIEW_PIXEL_SIZE = 8192;
 const SUPPORTED_IMAGE_EXTENSIONS = [
   ".jpg",
   ".jpeg",
@@ -19,6 +21,9 @@ const SUPPORTED_IMAGE_EXTENSIONS = [
   ".tif",
   ".tiff",
   ".avif",
+  ".heic",
+  ".heif",
+  ".hif",
 ];
 const SUPPORTED_SPLAT_EXTENSIONS = [
   ".spz",
@@ -133,6 +138,7 @@ const state = {
   visibleValidationActive: false,
   validatedVisibleKeys: new Set(),
   viewerGeneration: 0,
+  hdrTraceSeq: 0,
   imageUrlCache: new Map(),
   thumbnailDataCache: new Map(),
   lastWheelAt: 0,
@@ -182,6 +188,7 @@ const state = {
   slideshowPlaylist: null,
   slideshowSkipAttempts: 0,
   viewerCursorTimer: null,
+  hdrViewerActive: false,
   splatViewerModule: null,
   splatViewer: null,
   splatThumbnailSaving: false,
@@ -358,38 +365,11 @@ document.addEventListener("keydown", (event) => {
     return;
   }
 
-  if (event.key === "Escape") {
-    closeViewer();
-  } else if (currentViewerIsThreeD() && event.key.toLowerCase() === "t") {
+  if ((event.key === " " || event.key === "Spacebar") && event.repeat) {
+    return;
+  }
+  if (handleViewerKeyCommand(event.key)) {
     event.preventDefault();
-    saveCurrentAssetThumbnail().catch(showError);
-  } else if (currentViewerIsSplat() && event.key.toLowerCase() === "o") {
-    event.preventDefault();
-    cycleCurrentSplatOrientation();
-  } else if (currentViewerIsThreeD() && event.key.toLowerCase() === "r") {
-    event.preventDefault();
-    resetCurrentSplatView();
-  } else if (currentViewerIsThreeD() && event.key.toLowerCase() === "f") {
-    event.preventDefault();
-    frameCurrentSplatView();
-  } else if (event.key === "ArrowLeft") {
-    stopSlideshow();
-    moveViewer(-1);
-  } else if (event.key === "ArrowRight") {
-    stopSlideshow();
-    moveViewer(1);
-  } else if (event.key === "Home") {
-    event.preventDefault();
-    jumpToFirstViewerImage();
-  } else if (event.key === " " || event.key === "Spacebar") {
-    event.preventDefault();
-    if (event.repeat) {
-      return;
-    }
-    toggleSlideshow();
-  } else if (event.key.toLowerCase() === "r" && state.slideshowActive) {
-    event.preventDefault();
-    randomizeCurrentSlideshow();
   }
 });
 
@@ -505,6 +485,10 @@ async function wireScanEvents() {
     state.validatedVisibleKeys.clear();
     updateBusyIndicator();
     console.warn(payload.message);
+  });
+
+  await listen("hdr-viewer-event", ({ payload }) => {
+    handleHdrViewerEvent(payload);
   });
 
   await listen("scan-progress", ({ payload }) => {
@@ -3967,6 +3951,30 @@ function clampThumbScale(value) {
   return Math.min(2, Math.max(0.5, value));
 }
 
+function clampNumber(value, min, max) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return min;
+  }
+  return Math.min(max, Math.max(min, numeric));
+}
+
+function roundUpToMultiple(value, multiple) {
+  return Math.ceil(value / multiple) * multiple;
+}
+
+function viewerPreviewPixelSize() {
+  const viewportWidth = viewer?.clientWidth || window.innerWidth || 1800;
+  const viewportHeight = viewer?.clientHeight || window.innerHeight || 1800;
+  const screenWidth = window.screen?.width || 0;
+  const screenHeight = window.screen?.height || 0;
+  const dpr = clampNumber(window.devicePixelRatio || 1, 1, 2);
+  const requiredPixels = Math.ceil(
+    Math.max(viewportWidth, viewportHeight, screenWidth, screenHeight) * dpr,
+  );
+  return roundUpToMultiple(clampNumber(requiredPixels, 1200, MAX_VIEWER_PREVIEW_PIXEL_SIZE), 128);
+}
+
 function viewKey(rootId, relativePath) {
   if (rootId === null) {
     return "root-overview";
@@ -4603,6 +4611,11 @@ async function handleThumbContextAction(event) {
           relativePath: folder.relative_path,
         });
       }
+    } else if (action === "open-default" && image) {
+      await invoke("open_image_default", {
+        rootId: image.root_id,
+        imageId: image.id,
+      });
     } else if (action === "recycle") {
       if (image) {
         await moveImageToRecycleBin(image);
@@ -4623,7 +4636,10 @@ async function handleThumbContextAction(event) {
 
 function imageContextMenuItems() {
   const items = [{ action: "set-cover", label: "Set as cover" }];
-  if (!isThreeDItem(state.contextMenuImage)) {
+  if (isHeicItem(state.contextMenuImage)) {
+    items.push({ action: "open-default", label: "Open original for HDR" });
+  }
+  if (!isThreeDItem(state.contextMenuImage) && !isHeicItem(state.contextMenuImage)) {
     items.push(
       { action: "rotate-right", label: "Rotate right" },
       { action: "rotate-left", label: "Rotate left" },
@@ -5199,6 +5215,15 @@ function isImageFileName(fileName) {
   return SUPPORTED_IMAGE_EXTENSIONS.some((extension) => lower.endsWith(extension));
 }
 
+function isHeicItem(image) {
+  return isHeicFileName(image?.file_name) || isHeicFileName(image?.relative_path);
+}
+
+function isHeicFileName(fileName) {
+  const lower = String(fileName || "").toLowerCase();
+  return lower.endsWith(".heic") || lower.endsWith(".heif") || lower.endsWith(".hif");
+}
+
 function imageSlideshowItems(images) {
   return (images ?? []).filter(isImageItem);
 }
@@ -5446,6 +5471,108 @@ function openViewerByImageId(imageId) {
   }
 }
 
+function handleHdrViewerEvent(payload) {
+  if (!payload || typeof payload !== "object") {
+    return;
+  }
+
+  traceHdrViewer(`js_event_${payload.event}`, payload.generation, { payload });
+
+  if (payload.event === "loaded") {
+    if (Number(payload.generation) === state.viewerGeneration && isHeicItem(currentViewerImage())) {
+      traceHdrViewer("js_loaded_before_hide_web_image", payload.generation);
+      viewerImage.classList.add("hidden");
+      traceHdrViewer("js_loaded_after_hide_web_image", payload.generation);
+      state.slideshowSkipAttempts = 0;
+      if (state.slideshowActive) {
+        scheduleSlideshow();
+      }
+    }
+    return;
+  }
+
+  if (payload.event === "key") {
+    handleViewerKeyCommand(payload.key);
+    return;
+  }
+
+  if (payload.event === "wheel") {
+    handleNativeViewerWheel(Number(payload.delta));
+    return;
+  }
+
+  if (payload.event === "mouse_move") {
+    showViewerCursorTemporarily();
+    return;
+  }
+
+  if (payload.event === "close") {
+    closeViewer();
+    return;
+  }
+
+  if (payload.event === "error") {
+    if (
+      payload.generation === undefined ||
+      Number(payload.generation) === state.viewerGeneration
+    ) {
+      showError(payload.message || "DirectX HDR viewer failed");
+    }
+  }
+}
+
+function handleViewerKeyCommand(key) {
+  if (viewer.classList.contains("hidden")) {
+    return false;
+  }
+
+  const normalizedKey = key === "Spacebar" ? " " : String(key || "");
+  if (normalizedKey === "Escape") {
+    closeViewer();
+    return true;
+  }
+  if (currentViewerIsThreeD() && normalizedKey.toLowerCase() === "t") {
+    saveCurrentAssetThumbnail().catch(showError);
+    return true;
+  }
+  if (currentViewerIsSplat() && normalizedKey.toLowerCase() === "o") {
+    cycleCurrentSplatOrientation();
+    return true;
+  }
+  if (currentViewerIsThreeD() && normalizedKey.toLowerCase() === "r") {
+    resetCurrentSplatView();
+    return true;
+  }
+  if (currentViewerIsThreeD() && normalizedKey.toLowerCase() === "f") {
+    frameCurrentSplatView();
+    return true;
+  }
+  if (normalizedKey === "ArrowLeft") {
+    stopSlideshow();
+    moveViewer(-1);
+    return true;
+  }
+  if (normalizedKey === "ArrowRight") {
+    stopSlideshow();
+    moveViewer(1);
+    return true;
+  }
+  if (normalizedKey === "Home") {
+    jumpToFirstViewerImage();
+    return true;
+  }
+  if (normalizedKey === " ") {
+    toggleSlideshow();
+    return true;
+  }
+  if (normalizedKey.toLowerCase() === "r" && state.slideshowActive) {
+    randomizeCurrentSlideshow();
+    return true;
+  }
+
+  return false;
+}
+
 async function renderViewerImage() {
   const image = currentViewerImage();
   if (!image) {
@@ -5455,6 +5582,24 @@ async function renderViewerImage() {
 
   const generation = ++state.viewerGeneration;
   viewerImage.alt = image.file_name;
+  traceHdrViewer("js_render_start", generation, {
+    image: traceImageSummary(image),
+  });
+  if (isHeicItem(image)) {
+    await renderViewerHdrImage(image, generation);
+    return;
+  }
+
+  try {
+    traceHdrViewer("js_non_heic_hide_helper_before", generation);
+    await hideHdrViewerBackend();
+    traceHdrViewer("js_non_heic_hide_helper_after", generation);
+  } catch (error) {
+    console.warn("Could not hide DirectX HDR viewer", error);
+    traceHdrViewer("js_non_heic_hide_helper_error", generation, {
+      error: String(error),
+    });
+  }
   if (isThreeDItem(image)) {
     await renderViewerThreeDAsset(image, generation);
     return;
@@ -5463,7 +5608,21 @@ async function renderViewerImage() {
   stopSplatViewer();
   splatViewerNode.classList.add("hidden");
   viewerImage.classList.remove("hidden");
-  const source = await imageSourceFor(image);
+  const previewSize = viewerPreviewPixelSize();
+  const cachedSource = cachedImageSourceFor(image, { previewSize });
+  if (!cachedSource && isHeicItem(image)) {
+    try {
+      const quickSource = await heicQuickPreviewSourceFor(image);
+      if (generation !== state.viewerGeneration) {
+        return;
+      }
+      viewerImage.src = quickSource;
+    } catch {
+      // The full preview path below will surface any real loading error.
+    }
+  }
+
+  const source = cachedSource ?? (await imageSourceFor(image, { previewSize }));
   if (generation !== state.viewerGeneration) {
     return;
   }
@@ -5480,14 +5639,191 @@ async function renderViewerImage() {
   }
 
   state.slideshowSkipAttempts = 0;
-  viewerImage.src = source;
-  preloadNeighborImages(generation);
+  if (viewerImage.src !== source) {
+    traceHdrViewer("js_non_heic_set_src", generation, {
+      sourceKind: sourceKind(source),
+    });
+    viewerImage.src = source;
+  }
+  preloadNeighborImages(generation, previewSize);
   if (state.slideshowActive) {
     scheduleSlideshow();
   }
 }
 
+async function renderViewerHdrImage(image, generation) {
+  stopSplatViewer();
+  splatViewerNode.classList.add("hidden");
+  const keepExistingWebImage = viewerImageIsShowingLoadedImage();
+  traceHdrViewer("js_heic_start", generation, {
+    image: traceImageSummary(image),
+    keepExistingWebImage,
+  });
+  if (!keepExistingWebImage) {
+    viewerImage.removeAttribute("src");
+    viewerImage.classList.add("hidden");
+    traceHdrViewer("js_heic_no_previous_image_cleared_web_image", generation);
+  } else {
+    traceHdrViewer("js_heic_keep_existing_web_image", generation, {
+      reason: state.slideshowActive ? "slideshow" : "viewer_navigation",
+    });
+    window.requestAnimationFrame(() => {
+      traceHdrViewer("js_heic_keep_existing_next_frame_before_loaded", generation);
+    });
+  }
+
+  if (state.slideshowActive && state.settings.slideshow_ignore_smaller_than > 0) {
+    const dimensions = {
+      width: Number(image.width) || 0,
+      height: Number(image.height) || 0,
+    };
+    if (dimensions.width && dimensions.height && shouldIgnoreSlide(dimensions)) {
+      advanceSlideshow({ fromFilter: true });
+      return;
+    }
+  }
+
+  traceHdrViewer("js_heic_show_helper_before", generation);
+  await showHdrViewerBackend(image, generation);
+  traceHdrViewer("js_heic_show_helper_after", generation);
+  if (generation !== state.viewerGeneration) {
+    traceHdrViewer("js_heic_generation_stale_after_show", generation, {
+      currentGeneration: state.viewerGeneration,
+    });
+    return;
+  }
+
+  state.slideshowSkipAttempts = 0;
+  preloadNeighborImages(generation, viewerPreviewPixelSize());
+}
+
+function viewerImageIsShowingLoadedImage() {
+  return (
+    !viewer.classList.contains("hidden") &&
+    !viewerImage.classList.contains("hidden") &&
+    Boolean(viewerImage.currentSrc || viewerImage.getAttribute("src")) &&
+    viewerImage.complete &&
+    viewerImage.naturalWidth > 0 &&
+    viewerImage.naturalHeight > 0 &&
+    viewerImage.clientWidth > 0 &&
+    viewerImage.clientHeight > 0
+  );
+}
+
+async function showHdrViewerBackend(image, generation) {
+  if (!invoke) {
+    throw new Error("Run with Tauri to use the DirectX HEIC viewer.");
+  }
+
+  traceHdrViewer("js_invoke_show_before", generation, {
+    image: traceImageSummary(image),
+  });
+  await invoke("hdr_viewer_show", {
+    rootId: image.root_id,
+    imageId: image.id,
+    generation,
+    cursorHidden: viewer.dataset.cursorHidden === "true",
+  });
+  state.hdrViewerActive = true;
+  traceHdrViewer("js_invoke_show_after", generation);
+}
+
+async function hideHdrViewerBackend() {
+  if (!invoke || !state.hdrViewerActive) {
+    traceHdrViewer("js_hide_helper_skip", state.viewerGeneration, {
+      invokeAvailable: Boolean(invoke),
+      hdrViewerActive: state.hdrViewerActive,
+    });
+    return;
+  }
+
+  traceHdrViewer("js_invoke_hide_before", state.viewerGeneration);
+  state.hdrViewerActive = false;
+  await invoke("hdr_viewer_hide");
+  traceHdrViewer("js_invoke_hide_after", state.viewerGeneration);
+}
+
+function syncHdrViewerCursorHidden() {
+  if (!invoke || !state.hdrViewerActive) {
+    return;
+  }
+
+  invoke("hdr_viewer_set_cursor_hidden", {
+    hidden: viewer.dataset.cursorHidden === "true",
+  }).catch(() => {});
+}
+
+function traceHdrViewer(label, generation = state.viewerGeneration, extra = {}) {
+  if (!invoke) {
+    return;
+  }
+
+  const detail = {
+    seq: ++state.hdrTraceSeq,
+    performanceMs: Math.round(performance.now() * 10) / 10,
+    viewerGeneration: state.viewerGeneration,
+    slideshowActive: state.slideshowActive,
+    slideshowTimerActive: Boolean(state.slideshowTimer),
+    hdrViewerActive: state.hdrViewerActive,
+    current: traceImageSummary(currentViewerImage()),
+    viewerHidden: viewer.classList.contains("hidden"),
+    imageHidden: viewerImage.classList.contains("hidden"),
+    imageHasSrc: Boolean(viewerImage.getAttribute("src")),
+    imageComplete: viewerImage.complete,
+    imageNaturalWidth: viewerImage.naturalWidth,
+    imageNaturalHeight: viewerImage.naturalHeight,
+    imageClientWidth: viewerImage.clientWidth,
+    imageClientHeight: viewerImage.clientHeight,
+    imageDisplay: window.getComputedStyle(viewerImage).display,
+    imageSrcKind: sourceKind(viewerImage.currentSrc || viewerImage.getAttribute("src") || ""),
+    ...extra,
+  };
+
+  invoke("hdr_viewer_trace", {
+    label,
+    generation: Number.isFinite(Number(generation)) ? Number(generation) : null,
+    detail: JSON.stringify(detail),
+  }).catch(() => {});
+}
+
+function traceImageSummary(image) {
+  if (!image) {
+    return null;
+  }
+
+  return {
+    id: image.id,
+    rootId: image.root_id,
+    fileName: image.file_name,
+    heic: isHeicItem(image),
+    width: image.width,
+    height: image.height,
+  };
+}
+
+function sourceKind(source) {
+  if (!source) {
+    return "empty";
+  }
+  if (source.startsWith("data:")) {
+    return "data";
+  }
+  if (source.startsWith("asset:")) {
+    return "asset";
+  }
+  if (source.startsWith("blob:")) {
+    return "blob";
+  }
+  if (source.startsWith("http")) {
+    return "http";
+  }
+  return source.slice(0, 48);
+}
+
 async function renderViewerThreeDAsset(image, generation) {
+  hideHdrViewerBackend().catch((error) => {
+    console.warn("Could not hide DirectX HDR viewer", error);
+  });
   stopSlideshow();
   viewerImage.removeAttribute("src");
   viewerImage.classList.add("hidden");
@@ -5721,15 +6057,35 @@ function formatBytes(bytes) {
   return `${value} B`;
 }
 
-async function imageSourceFor(image) {
-  const cacheKey = `${image.root_id}:${image.id}:${image.modified_unix_ms}`;
+async function imageSourceFor(image, options = {}) {
+  const heicPreviewSize = heicPreviewSizeForImage(image, options);
+  const cacheKey = imageSourceCacheKey(image, options);
   const cached = state.imageUrlCache.get(cacheKey);
   if (cached) {
     return cached;
   }
 
   let source;
-  if (convertFileSrc) {
+  if (isHeicItem(image)) {
+    if (convertFileSrc) {
+      const preview = await invoke("image_preview_file", {
+        rootId: image.root_id,
+        imageId: image.id,
+        size: heicPreviewSize,
+      });
+      source = withCacheBuster(
+        convertFileSrc(preview.path),
+        `${image.modified_unix_ms}-${heicPreviewSize}`,
+      );
+    } else {
+      const preview = await invoke("image_preview", {
+        rootId: image.root_id,
+        imageId: image.id,
+        size: heicPreviewSize,
+      });
+      source = preview.data_url;
+    }
+  } else if (convertFileSrc) {
     const path = await invoke("image_file_path", {
       rootId: image.root_id,
       imageId: image.id,
@@ -5746,6 +6102,61 @@ async function imageSourceFor(image) {
 
   state.imageUrlCache.set(cacheKey, source);
   return source;
+}
+
+function cachedImageSourceFor(image, options = {}) {
+  return state.imageUrlCache.get(imageSourceCacheKey(image, options));
+}
+
+function imageSourceCacheKey(image, options = {}) {
+  const heicPreviewSize = heicPreviewSizeForImage(image, options);
+  const baseCacheKey = `${image.root_id}:${image.id}:${image.modified_unix_ms}`;
+  return heicPreviewSize ? `${baseCacheKey}:preview:${heicPreviewSize}` : baseCacheKey;
+}
+
+function heicPreviewSizeForImage(image, options = {}) {
+  if (!isHeicItem(image)) {
+    return null;
+  }
+
+  const nativePixels = Math.max(Number(image?.width) || 0, Number(image?.height) || 0);
+  const requestedPixels = Math.max(
+    nativePixels,
+    Number(options.previewSize) || 0,
+    viewerPreviewPixelSize(),
+  );
+  return viewerPreviewPixelSizeForCache(requestedPixels);
+}
+
+async function heicQuickPreviewSourceFor(image) {
+  const visibleThumbKey = thumbnailCacheKey(image.root_id, image.id, THUMBNAIL_PIXEL_SIZE);
+  const visibleThumb = state.thumbnailDataCache.get(visibleThumbKey);
+  if (visibleThumb) {
+    return visibleThumb;
+  }
+
+  const cacheKey = thumbnailCacheKey(image.root_id, image.id, HEIC_QUICK_PREVIEW_SIZE);
+  const cached = state.thumbnailDataCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  const thumbnail = await invoke("thumbnail", {
+    rootId: image.root_id,
+    imageId: image.id,
+    size: HEIC_QUICK_PREVIEW_SIZE,
+  });
+  state.thumbnailDataCache.delete(cacheKey);
+  state.thumbnailDataCache.set(cacheKey, thumbnail.data_url);
+  trimMapToSize(state.thumbnailDataCache, MAX_THUMBNAIL_DATA_CACHE_ENTRIES);
+  return thumbnail.data_url;
+}
+
+function viewerPreviewPixelSizeForCache(value) {
+  return roundUpToMultiple(
+    clampNumber(Math.ceil(value || viewerPreviewPixelSize()), 1200, MAX_VIEWER_PREVIEW_PIXEL_SIZE),
+    128,
+  );
 }
 
 function viewerImages() {
@@ -5795,7 +6206,7 @@ function shouldIgnoreSlide(dimensions) {
   return Math.max(dimensions.width, dimensions.height) < threshold;
 }
 
-function preloadNeighborImages(generation) {
+function preloadNeighborImages(generation, previewSize) {
   const images = viewerImages();
   if (images.length < 2 || !convertFileSrc) {
     return;
@@ -5807,7 +6218,10 @@ function preloadNeighborImages(generation) {
     if (!isImageItem(image)) {
       continue;
     }
-    imageSourceFor(image)
+    const sourcePromise = isHeicItem(image)
+      ? heicQuickPreviewSourceFor(image)
+      : imageSourceFor(image, { previewSize });
+    sourcePromise
       .then((source) => {
         if (generation !== state.viewerGeneration) {
           return;
@@ -5869,9 +6283,13 @@ function scheduleSlideshow() {
   }
   if (!state.slideshowActive || viewer.classList.contains("hidden")) {
     state.slideshowTimer = null;
+    traceHdrViewer("js_schedule_slideshow_skip", state.viewerGeneration);
     return;
   }
 
+  traceHdrViewer("js_schedule_slideshow", state.viewerGeneration, {
+    delayMs: state.settings.slideshow_speed_seconds * 1000,
+  });
   state.slideshowTimer = window.setTimeout(() => {
     state.slideshowTimer = null;
     if (!state.slideshowActive || viewer.classList.contains("hidden")) {
@@ -5882,6 +6300,10 @@ function scheduleSlideshow() {
 }
 
 function advanceSlideshow(options = {}) {
+  traceHdrViewer("js_advance_slideshow", state.viewerGeneration, {
+    fromFilter: Boolean(options.fromFilter),
+    viewerIndex: state.viewerIndex,
+  });
   const images = viewerImages();
   if (images.length === 0) {
     stopSlideshow({ ended: true });
@@ -5982,6 +6404,21 @@ function handleViewerWheel(event) {
   moveViewer(delta > 0 ? 1 : -1);
 }
 
+function handleNativeViewerWheel(delta) {
+  if (viewer.classList.contains("hidden") || !delta) {
+    return;
+  }
+
+  showViewerCursorTemporarily();
+  const now = Date.now();
+  if (now - state.lastWheelAt < 180) {
+    return;
+  }
+
+  state.lastWheelAt = now;
+  moveViewer(delta < 0 ? 1 : -1);
+}
+
 function handleViewerMouseMove() {
   if (viewer.classList.contains("hidden")) {
     return;
@@ -5992,6 +6429,7 @@ function handleViewerMouseMove() {
 
 function showViewerCursorTemporarily() {
   viewer.dataset.cursorHidden = "false";
+  syncHdrViewerCursorHidden();
   if (state.viewerCursorTimer) {
     window.clearTimeout(state.viewerCursorTimer);
   }
@@ -5999,6 +6437,7 @@ function showViewerCursorTemporarily() {
   state.viewerCursorTimer = window.setTimeout(() => {
     if (!viewer.classList.contains("hidden")) {
       viewer.dataset.cursorHidden = "true";
+      syncHdrViewerCursorHidden();
     }
   }, VIEWER_CURSOR_HIDE_DELAY_MS);
 }
@@ -6009,6 +6448,7 @@ function resetViewerCursor() {
     state.viewerCursorTimer = null;
   }
   viewer.dataset.cursorHidden = "false";
+  syncHdrViewerCursorHidden();
 }
 
 async function enterViewerFullscreen() {
@@ -6064,6 +6504,9 @@ function moveViewer(delta, options = {}) {
 function closeViewer() {
   stopSlideshow();
   stopSplatViewer();
+  hideHdrViewerBackend().catch((error) => {
+    console.warn("Could not hide DirectX HDR viewer", error);
+  });
   resetViewerCursor();
   state.slideshowPlaylist = null;
   state.slideshowEnded = false;

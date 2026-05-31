@@ -8,17 +8,18 @@ use picturious_core::{
     GeneratedThumbnail, ImageMetadata, ImageSummary, LibraryManager, LibraryOverview, LibraryRoot,
     MetadataPersonSummary, MetadataSearchQuery, MetadataTag, RootDatabase,
     RotationDirection as CoreRotationDirection, ScanReport, ScanTarget, ThumbnailCache,
-    ThumbnailResponse, convert_png_to_jpg as convert_png_to_jpg_file, generate_thumbnail,
-    rotate_image as rotate_image_file,
+    ThumbnailResponse, convert_png_to_jpg as convert_png_to_jpg_file, generate_image_preview,
+    generate_image_preview_jpeg, generate_thumbnail, rotate_image as rotate_image_file,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::Read;
+use std::hash::{Hash, Hasher};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -34,6 +35,9 @@ const DEFAULT_WINDOW_HEIGHT: u32 = 820;
 const MIN_RESTORED_WINDOW_WIDTH: u32 = 640;
 const MIN_RESTORED_WINDOW_HEIGHT: u32 = 480;
 const MONITOR_SIZED_WINDOW_TOLERANCE: u32 = 8;
+const PREVIEW_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const PREVIEW_CACHE_TARGET_BYTES: u64 = 1536 * 1024 * 1024;
+const IMAGE_PREVIEW_CACHE_VERSION: u8 = 2;
 
 struct AppState {
     library: Arc<Mutex<LibraryManager>>,
@@ -42,6 +46,8 @@ struct AppState {
     active_movie_jobs: Arc<Mutex<HashMap<String, MovieJobControl>>>,
     settings: Arc<Mutex<UiSettings>>,
     settings_path: Arc<PathBuf>,
+    preview_cache_dir: Arc<PathBuf>,
+    hdr_viewer: Arc<Mutex<Option<HdrViewerProcess>>>,
     window_state_suppressed_until: Arc<Mutex<Option<Instant>>>,
     window_closing: Arc<AtomicBool>,
 }
@@ -63,6 +69,50 @@ impl Drop for ActiveRootGuard {
 struct MovieJobControl {
     cancel_requested: Arc<AtomicBool>,
     child_id: Arc<Mutex<Option<u32>>>,
+}
+
+struct HdrViewerProcess {
+    child: Child,
+    stdin: ChildStdin,
+    #[cfg(windows)]
+    _job: Option<HdrViewerJob>,
+}
+
+#[cfg(windows)]
+struct HdrViewerJob {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+unsafe impl Send for HdrViewerJob {}
+
+#[cfg(windows)]
+impl Drop for HdrViewerJob {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
+impl Drop for HdrViewerProcess {
+    fn drop(&mut self) {
+        let _ = serde_json::to_writer(&mut self.stdin, &HdrViewerCommand::Close);
+        let _ = writeln!(self.stdin);
+        let _ = self.stdin.flush();
+
+        for _ in 0..10 {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(30));
+        }
+
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 struct TempPathCleanup {
@@ -329,6 +379,37 @@ struct MovieOutputPreview {
     output_path: String,
     exists: bool,
     image_count: u32,
+}
+
+#[derive(Clone, Serialize)]
+struct ImagePreviewFileResponse {
+    image_id: i64,
+    path: String,
+    from_cache: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct HdrViewerBounds {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+enum HdrViewerCommand {
+    Show {
+        path: String,
+        generation: u64,
+        bounds: Option<HdrViewerBounds>,
+        cursor_hidden: bool,
+    },
+    SetCursorHidden {
+        hidden: bool,
+    },
+    Hide,
+    Close,
 }
 
 #[derive(Clone, Serialize)]
@@ -776,6 +857,109 @@ async fn thumbnail(
     }
     cache.insert_generated(&path, modified_unix_ms, size, generated);
     Ok(response)
+}
+
+#[tauri::command]
+async fn image_preview(
+    root_id: String,
+    image_id: i64,
+    size: u32,
+    state: State<'_, AppState>,
+) -> Result<ThumbnailResponse, String> {
+    if root_is_scanning(&state.active_scans, &root_id)? {
+        return Err("image preview generation is paused while scanning".to_owned());
+    }
+
+    let library = state.library.clone();
+    let root_id_for_path = root_id.clone();
+    let (path, _) = tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .image_path(&root_id_for_path, image_id)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+
+    if is_supported_3d_asset_path(&path) {
+        return Err("image preview is only available for regular images".to_owned());
+    }
+
+    let generated = spawn_image_preview_job(path, size).await?;
+    Ok(generated.response(image_id, false))
+}
+
+#[tauri::command]
+async fn image_preview_file(
+    root_id: String,
+    image_id: i64,
+    size: u32,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ImagePreviewFileResponse, String> {
+    if root_is_scanning(&state.active_scans, &root_id)? {
+        return Err("image preview generation is paused while scanning".to_owned());
+    }
+
+    let library = state.library.clone();
+    let root_id_for_path = root_id.clone();
+    let (path, modified_unix_ms) = tauri::async_runtime::spawn_blocking(move || {
+        library
+            .lock()
+            .map_err(|_| "library state is locked".to_owned())?
+            .image_path(&root_id_for_path, image_id)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+
+    if is_supported_3d_asset_path(&path) {
+        return Err("image preview is only available for regular images".to_owned());
+    }
+
+    let size = size.clamp(64, 8192);
+    let cache_path = image_preview_cache_path(
+        state.preview_cache_dir.as_ref(),
+        &root_id,
+        image_id,
+        modified_unix_ms,
+        size,
+        &path,
+    );
+    let from_cache = cache_path.is_file();
+    if !from_cache {
+        let source_path = path.clone();
+        let cache_path_for_job = cache_path.clone();
+        let cache_dir = state.preview_cache_dir.clone();
+        tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<()> {
+            fs::create_dir_all(cache_dir.as_ref())?;
+            if !cache_path_for_job.is_file() {
+                let bytes = generate_image_preview_jpeg(&source_path, size).map_err(|error| {
+                    anyhow::anyhow!(
+                        "could not generate preview for {}: {error}",
+                        source_path.display()
+                    )
+                })?;
+                fs::write(&cache_path_for_job, bytes)?;
+                prune_preview_cache(cache_dir.as_ref());
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(error_message)?;
+    }
+
+    app.asset_protocol_scope()
+        .allow_file(&cache_path)
+        .map_err(|error| error.to_string())?;
+
+    Ok(ImagePreviewFileResponse {
+        image_id,
+        path: clean_path_string(&cache_path),
+        from_cache,
+    })
 }
 
 #[tauri::command]
@@ -1261,6 +1445,91 @@ fn open_image_with(
 }
 
 #[tauri::command]
+fn open_image_default(
+    root_id: String,
+    image_id: i64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let (path, _) = image_path_for(&state.library, &root_id, image_id)?;
+    open_path_in_default_app(&path).map_err(error_message)
+}
+
+#[tauri::command]
+fn open_image_hdr_viewer(
+    root_id: String,
+    image_id: i64,
+    window: WebviewWindow,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let (path, _) = image_path_for(&state.library, &root_id, image_id)?;
+    let bounds = hdr_viewer_bounds_for_window(&window);
+    let command = HdrViewerCommand::Show {
+        path: clean_path_string(&path),
+        generation: 0,
+        bounds,
+        cursor_hidden: false,
+    };
+    send_hdr_viewer_command(&app, &state, &command).map_err(error_message)
+}
+
+#[tauri::command]
+fn hdr_viewer_show(
+    root_id: String,
+    image_id: i64,
+    generation: u64,
+    cursor_hidden: bool,
+    window: WebviewWindow,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let (path, _) = image_path_for(&state.library, &root_id, image_id)?;
+    let bounds = hdr_viewer_bounds_for_window(&window);
+    let command = HdrViewerCommand::Show {
+        path: clean_path_string(&path),
+        generation,
+        bounds,
+        cursor_hidden,
+    };
+    trace_hdr_viewer(
+        &state,
+        "rust_show_command",
+        Some(generation),
+        &format!("root_id={root_id} image_id={image_id}"),
+    );
+    send_hdr_viewer_command(&app, &state, &command).map_err(error_message)
+}
+
+#[tauri::command]
+fn hdr_viewer_hide(state: State<'_, AppState>) -> Result<(), String> {
+    trace_hdr_viewer(&state, "rust_hide_command", None, "");
+    send_hdr_viewer_command_if_running(&state, &HdrViewerCommand::Hide).map_err(error_message)
+}
+
+#[tauri::command]
+fn hdr_viewer_set_cursor_hidden(hidden: bool, state: State<'_, AppState>) -> Result<(), String> {
+    trace_hdr_viewer(
+        &state,
+        "rust_cursor_hidden_command",
+        None,
+        &format!("hidden={hidden}"),
+    );
+    send_hdr_viewer_command_if_running(&state, &HdrViewerCommand::SetCursorHidden { hidden })
+        .map_err(error_message)
+}
+
+#[tauri::command]
+fn hdr_viewer_trace(
+    label: String,
+    generation: Option<u64>,
+    detail: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    trace_hdr_viewer(&state, &label, generation, detail.as_deref().unwrap_or(""));
+    Ok(())
+}
+
+#[tauri::command]
 async fn move_image_to_recycle_bin(
     root_id: String,
     image_id: i64,
@@ -1683,6 +1952,7 @@ fn main() {
             let config_dir = app.path().app_config_dir()?;
             let settings_dir = app.path().app_local_data_dir()?;
             let settings_path = Arc::new(settings_dir.join("settings.json"));
+            let preview_cache_dir = Arc::new(settings_dir.join("preview-cache"));
             let settings = Arc::new(Mutex::new(read_ui_settings(settings_path.as_ref())));
             app.manage(AppState {
                 library: Arc::new(Mutex::new(LibraryManager::new(&config_dir)?)),
@@ -1691,6 +1961,8 @@ fn main() {
                 active_movie_jobs: Arc::new(Mutex::new(HashMap::new())),
                 settings: settings.clone(),
                 settings_path: settings_path.clone(),
+                preview_cache_dir,
+                hdr_viewer: Arc::new(Mutex::new(None)),
                 window_state_suppressed_until: Arc::new(Mutex::new(None)),
                 window_closing: Arc::new(AtomicBool::new(false)),
             });
@@ -1712,6 +1984,7 @@ fn main() {
                     settings_path,
                     state.window_state_suppressed_until.clone(),
                     state.window_closing.clone(),
+                    state.hdr_viewer.clone(),
                 );
             }
             Ok(())
@@ -1733,6 +2006,8 @@ fn main() {
             stream_folder_view,
             validate_folder_view,
             thumbnail,
+            image_preview,
+            image_preview_file,
             image_file_path,
             splat_file_bytes,
             asset_file_bytes,
@@ -1751,6 +2026,12 @@ fn main() {
             show_folder_in_explorer,
             open_homepage,
             open_image_with,
+            open_image_default,
+            open_image_hdr_viewer,
+            hdr_viewer_show,
+            hdr_viewer_hide,
+            hdr_viewer_set_cursor_hidden,
+            hdr_viewer_trace,
             move_image_to_recycle_bin,
             move_folder_to_recycle_bin,
             set_folder_thumbnail,
@@ -1800,6 +2081,356 @@ fn clean_path_string(path: &Path) -> String {
     path.to_string_lossy()
         .trim_start_matches(r"\\?\")
         .to_owned()
+}
+
+fn hdr_viewer_executable_path() -> anyhow::Result<PathBuf> {
+    let current_exe = std::env::current_exe().context("could not locate Picturious executable")?;
+    let exe_dir = current_exe
+        .parent()
+        .context("Picturious executable has no parent directory")?;
+    let viewer_name = if cfg!(windows) {
+        "picturious-hdr-viewer.exe"
+    } else {
+        "picturious-hdr-viewer"
+    };
+    let candidate = exe_dir.join(viewer_name);
+    if candidate.is_file() {
+        return Ok(candidate);
+    }
+
+    anyhow::bail!(
+        "DirectX HDR viewer helper was not found at {}; build it with `cargo build -p picturious --bin picturious-hdr-viewer`",
+        candidate.display()
+    )
+}
+
+fn hdr_viewer_bounds_for_window(window: &WebviewWindow) -> Option<HdrViewerBounds> {
+    let monitor = window.current_monitor().ok().flatten()?;
+    let position = monitor.position();
+    let size = monitor.size();
+    Some(HdrViewerBounds {
+        x: position.x,
+        y: position.y,
+        width: i32::try_from(size.width).ok()?,
+        height: i32::try_from(size.height).ok()?,
+    })
+}
+
+fn send_hdr_viewer_command(
+    app: &AppHandle,
+    state: &AppState,
+    command: &HdrViewerCommand,
+) -> anyhow::Result<()> {
+    ensure_hdr_viewer_process(app, state)?;
+    let mut guard = state
+        .hdr_viewer
+        .lock()
+        .map_err(|_| anyhow::anyhow!("HDR viewer process state is locked"))?;
+    let process = guard
+        .as_mut()
+        .context("HDR viewer process was not started")?;
+    write_hdr_viewer_command(process, command)?;
+    Ok(())
+}
+
+fn send_hdr_viewer_command_if_running(
+    state: &AppState,
+    command: &HdrViewerCommand,
+) -> anyhow::Result<()> {
+    let mut guard = state
+        .hdr_viewer
+        .lock()
+        .map_err(|_| anyhow::anyhow!("HDR viewer process state is locked"))?;
+    let exited = match guard.as_mut() {
+        Some(process) => process.child.try_wait()?.is_some(),
+        None => return Ok(()),
+    };
+    if exited {
+        *guard = None;
+        return Ok(());
+    }
+
+    let process = guard
+        .as_mut()
+        .context("HDR viewer process was not started")?;
+    write_hdr_viewer_command(process, command)?;
+    Ok(())
+}
+
+fn write_hdr_viewer_command(
+    process: &mut HdrViewerProcess,
+    command: &HdrViewerCommand,
+) -> anyhow::Result<()> {
+    serde_json::to_writer(&mut process.stdin, command)?;
+    writeln!(process.stdin)?;
+    process.stdin.flush()?;
+    Ok(())
+}
+
+fn ensure_hdr_viewer_process(app: &AppHandle, state: &AppState) -> anyhow::Result<()> {
+    let mut guard = state
+        .hdr_viewer
+        .lock()
+        .map_err(|_| anyhow::anyhow!("HDR viewer process state is locked"))?;
+
+    if let Some(process) = guard.as_mut() {
+        if process.child.try_wait()?.is_none() {
+            return Ok(());
+        }
+    }
+
+    *guard = None;
+    let viewer_path = hdr_viewer_executable_path()?;
+    let mut command = Command::new(&viewer_path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if let Some(settings_dir) = state.settings_path.parent() {
+        let log_path = settings_dir.join("hdr-viewer.log");
+        command.env("PICTURIOUS_HDR_VIEWER_LOG", log_path.clone());
+        append_hdr_viewer_log(
+            &log_path,
+            &format!("[{}] rust_trace label=rust_spawn_helper\n", unix_time_ms()),
+        );
+    }
+
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "could not start DirectX HDR viewer at {}",
+            viewer_path.display()
+        )
+    })?;
+    let stdin = child
+        .stdin
+        .take()
+        .context("DirectX HDR viewer did not provide stdin")?;
+    if let Some(stdout) = child.stdout.take() {
+        spawn_hdr_viewer_event_reader(app.clone(), stdout, hdr_viewer_log_path(state));
+    }
+
+    #[cfg(windows)]
+    let job = match create_hdr_viewer_job(&child) {
+        Ok(job) => Some(job),
+        Err(error) => {
+            eprintln!("could not attach DirectX HDR viewer to cleanup job: {error}");
+            None
+        }
+    };
+
+    *guard = Some(HdrViewerProcess {
+        child,
+        stdin,
+        #[cfg(windows)]
+        _job: job,
+    });
+    Ok(())
+}
+
+#[cfg(windows)]
+fn create_hdr_viewer_job(child: &Child) -> anyhow::Result<HdrViewerJob> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        return Err(io::Error::last_os_error()).context("could not create HDR viewer job object");
+    }
+
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let info_set = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &limits as *const _ as *const _,
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if info_set == 0 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            CloseHandle(job);
+        }
+        return Err(error).context("could not configure HDR viewer cleanup job");
+    }
+
+    let assigned = unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) };
+    if assigned == 0 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            CloseHandle(job);
+        }
+        return Err(error).context("could not attach HDR viewer process to cleanup job");
+    }
+
+    Ok(HdrViewerJob { handle: job })
+}
+
+fn shutdown_hdr_viewer_process(hdr_viewer: &Arc<Mutex<Option<HdrViewerProcess>>>) {
+    let process = match hdr_viewer.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(_) => None,
+    };
+    drop(process);
+}
+
+fn spawn_hdr_viewer_event_reader(
+    app: AppHandle,
+    stdout: impl Read + Send + 'static,
+    log_path: Option<PathBuf>,
+) {
+    thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<serde_json::Value>(trimmed) {
+                Ok(event) => {
+                    if let Some(log_path) = &log_path {
+                        append_hdr_viewer_log(
+                            log_path,
+                            &format!(
+                                "[{}] rust_trace label=helper_event event={}\n",
+                                unix_time_ms(),
+                                event
+                            ),
+                        );
+                    }
+                    let _ = app.emit("hdr-viewer-event", event);
+                }
+                Err(error) => {
+                    eprintln!("could not parse DirectX HDR viewer event: {error}");
+                }
+            }
+        }
+    });
+}
+
+fn trace_hdr_viewer(state: &AppState, label: &str, generation: Option<u64>, detail: &str) {
+    let Some(log_path) = hdr_viewer_log_path(state) else {
+        return;
+    };
+    let generation = generation
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_owned());
+    append_hdr_viewer_log(
+        &log_path,
+        &format!(
+            "[{}] rust_trace label={} generation={} {}\n",
+            unix_time_ms(),
+            label,
+            generation,
+            detail
+        ),
+    );
+}
+
+fn hdr_viewer_log_path(state: &AppState) -> Option<PathBuf> {
+    state
+        .settings_path
+        .parent()
+        .map(|settings_dir| settings_dir.join("hdr-viewer.log"))
+}
+
+fn append_hdr_viewer_log(log_path: &Path, message: &str) {
+    if let Some(parent) = log_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        let _ = file.write_all(message.as_bytes());
+    }
+}
+
+fn unix_time_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+fn image_preview_cache_path(
+    cache_dir: &Path,
+    root_id: &str,
+    image_id: i64,
+    modified_unix_ms: i64,
+    size: u32,
+    source_path: &Path,
+) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    root_id.hash(&mut hasher);
+    image_id.hash(&mut hasher);
+    modified_unix_ms.hash(&mut hasher);
+    size.hash(&mut hasher);
+    IMAGE_PREVIEW_CACHE_VERSION.hash(&mut hasher);
+    source_path.to_string_lossy().hash(&mut hasher);
+    cache_dir.join(format!("{:016x}-{size}.jpg", hasher.finish()))
+}
+
+struct PreviewCacheFile {
+    path: PathBuf,
+    len: u64,
+    modified: SystemTime,
+}
+
+fn prune_preview_cache(cache_dir: &Path) {
+    let Ok(entries) = fs::read_dir(cache_dir) else {
+        return;
+    };
+
+    let mut files = Vec::new();
+    let mut total_bytes = 0_u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+
+        let len = metadata.len();
+        total_bytes = total_bytes.saturating_add(len);
+        files.push(PreviewCacheFile {
+            path,
+            len,
+            modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+        });
+    }
+
+    if total_bytes <= PREVIEW_CACHE_MAX_BYTES {
+        return;
+    }
+
+    files.sort_by_key(|file| file.modified);
+    for file in files {
+        if total_bytes <= PREVIEW_CACHE_TARGET_BYTES {
+            break;
+        }
+        if fs::remove_file(&file.path).is_ok() {
+            total_bytes = total_bytes.saturating_sub(file.len);
+        }
+    }
 }
 
 fn run_scan(target: ScanTarget, app: &AppHandle) -> anyhow::Result<ScanReport> {
@@ -2881,6 +3512,7 @@ fn track_window_state(
     settings_path: Arc<PathBuf>,
     suppressed_until: Arc<Mutex<Option<Instant>>>,
     closing: Arc<AtomicBool>,
+    hdr_viewer: Arc<Mutex<Option<HdrViewerProcess>>>,
 ) {
     let tracked_window = window.clone();
     window.on_window_event(move |event| {
@@ -2891,6 +3523,7 @@ fn track_window_state(
                 &settings,
                 settings_path.as_ref().as_path(),
             );
+            shutdown_hdr_viewer_process(&hdr_viewer);
             return;
         }
 
@@ -3572,6 +4205,56 @@ fn open_with_external_viewer(viewer: &ExternalViewer, image_path: &Path) -> anyh
 }
 
 #[cfg(windows)]
+fn open_path_in_default_app(path: &Path) -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+
+    if !path.exists() {
+        anyhow::bail!("path is not available: {}", path.display());
+    }
+
+    let wide_path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            wide_path.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        ) as isize
+    };
+
+    if result <= 32 {
+        anyhow::bail!("could not open {} in the default app", path.display());
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn open_path_in_default_app(path: &Path) -> anyhow::Result<()> {
+    Command::new("open")
+        .arg(path)
+        .spawn()
+        .with_context(|| format!("could not open {} in the default app", path.display()))?;
+    Ok(())
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn open_path_in_default_app(path: &Path) -> anyhow::Result<()> {
+    Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .with_context(|| format!("could not open {} in the default app", path.display()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
 fn open_url_in_default_browser(url: &str) -> anyhow::Result<()> {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
 
@@ -3664,6 +4347,17 @@ async fn spawn_thumbnail_job(path: PathBuf, size: u32) -> Result<GeneratedThumbn
                 "could not generate thumbnail for {}: {error}",
                 path.display()
             )
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(error_message)
+}
+
+async fn spawn_image_preview_job(path: PathBuf, size: u32) -> Result<GeneratedThumbnail, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        generate_image_preview(&path, size).map_err(|error| {
+            anyhow::anyhow!("could not generate preview for {}: {error}", path.display())
         })
     })
     .await

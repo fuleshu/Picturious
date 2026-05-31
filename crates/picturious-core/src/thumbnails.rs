@@ -1,3 +1,4 @@
+use crate::heic::{decode_heic_image, is_heic_path};
 use crate::models::ThumbnailResponse;
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -121,7 +122,37 @@ impl GeneratedThumbnail {
 }
 
 pub fn generate_thumbnail(path: &Path, size: u32) -> Result<GeneratedThumbnail> {
-    let size = size.clamp(64, 2400);
+    generate_thumbnail_with_limit(path, size, 2400)
+}
+
+pub fn generate_image_preview(path: &Path, size: u32) -> Result<GeneratedThumbnail> {
+    let bytes = generate_image_preview_jpeg(path, size)?;
+
+    Ok(GeneratedThumbnail {
+        byte_len: bytes.len(),
+        data_url: jpeg_data_url(&bytes),
+    })
+}
+
+pub fn generate_image_preview_jpeg(path: &Path, size: u32) -> Result<Vec<u8>> {
+    generate_image_preview_bytes_with_limit(path, size, 8192)
+}
+
+fn generate_thumbnail_with_limit(
+    path: &Path,
+    size: u32,
+    max_size: u32,
+) -> Result<GeneratedThumbnail> {
+    let bytes = generate_thumbnail_bytes_with_limit(path, size, max_size)?;
+
+    Ok(GeneratedThumbnail {
+        byte_len: bytes.len(),
+        data_url: jpeg_data_url(&bytes),
+    })
+}
+
+fn generate_thumbnail_bytes_with_limit(path: &Path, size: u32, max_size: u32) -> Result<Vec<u8>> {
+    let size = size.clamp(64, max_size);
     if is_jpeg(path) {
         return generate_jpeg_thumbnail(path, size)
             .or_else(|_| generate_generic_thumbnail(path, size));
@@ -130,7 +161,18 @@ pub fn generate_thumbnail(path: &Path, size: u32) -> Result<GeneratedThumbnail> 
     generate_generic_thumbnail(path, size)
 }
 
-fn generate_jpeg_thumbnail(path: &Path, size: u32) -> Result<GeneratedThumbnail> {
+fn generate_image_preview_bytes_with_limit(
+    path: &Path,
+    size: u32,
+    max_size: u32,
+) -> Result<Vec<u8>> {
+    let size = size.clamp(64, max_size);
+    let image = decode_image_with_orientation(path, Some(size))?;
+    let preview = image.thumbnail(size, size).to_rgb8();
+    encode_rgb_jpeg_high_quality(preview.as_raw(), preview.width(), preview.height())
+}
+
+fn generate_jpeg_thumbnail(path: &Path, size: u32) -> Result<Vec<u8>> {
     let orientation = image_orientation(path)?;
     let jpeg_data = std::fs::read(path)?;
     let mut decompressor = Decompressor::new()?;
@@ -159,23 +201,13 @@ fn generate_jpeg_thumbnail(path: &Path, size: u32) -> Result<GeneratedThumbnail>
     let mut image = DynamicImage::ImageRgb8(rgb);
     image.apply_orientation(orientation);
     let thumbnail = image.thumbnail(size, size).to_rgb8();
-    let bytes = encode_rgb_jpeg(thumbnail.as_raw(), thumbnail.width(), thumbnail.height())?;
-
-    Ok(GeneratedThumbnail {
-        byte_len: bytes.len(),
-        data_url: jpeg_data_url(&bytes),
-    })
+    encode_rgb_jpeg(thumbnail.as_raw(), thumbnail.width(), thumbnail.height())
 }
 
-fn generate_generic_thumbnail(path: &Path, size: u32) -> Result<GeneratedThumbnail> {
-    let image = decode_image_with_orientation(path)?;
+fn generate_generic_thumbnail(path: &Path, size: u32) -> Result<Vec<u8>> {
+    let image = decode_image_with_orientation(path, Some(size))?;
     let thumbnail = image.thumbnail(size, size).to_rgb8();
-    let bytes = encode_rgb_jpeg(thumbnail.as_raw(), thumbnail.width(), thumbnail.height())?;
-
-    Ok(GeneratedThumbnail {
-        byte_len: bytes.len(),
-        data_url: jpeg_data_url(&bytes),
-    })
+    encode_rgb_jpeg(thumbnail.as_raw(), thumbnail.width(), thumbnail.height())
 }
 
 fn image_orientation(path: &Path) -> Result<Orientation> {
@@ -184,7 +216,11 @@ fn image_orientation(path: &Path) -> Result<Orientation> {
     Ok(decoder.orientation()?)
 }
 
-fn decode_image_with_orientation(path: &Path) -> Result<DynamicImage> {
+fn decode_image_with_orientation(path: &Path, max_dimension: Option<u32>) -> Result<DynamicImage> {
+    if is_heic_path(path) {
+        return decode_heic_image(path, max_dimension);
+    }
+
     let reader = ImageReader::open(path)?.with_guessed_format()?;
     let mut decoder = reader.into_decoder()?;
     let orientation = decoder.orientation()?;
@@ -202,7 +238,7 @@ fn thumbnail_key(path: &Path, modified_unix_ms: i64, size: u32) -> ThumbnailKey 
 }
 
 fn encode_rgb_jpeg(rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
-    if let Ok(bytes) = encode_rgb_jpeg_turbo(rgb, width, height) {
+    if let Ok(bytes) = encode_rgb_jpeg_turbo(rgb, width, height, 82, Subsamp::Sub2x2) {
         return Ok(bytes);
     }
 
@@ -212,10 +248,27 @@ fn encode_rgb_jpeg(rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
     Ok(jpeg.into_inner())
 }
 
-fn encode_rgb_jpeg_turbo(rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+fn encode_rgb_jpeg_high_quality(rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    if let Ok(bytes) = encode_rgb_jpeg_turbo(rgb, width, height, 95, Subsamp::None) {
+        return Ok(bytes);
+    }
+
+    let mut jpeg = Cursor::new(Vec::new());
+    let mut encoder = JpegEncoder::new_with_quality(&mut jpeg, 95);
+    encoder.encode(rgb, width, height, ExtendedColorType::Rgb8)?;
+    Ok(jpeg.into_inner())
+}
+
+fn encode_rgb_jpeg_turbo(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    quality: i32,
+    subsamp: Subsamp,
+) -> Result<Vec<u8>> {
     let mut compressor = Compressor::new()?;
-    compressor.set_quality(82)?;
-    compressor.set_subsamp(Subsamp::Sub2x2)?;
+    compressor.set_quality(quality)?;
+    compressor.set_subsamp(subsamp)?;
     let image = TurboImage {
         pixels: rgb,
         width: width as usize,
@@ -293,6 +346,23 @@ mod tests {
 
         fs::remove_file(path).ok();
         assert_eq!((decoded.width(), decoded.height()), (300, 150));
+    }
+
+    #[test]
+    fn image_preview_jpeg_returns_decodable_image() {
+        let path = temp_image_path("png");
+        let source = ImageBuffer::from_pixel(640, 320, Rgb([80_u8, 180, 120]));
+        source.save(&path).unwrap();
+
+        let bytes = generate_image_preview_jpeg(&path, 320).unwrap();
+        let decoded = ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap();
+
+        fs::remove_file(path).ok();
+        assert_eq!((decoded.width(), decoded.height()), (320, 160));
     }
 
     #[test]
