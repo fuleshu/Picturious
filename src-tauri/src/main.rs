@@ -38,6 +38,8 @@ const MONITOR_SIZED_WINDOW_TOLERANCE: u32 = 8;
 const PREVIEW_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const PREVIEW_CACHE_TARGET_BYTES: u64 = 1536 * 1024 * 1024;
 const IMAGE_PREVIEW_CACHE_VERSION: u8 = 2;
+const HDR_VIEWER_LOG_ENV: &str = "PICTURIOUS_HDR_VIEWER_LOG";
+const HDR_VIEWER_DIAGNOSTICS_ENV: &str = "PICTURIOUS_HDR_VIEWER_DIAGNOSTICS";
 
 struct AppState {
     library: Arc<Mutex<LibraryManager>>,
@@ -2191,11 +2193,11 @@ fn ensure_hdr_viewer_process(app: &AppHandle, state: &AppState) -> anyhow::Resul
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    if let Some(settings_dir) = state.settings_path.parent() {
-        let log_path = settings_dir.join("hdr-viewer.log");
-        command.env("PICTURIOUS_HDR_VIEWER_LOG", log_path.clone());
+    let log_path = hdr_viewer_log_path(state);
+    if let Some(log_path) = &log_path {
+        command.env(HDR_VIEWER_LOG_ENV, log_path);
         append_hdr_viewer_log(
-            &log_path,
+            log_path,
             &format!("[{}] rust_trace label=rust_spawn_helper\n", unix_time_ms()),
         );
     }
@@ -2211,7 +2213,7 @@ fn ensure_hdr_viewer_process(app: &AppHandle, state: &AppState) -> anyhow::Resul
         .take()
         .context("DirectX HDR viewer did not provide stdin")?;
     if let Some(stdout) = child.stdout.take() {
-        spawn_hdr_viewer_event_reader(app.clone(), stdout, hdr_viewer_log_path(state));
+        spawn_hdr_viewer_event_reader(app.clone(), stdout, log_path);
     }
 
     #[cfg(windows)]
@@ -2343,10 +2345,59 @@ fn trace_hdr_viewer(state: &AppState, label: &str, generation: Option<u64>, deta
 }
 
 fn hdr_viewer_log_path(state: &AppState) -> Option<PathBuf> {
-    state
-        .settings_path
+    let log_env = std::env::var_os(HDR_VIEWER_LOG_ENV);
+    let diagnostics_env = std::env::var_os(HDR_VIEWER_DIAGNOSTICS_ENV);
+    hdr_viewer_log_path_for_settings(
+        &state.settings_path,
+        log_env.as_deref(),
+        diagnostics_env.as_deref(),
+    )
+}
+
+fn hdr_viewer_log_path_for_settings(
+    settings_path: &Path,
+    log_env: Option<&std::ffi::OsStr>,
+    diagnostics_env: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    if let Some(value) = log_env {
+        let normalized = value.to_string_lossy().trim().to_ascii_lowercase();
+        if normalized.is_empty() || env_value_is_disabled(&normalized) {
+            return None;
+        }
+        if env_value_is_enabled(&normalized) {
+            return default_hdr_viewer_log_path(settings_path);
+        }
+        return Some(PathBuf::from(value));
+    }
+
+    if diagnostics_env
+        .map(|value| env_value_is_enabled(value.to_string_lossy().trim()))
+        .unwrap_or(false)
+    {
+        default_hdr_viewer_log_path(settings_path)
+    } else {
+        None
+    }
+}
+
+fn default_hdr_viewer_log_path(settings_path: &Path) -> Option<PathBuf> {
+    settings_path
         .parent()
         .map(|settings_dir| settings_dir.join("hdr-viewer.log"))
+}
+
+fn env_value_is_enabled(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn env_value_is_disabled(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
 }
 
 fn append_hdr_viewer_log(log_path: &Path, message: &str) {
@@ -4413,5 +4464,51 @@ mod tests {
         assert_eq!(value["window"]["width"], 900);
         assert!(value["window"].get("fullscreen").is_none());
         assert!(value["window"].get("maximized").is_none());
+    }
+
+    #[test]
+    fn hdr_viewer_logging_is_disabled_by_default() {
+        let settings_path = Path::new("C:/tmp/picturious/settings.json");
+
+        assert_eq!(
+            hdr_viewer_log_path_for_settings(settings_path, None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn hdr_viewer_logging_can_be_enabled_explicitly() {
+        let settings_path = Path::new("C:/tmp/picturious/settings.json");
+
+        assert_eq!(
+            hdr_viewer_log_path_for_settings(
+                settings_path,
+                None,
+                Some(std::ffi::OsStr::new("true"))
+            ),
+            Some(PathBuf::from("C:/tmp/picturious/hdr-viewer.log"))
+        );
+        assert_eq!(
+            hdr_viewer_log_path_for_settings(
+                settings_path,
+                Some(std::ffi::OsStr::new("C:/tmp/custom-hdr-viewer.log")),
+                None
+            ),
+            Some(PathBuf::from("C:/tmp/custom-hdr-viewer.log"))
+        );
+    }
+
+    #[test]
+    fn hdr_viewer_logging_false_env_disables_logging() {
+        let settings_path = Path::new("C:/tmp/picturious/settings.json");
+
+        assert_eq!(
+            hdr_viewer_log_path_for_settings(
+                settings_path,
+                Some(std::ffi::OsStr::new("false")),
+                Some(std::ffi::OsStr::new("true"))
+            ),
+            None
+        );
     }
 }
